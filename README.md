@@ -1,11 +1,9 @@
 # budget
 
-A collection of tools to compute the Spectral Energy Budget of a dry non-hydrostatic Atmosphere. 
-This package is developed for application to numerical simulations on regional domains following 
-Peng et al. (2014). The analysis supports data sampled on a regular (equally spaced in longitude 
-and latitude) or Cartesian horizontal grids (metric-aware horizontal derivatives).
-The vertical grid should be on geometric heights.
+Tools to compute the spectral energy budget of a dry, non-hydrostatic atmosphere on regional domains.
+The package targets model output on either regular lon–lat (equi-angular) or Cartesian horizontal grids, with a geometric-height vertical coordinate.
 
+Analyses primarily follow Peng et al. and subsequent applications to mesoscale flows (see References).
 
 ### Features
 
