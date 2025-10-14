@@ -7,10 +7,10 @@ Analyses primarily follow Peng et al. and subsequent applications to mesoscale f
 
 ### Features
 
-- Horizontal kinetic-energy spectra and budget terms (transfer, vertical flux/divergence, 
-pressure work, conversion, divergence term)
-- Chunk-friendly xarray/dask implementation (out-of-core)
-- NetCDF output with CF-style metadata (horizontal coordinates replaced with the wavenumber in rad m⁻¹)
+- Horizontal kinetic-energy (HKE) spectra and budget terms (nonlinear transfer, vertical pressure 
+  and momentum fluxes/divergence, conversion from APE to HKE, divergence term)
+- FFT backed chunk-friendly xarray/dask implementation (out-of-core)
+- NetCDF output with CF-style metadata (horizontal coordinates are replaced with wavenumber in rad m⁻¹)
 
 References:
 - J. Peng, L. Zhang, and J. Guan (2015). Applications of a Moist Nonhydrostatic Formulation of the
