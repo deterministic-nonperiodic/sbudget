@@ -1,0 +1,31 @@
+input:
+  path: ./model_output.nc
+  dims: [ z_mc,  lat, lon ]          # or [y, x]
+  engine: h5netcdf          # optional: h5netcdf | netcdf4 | scipy
+
+output:
+  path: ./budget_out.nc
+  store: netcdf             # or zarr
+  overwrite: true
+
+compute:
+  norm: null                # or 'ortho'
+  dx: null                  # only for Cartesian grids; lon/lat inferred
+  dy: null
+  cumulative: true          # default; set false for raw (non-accumulated) spectra
+  transfer_form: invariant  # invariant, flux. Method for computing nonlinear spectral transfers
+  # FFT stability & memory control
+  rechunk_spatial: true     # ensure single spatial chunks (y,x) for FFTs
+  dask_allow_rechunk: true  # allow apply_ufunc to rechunk as a fallback
+  scheduler: threads        # distributed, processes
+
+variables:
+  u: u                     # zonal velocity
+  v: v
+  w: w
+  theta: theta              # preferred; if missing, derive from pressure & temperature
+  pressure: p               # optional if theta present
+  temperature: temp         # optional if theta present
+  # Optional precomputed diagnostics (used if present)
+  divergence: div
+  vorticity: vor
