@@ -262,7 +262,7 @@ def cross_spectrum(field1: xr.DataArray, field2: xr.DataArray,
 
     ny = field1.sizes[dims[0]]
     nx = field1.sizes[dims[1]]
-    nx_fft = nx // 2 + 1
+    nx_pos = nx // 2 + 1
 
     def _cross(a, b):
         spec1 = _real_fft2_shifted(a, norm)
@@ -278,7 +278,7 @@ def cross_spectrum(field1: xr.DataArray, field2: xr.DataArray,
         keep_attrs=True,
         dask_gufunc_kwargs={
             "allow_rechunk": _OPTIONS.allow_rechunk,
-            "output_sizes": {"ky": ny, "kx": nx_fft},
+            "output_sizes": {"ky": ny, "kx": nx_pos},
             "meta": np.array((), dtype=np.float64),
         }
     )
@@ -439,8 +439,8 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray,
     return u_term + v_term
 
 
-def kinetic_energy(u: xr.DataArray, v: xr.DataArray, norm: str | None = None,
-                   name="hke") -> xr.DataArray:
+def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = None,
+                           name="hke") -> xr.DataArray:
     """Horizontal kinetic energy per unit mass spectrum: ½(|Û|² + |V̂|²)."""
     hke = 0.5 * (scalar_spectrum(u, norm) + scalar_spectrum(v, norm))
     return hke.rename(name)
@@ -653,7 +653,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         w = _ensure_spatial_single_chunk(w, space_dims)
 
     # --- spectra: HKE 2D and isotropic 1D ---
-    hke_2d = kinetic_energy(u, v, norm=cfg.compute.norm)
+    hke_2d = kinetic_energy_spectra(u, v, norm=cfg.compute.norm)
     hke_1d = isotropize(hke_2d, dx, dy)
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
