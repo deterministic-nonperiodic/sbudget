@@ -182,17 +182,33 @@ def _fft2_shifted(a, norm=None):
 
 
 def _real_fft2_shifted(a, norm=None):
-    """2-D FFT over the last two axes, with optional normalization."""
+    """2-D real-input FFT over the last two axes with ky-shift and rFFT half-plane weighting.
+
+    - rFFT on (y, x): last axis returns non-negative kx (half-plane).
+    - Legacy scaling when norm is None: divide by Ny * Nx.
+    - Apply √2 on interior kx columns so that |F|^2 doubles there (DC and Nyquist stay 1).
+    """
     a = np.asanyarray(a).real
 
-    a_sc = np.fft.rfftn(a, axes=(-2, -1), norm=norm)  # half-plane along x
-    a_sc = np.fft.fftshift(a_sc, axes=(-2,))  # shift ky only
+    # rFFT core: half-plane along x
+    a_sc = np.fft.rfftn(a, axes=(-2, -1), norm=norm)
+    # center ky only (symmetric)
+    a_sc = np.fft.fftshift(a_sc, axes=(-2,))
 
-    # Normalize FFT
+    # normalization matching legacy (forward scaled)
     if norm is None:
-        a_sc = a_sc / np.prod(a.shape)  # scale by physical grid size
+        a_sc = a_sc / np.prod(a.shape)
 
-    return a_sc
+    # --- rFFT half-plane amplitude weights (√2 on interior kx) ---
+    nx = a.shape[-1]
+    nkx = nx // 2 + 1
+    has_nyq = (nx % 2) == 0  # even Nx has explicit Nyquist column at the end
+    idx = np.arange(nkx)
+
+    # 1 at DC (i==0) and Nyquist (if present), √2 elsewhere
+    weights = np.where(idx == 0, 1.0, np.where(has_nyq & (idx == nkx - 1), 1.0, np.sqrt(2.0)))
+
+    return a_sc * weights
 
 
 def scalar_spectrum(field: xr.DataArray, norm: str | None = None) -> xr.DataArray:
@@ -322,7 +338,7 @@ def _azimuthal_bincount(block: np.ndarray, bin_idx2d: np.ndarray, n_bins: int) -
     Parameters
     ----------
     block : (ny, nx) spectrum values for one (time,z,...) slice
-    bin_idx2d : ny, nx) 2-D bin index array
+    bin_idx2d : (ny, nx) 2-D bin index array
     n_bins: number of final bins
 
     Returns
@@ -357,25 +373,14 @@ def isotropize(spectrum: xr.DataArray, dx: float, dy: float, nyquist: bool = Tru
         spectrum = spectrum.rename({y: "ky", x: "kx"})
 
     # Get kappa bins and 2D bin index array
-    ny, nx_pos = int(spectrum.sizes["ky"]), int(spectrum.sizes["kx"])
-
-    # rFFT weighting: double interior kx columns
-    nx = 2 * (nx_pos - 1)
-    has_nyq = (nx % 2 == 0)
-    weights = np.ones((ny, nx_pos), dtype=np.float64)
-    if nx_pos > 1:
-        weights[:, 1:-1] = 2.0
-        if not has_nyq:
-            weights[:, -1] = 2.0  # last col is interior if no Nyquist column exists
-
-    spectrum_w = spectrum * xr.DataArray(weights, dims=("ky", "kx"), name=spectrum.name)
+    nky, nkx = int(spectrum.sizes["ky"]), int(spectrum.sizes["kx"])
 
     # bins & index
-    wavenumber, idx2d = _prep_bins(nx_pos, ny, dx, dy, nyquist=nyquist)
+    wavenumber, idx2d = _prep_bins(nkx, nky, dx, dy, nyquist=nyquist)
 
     spec1d = xr.apply_ufunc(
         _azimuthal_bincount,
-        spectrum_w,
+        spectrum,
         xr.DataArray(idx2d, dims=("ky", "kx")),
         wavenumber.size,
         input_core_dims=[("ky", "kx"), ("ky", "kx"), []],
