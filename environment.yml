@@ -1,0 +1,25 @@
+name: budget
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  # Core
+  - python=3.11
+  - numpy>=1.24
+  - scipy
+  - pandas
+  - xarray>=2024.5.0
+  - bottleneck            # speeds up xarray reductions
+  - dask>=2024.5.0
+  - distributed
+  - pyyaml                # read config.yaml
+
+  # NetCDF I/O (both engines so xarray doesn't complain)
+  - netcdf4               # enables engine="netcdf4"
+  - h5netcdf              # enables engine="h5netcdf"
+  - h5py                  # backend for h5netcdf
+  - cftime                # robust time decoding
+
+  # Build/runtime basics
+  - pip
