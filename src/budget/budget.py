@@ -170,123 +170,154 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
 # Spectral primitives (unchanged API; now read global options)
 # --------------------------------------------------------------------------------------------------
 def _fft2_shifted(a, norm=None):
+    """2-D FFT over the last two axes, with optional normalization."""
+    a_sc = np.fft.fftn(a, axes=(-2, -1), norm=norm)
+    a_sc = np.fft.fftshift(a_sc, axes=(-2, -1))
+
+    # Normalize FFT by total number of points
     if norm is None:
-        a_sc = np.fft.fftn(a, axes=(-2, -1))
-        a_sc = np.fft.fftshift(a_sc, axes=(-2, -1)) / np.prod(a.shape)
-    elif norm == 'ortho':
-        a_sc = np.fft.fftn(a, axes=(-2, -1), norm='ortho')
-        a_sc = np.fft.fftshift(a_sc, axes=(-2, -1))
-    else:
-        raise ValueError("norm must be None or 'ortho'")
+        a_sc = a_sc / np.prod(a.shape)
+
     return a_sc
 
 
-def scalar_spectrum(field: xr.DataArray, norm: str | None = None,
-                    allow_rechunk: bool | None = None) -> xr.DataArray:
-    """Return 2‑D power spectrum |F(k)|^2 over the horizontal axes."""
+def _real_fft2_shifted(a, norm=None):
+    """2-D FFT over the last two axes, with optional normalization."""
+    a = np.asanyarray(a).real
 
-    dims = get_spatial_dims(field)
+    a_sc = np.fft.rfftn(a, axes=(-2, -1), norm=norm)  # half-plane along x
+    a_sc = np.fft.fftshift(a_sc, axes=(-2,))  # shift ky only
 
-    # get output sizes for spectral coordinates
-    output_core_dims = ["ky", "kx"]
-    output_sizes = {out_dim: field.sizes[dim] for dim, out_dim in zip(dims, output_core_dims)}
+    # Normalize FFT
+    if norm is None:
+        a_sc = a_sc / np.prod(a.shape)  # scale by physical grid size
 
-    field_spc = xr.apply_ufunc(
-        _fft2_shifted, field,
-        input_core_dims=[list(dims)], output_core_dims=[["ky", "kx"]],
-        vectorize=True, dask='parallelized', kwargs={'norm': norm},
+    return a_sc
+
+
+def scalar_spectrum(field: xr.DataArray, norm: str | None = None) -> xr.DataArray:
+    """Return 2-D power spectrum |F(k)|^2 over the last two spatial axes.
+
+    rFFT path:
+      - _fft2_shifted returns (ky shifted, kx non-negative) complex spectrum
+      - we compute |F|^2, then apply interior-kx ×2 in isotropize (not here)
+    """
+
+    dims = get_spatial_dims(field)  # your helper: e.g., ("y","x")
+
+    # output spectral sizes: ky = Ny; kx = Nx//2 + 1
+    ny = field.sizes[dims[0]]
+    nx = field.sizes[dims[1]]
+    nx_pos = nx // 2 + 1
+
+    def _pow(a):
+        spec = _real_fft2_shifted(a, norm)  # rFFT core
+        return (spec.conj() * spec).real  # (…, ky, kx_rfft)
+
+    power = xr.apply_ufunc(
+        _pow, field,
+        input_core_dims=[list(dims)],
+        output_core_dims=[["ky", "kx"]],
+        dask="parallelized",
+        vectorize=True,
+        keep_attrs=True,
         dask_gufunc_kwargs={
-            'output_sizes': output_sizes,
-            "allow_rechunk": _OPTIONS.allow_rechunk if allow_rechunk is None else allow_rechunk,
-            "meta": np.array((), dtype=np.complex128)
+            "allow_rechunk": _OPTIONS.allow_rechunk,
+            "output_sizes": {"ky": ny, "kx": nx_pos},
+            "meta": np.array((), dtype=np.float64),
         }
     )
 
-    return (field_spc.conj() * field_spc).real
+    # ensure spectral dim names
+    if "ky" not in power.dims or "kx" not in power.dims:
+        power = power.rename({dims[0]: "ky", dims[1]: "kx"})
+
+    return power
 
 
-def cross_spectrum(field1: xr.DataArray, field2: xr.DataArray, norm: str | None = None,
-                   allow_rechunk: bool | None = None) -> xr.DataArray:
-    """Return 2‑D power cross-spectrum |F1(k)F2(k)*| over the horizontal axes."""
+def cross_spectrum(field1: xr.DataArray, field2: xr.DataArray,
+                   norm: str | None = None) -> xr.DataArray:
+    """Return 2-D cross-spectrum F1*(k) F2(k) over the horizontal dims.
 
+    rFFT path (half-plane in kx, ky shifted). Interior-kx ×2 will be applied
+    in isotropize (not here) to preserve total variance consistently.
+    """
     dims = get_spatial_dims(field1)
 
-    # get output sizes for spectral coordinates
-    output_core_dims = ["ky", "kx"]
-    output_sizes = {out_dim: field1.sizes[dim] for dim, out_dim in zip(dims, output_core_dims)}
+    ny = field1.sizes[dims[0]]
+    nx = field1.sizes[dims[1]]
+    nx_fft = nx // 2 + 1
 
-    """Return 2‑D cross‑spectrum F1*(k) F2(k) over the horizontal dims."""
-    field1_spc = xr.apply_ufunc(
-        _fft2_shifted, field1,
-        input_core_dims=[list(dims)], output_core_dims=[output_core_dims],
-        vectorize=True, dask='parallelized', kwargs={'norm': norm},
+    def _cross(a, b):
+        spec1 = _real_fft2_shifted(a, norm)
+        spec2 = _real_fft2_shifted(b, norm)
+        return (spec1.conj() * spec2).real
+
+    power = xr.apply_ufunc(
+        _cross, field1, field2,
+        input_core_dims=[list(dims), list(dims)],
+        output_core_dims=[["ky", "kx"]],
+        dask="parallelized",
+        vectorize=True,
+        keep_attrs=True,
         dask_gufunc_kwargs={
-            'output_sizes': output_sizes,
-            "allow_rechunk": _OPTIONS.allow_rechunk if allow_rechunk is None else allow_rechunk,
-            "meta": np.array((), dtype=np.complex128)
+            "allow_rechunk": _OPTIONS.allow_rechunk,
+            "output_sizes": {"ky": ny, "kx": nx_fft},
+            "meta": np.array((), dtype=np.float64),
         }
     )
-    field2_spc = xr.apply_ufunc(
-        _fft2_shifted, field2,
-        input_core_dims=[list(dims)], output_core_dims=[output_core_dims],
-        vectorize=True, dask='parallelized', kwargs={'norm': norm},
-        dask_gufunc_kwargs={
-            'output_sizes': output_sizes,
-            "allow_rechunk": _OPTIONS.allow_rechunk if allow_rechunk is None else allow_rechunk,
-            "meta": np.array((), dtype=np.complex128)
-        }
-    )
-    return (field1_spc.conj() * field2_spc).real
+
+    if "ky" not in power.dims or "kx" not in power.dims:
+        power = power.rename({dims[0]: "ky", dims[1]: "kx"})
+
+    return power
 
 
 def _prep_bins(nx: int, ny: int, dx: float, dy: float, nyquist=True):
     """
     Precompute bin index. Non-overlapping, variance-conserving radial bins.
-    Δ = 2π / L  with L = min(dx*nx, dy*ny); edges cover full radius up to min(Nyquist, Kh.max()).
 
-    Legacy definitions:
-      - Legacy bandwidth:   del0 = 4π / L,  with L = min(dx*nx, dy*ny)
-      - Legacy centers:     kc = arange(del0/2, kmax - del0/2, del0/2)
-      - (width = del0, center step = del0/2)  -> 50% overlap
-      - Using fine non-overlapping bins at step Δ = del0/2 = 2π/L
+    rFFT-aware:
+      - kx is non-negative via rfftfreq(nx), while ky is symmetric
+      - Δ = 2π / min(dx*Nx_full, dy*ny)  (legacy center spacing)
+      - centers at nΔ (drop inner < Δ/2 ring), identical to legacy layout
     """
-    kx = np.fft.fftshift(np.fft.fftfreq(nx, dx / (2 * np.pi)))
-    ky = np.fft.fftshift(np.fft.fftfreq(ny, dy / (2 * np.pi)))
+    # reconstruct physical Nx from rFFT spectral size
+    nx_pos = 2 * (nx - 1)
 
-    kh_grid = np.hypot(*np.meshgrid(kx, ky, indexing="xy")).astype(np.float64)
+    kx = np.fft.rfftfreq(nx_pos, dx / (2 * np.pi))  # length nx (half-plane)
+    ky = np.fft.fftshift(np.fft.fftfreq(ny, dy / (2 * np.pi)))  # length ny (centered)
 
-    # Fine-bin step (this is the legacy center spacing): Δ = 2π / L (domain size)
-    delta = 2.0 * np.pi / min(dx * nx, dy * ny)
+    Kx, Ky = np.meshgrid(kx, ky, indexing="xy")
+    kh_grid = np.hypot(Kx, Ky).astype(np.float64)
 
-    # target cutoff radius
-    kh_max = float(kh_grid.max())
+    delta = 2.0 * np.pi / min(dx * nx_pos, dy * ny)
+
+    # Explicit Nyquist cutoff (if requested)
     nyq = np.pi / max(dx, dy)
+    k_cut = min(nyq, float(kh_grid.max())) if nyquist else float(kh_grid.max())
 
-    k_cut = min(nyq, kh_max) if nyquist else kh_max
-
-    # edges: Δ/2, 3Δ/2, 5Δ/2, ...  ⇒ bins [(n-½)Δ, (n+½)Δ), centers nΔ (n≥1)
     start = 0.5 * delta
-    n_bins = int(np.floor((k_cut - start) / delta + 1e-12))  # number of n=1..N bins inside cutoff
+    n_bins = int(np.floor((k_cut - start) / delta + 1e-12))
     if (k_cut - start) - n_bins * delta > 1e-12:
         n_bins += 1
+
+    # bin edges and centers
     edges = start + np.arange(0, n_bins, dtype=np.float64) * delta
     edges = np.concatenate([edges, [max(k_cut + 1e-15 * delta, start + n_bins * delta)]])
 
-    # centers exactly at nΔ: take midpoints then snap to nearest multiple of Δ (for nice labels)
     centers = 0.5 * (edges[:-1] + edges[1:])
     centers = delta * np.rint(centers / delta)
 
-    # 2-D bin indices; outside cutoff -> -1; inside -> [0..n_bins-1]
+    # 2-D bin index array
     idx2d = np.digitize(kh_grid, edges, right=False) - 1
-    idx2d[(idx2d < 0) | (idx2d >= n_bins)] = -1  # outside gets -1
-
+    idx2d[(idx2d < 0) | (idx2d >= n_bins)] = -1
     return centers, idx2d
 
 
 def _azimuthal_bincount(block: np.ndarray, bin_idx2d: np.ndarray, n_bins: int) -> np.ndarray:
     """
-    Sum values into fine non-overlapping bins via bincount, then
-    reproduce legacy 50%-overlap bins as a moving sum of width 2.
+    Sum values into fine non-overlapping bins via bincount.
 
     Parameters
     ----------
@@ -311,8 +342,8 @@ def _azimuthal_bincount(block: np.ndarray, bin_idx2d: np.ndarray, n_bins: int) -
 def isotropize(spectrum: xr.DataArray, dx: float, dy: float, nyquist: bool = True) -> xr.DataArray:
     """Variance-conserving azimuthally average a 2-D spectrum to a 1-D isotropic spectrum.
 
-    Accepts spectra with dims ('ky','kx') or physical dims ('lat','lon')/'y','x'.
-    Returns dataset with coords 'wavenumber' and variable 'spectrum_1d'.
+    Accepts spectra with dims ('ky','kx'), where kx is the rFFT half-plane.
+      - doubles interior kx columns (except DC and Nyquist)
 
     Returns
     -------
@@ -326,25 +357,37 @@ def isotropize(spectrum: xr.DataArray, dx: float, dy: float, nyquist: bool = Tru
         spectrum = spectrum.rename({y: "ky", x: "kx"})
 
     # Get kappa bins and 2D bin index array
-    ny, nx = spectrum.sizes["ky"], spectrum.sizes["kx"]
+    ny, nx_pos = int(spectrum.sizes["ky"]), int(spectrum.sizes["kx"])
 
-    wavenumber, idx2d = _prep_bins(nx, ny, dx, dy, nyquist=nyquist)
+    # rFFT weighting: double interior kx columns
+    nx = 2 * (nx_pos - 1)
+    has_nyq = (nx % 2 == 0)
+    weights = np.ones((ny, nx_pos), dtype=np.float64)
+    if nx_pos > 1:
+        weights[:, 1:-1] = 2.0
+        if not has_nyq:
+            weights[:, -1] = 2.0  # last col is interior if no Nyquist column exists
 
-    # wrap the pure-numpy reducer with apply_ufunc
+    spectrum_w = spectrum * xr.DataArray(weights, dims=("ky", "kx"), name=spectrum.name)
+
+    # bins & index
+    wavenumber, idx2d = _prep_bins(nx_pos, ny, dx, dy, nyquist=nyquist)
+
     spec1d = xr.apply_ufunc(
         _azimuthal_bincount,
-        spectrum,
-        xr.DataArray(idx2d, dims=("ky", "kx")), wavenumber.size,
+        spectrum_w,
+        xr.DataArray(idx2d, dims=("ky", "kx")),
+        wavenumber.size,
         input_core_dims=[("ky", "kx"), ("ky", "kx"), []],
         output_core_dims=[["wavenumber"]],
         vectorize=True,
         dask="parallelized",
         dask_gufunc_kwargs={
             "output_sizes": {"wavenumber": wavenumber.size},
-            "allow_rechunk": False,  # avoid surprise rechunks
+            "allow_rechunk": False,
             "meta": np.array((), dtype=spectrum.dtype),
         },
-        keep_attrs = True
+        keep_attrs=True,
     )
 
     spec1d = spec1d.rename(spec1d.name or "spectrum_1d")
@@ -379,16 +422,15 @@ def rotate_vector(vec: xr.DataArray) -> xr.DataArray:
 
 
 def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray,
-                          norm: str | None = None,
-                          allow_rechunk: bool | None = None) -> xr.DataArray:
+                          norm: str | None = None) -> xr.DataArray:
     """Sum of cross-spectra of matching components of two 2D vectors.
 
     Returns ⟨u1, u2⟩ + ⟨v1, v2⟩ in spectral space.
     """
     if "comp" not in vec1.dims or "comp" not in vec2.dims:
         raise ValueError("vector_cross_spectrum expects inputs with 'comp' dimension")
-    u_term = cross_spectrum(vec1.sel(comp="u"), vec2.sel(comp="u"), norm, allow_rechunk)
-    v_term = cross_spectrum(vec1.sel(comp="v"), vec2.sel(comp="v"), norm, allow_rechunk)
+    u_term = cross_spectrum(vec1.sel(comp="u"), vec2.sel(comp="u"), norm)
+    v_term = cross_spectrum(vec1.sel(comp="v"), vec2.sel(comp="v"), norm)
     return u_term + v_term
 
 
@@ -682,14 +724,13 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         "vfd_pres": ("pressure_flux_divergence", "vertical divergence of pressure work"),
         "div_hke": ("horizontal_ke_divergence", "horizontal divergence contribution to HKE budget"),
     }
+
     # apply attrs only to variables that are present and recognized
     for var in fluxes.data_vars:
         if var in meta:
             std_name, long_name = meta[str(var)]
-            fluxes[var].attrs.update({
-                "units": units,
-                "standard_name": std_name,
-                "long_name": long_name,
-            })
+            fluxes[var].attrs.update(
+                {"standard_name": std_name, "long_name": long_name, "units": units}
+            )
 
     return fluxes
