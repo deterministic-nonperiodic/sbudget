@@ -7,8 +7,8 @@ Analyses primarily follow Peng et al. and subsequent applications to mesoscale f
 
 ### Features
 
-- Horizontal kinetic-energy (HKE) spectra and budget terms (nonlinear transfer, vertical pressure 
-  and momentum fluxes/divergence, conversion from APE to HKE, divergence term)
+- Horizontal kinetic-energy (HKE) spectra and budget terms (nonlinear spectral transfer, vertical 
+  pressure and momentum fluxes/divergence, conversion from APE to HKE, divergence term)
 - FFT backed chunk-friendly xarray/dask implementation (out-of-core)
 - NetCDF output with CF-style metadata (horizontal coordinates are replaced with wavenumber in rad m⁻¹)
 
