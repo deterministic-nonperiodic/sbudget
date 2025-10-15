@@ -20,7 +20,7 @@ def _cf_guess(ds: xr.Dataset, target: str) -> str | None:
         "pressure": {"standard_names": {"air_pressure"}, "units": {"Pa", "pascal"}},
         "temperature": {"standard_names": {"air_temperature"}, "units": {"K", "kelvin"}},
         "theta": {"standard_names": {"air_potential_temperature"}, "units": {"K", "kelvin"}},
-        "div": {"standard_names": {"divergence_of_wind"}, "units": {"s-1"}},
+        "divergence": {"standard_names": {"divergence_of_wind"}, "units": {"s-1"}},
         "vorticity": {"standard_names": {"relative_vorticity"}, "units": {"s-1"}},
     }
     rule = cf_map.get(target)
