@@ -429,7 +429,7 @@ def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = 
     return hke.rename(name)
 
 
-def nonlinear_hke_transfer(
+def nonlinear_hke_transfer_flux(
         u: xr.DataArray,
         v: xr.DataArray,
         w: xr.DataArray,
@@ -467,68 +467,15 @@ def nonlinear_hke_transfer(
     wind_shear = stack_vector(dzu, dzv, name="shear")
 
     # Advection-like vector A and transport vector wU
-    adv_u = (u * dxu + v * dyu) + 0.5 * (divergence * u) + 0.5 * (w * dzu)
-    adv_v = (u * dxv + v * dyv) + 0.5 * (divergence * v) + 0.5 * (w * dzv)
-    advection = stack_vector(adv_u, adv_v, name="advection")
-
-    wU = stack_vector(w * u, w * v, name="w_wind")
+    adv_u = (u * dxu + v * dyu) + 0.5 * (divergence * u)
+    adv_v = (u * dxv + v * dyv) + 0.5 * (divergence * v)
+    advection = stack_vector(adv_u, adv_v, name="advection") + 0.5 * w * wind_shear
 
     # Spectral vector inner products (sum over components)
     t_adv = - vector_cross_spectrum(wind, advection, norm=norm)  # -⟨U, A⟩
-    t_shear = vector_cross_spectrum(wind_shear, wU, norm=norm)  # ⟨∂z U, w U⟩
+    t_shear = vector_cross_spectrum(wind_shear, w * wind, norm=norm)  # ⟨∂z U, w U⟩
 
     pi_nke = t_adv + t_shear
-
-    return pi_nke.rename(name)
-
-
-def nonlinear_hke_transfer_conservative(
-        u: xr.DataArray,
-        v: xr.DataArray,
-        w: xr.DataArray,
-        divergence: Union[xr.DataArray | None] = None,
-        norm: str | None = None,
-        name="pi_nke"
-) -> xr.DataArray:
-    """
-    Nonlinear transfer term for horizontal kinetic energy (HKE), conservative (divergence) form.
-
-    Implements, component-wise,
-        (u·∇)u = ∂x(u * u) + ∂y(u * v) + ∂z(u * w) − u (∂x u + ∂y v + ∂z w)
-        (u·∇)v = ∂x(v * u) + ∂y(v * v) + ∂z(v * w) − v (∂x u + ∂y v + ∂z w)
-
-    Horizontal derivatives are metric-aware via `differentiate_metric` (handles lon/lat);
-    vertical derivatives use `.differentiate("z")`.
-
-    Returns
-    -------
-    xr.DataArray
-        Spectral nonlinear HKE transfer:  -⟨u, (u·∇)u⟩ - ⟨v, (u·∇)v⟩
-        with dims ('ky','kx', ...).
-    """
-    y, x = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
-
-    # 3D divergence used for anelastic correction
-    if divergence is None:
-        divergence = compute_divergence(u, v)
-
-    # 3D divergence used for anelastic correction
-    divergence_3d = divergence + differentiate_metric(w, "z")
-
-    uv = u * v
-
-    adv_u = (differentiate_metric(u * u, x) + differentiate_metric(uv, y)
-             + differentiate_metric(u * w, 'z') - u * divergence_3d)
-
-    adv_v = (differentiate_metric(uv, x) + differentiate_metric(v * v, y)
-             + differentiate_metric(v * w, 'z') - v * divergence_3d)
-
-    # Stack vectors
-    wind = stack_vector(u, v, name="wind")  # (comp=2, z, y, x, …)
-    advection = stack_vector(adv_u, adv_v, name="advection")
-
-    # Spectral vector inner products (sum over components)
-    pi_nke = - vector_cross_spectrum(wind, advection, norm=norm)
 
     return pi_nke.rename(name)
 
@@ -742,7 +689,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
                                                        divergence, vorticity,
                                                        norm=cfg.compute.norm)
     else:
-        transfer_2d = nonlinear_hke_transfer(u, v, w, divergence, norm=cfg.compute.norm)
+        transfer_2d = nonlinear_hke_transfer_flux(u, v, w, divergence, norm=cfg.compute.norm)
 
     transfer_1d = isotropize(transfer_2d, dx, dy)
 
