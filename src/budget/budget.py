@@ -3,6 +3,8 @@ import xarray as xr
 from typing import Union
 from dataclasses import dataclass
 
+from .io_utils import _coord_is_degrees, _is_lon, _is_lat
+
 # Constants
 g = 9.80665  # gravitational acceleration (m / s**2)
 cp = 1004.0  # specific heat at constant pressure for dry air (J / kg / K)
@@ -34,58 +36,6 @@ def _ensure_spatial_single_chunk(da: xr.DataArray, dims: tuple[str, str, str]) -
         return da.chunk({y: -1, x: -1})
     except Exception:
         return da
-
-
-def _has(cname: str, coords) -> bool:
-    return (cname in coords) and hasattr(coords[cname], "attrs")
-
-
-def _is_lat(cname: str, coords) -> bool:
-    if not _has(cname, coords):
-        return False
-    da = coords[cname]
-    name_ok = ("lat" in cname.lower()) or ('latitude' in cname.lower())
-    units = str(da.attrs.get("units", "")).lower()
-    stdn = str(da.attrs.get("standard_name", "")).lower()
-    axis = str(da.attrs.get("axis", "")).upper()
-    units_ok = any(u in units for u in ("degree", "degrees", "degrees_north"))
-    std_ok = stdn in ("latitude",)
-    axis_ok = axis == "Y" and ("degree" in units or "north" in units)
-    return name_ok or units_ok or std_ok or axis_ok
-
-
-def _is_lon(cname: str, coords) -> bool:
-    if not _has(cname, coords):
-        return False
-    da = coords[cname]
-    name_ok = ("lon" in cname.lower()) or ("long" in cname.lower())
-    units = str(da.attrs.get("units", "")).lower()
-    stdn = str(da.attrs.get("standard_name", "")).lower()
-    axis = str(da.attrs.get("axis", "")).upper()
-    units_ok = any(u in units for u in ("degree", "degrees", "degrees_east"))
-    std_ok = stdn in ("longitude",)
-    axis_ok = axis == "X" and ("degree" in units or "east" in units)
-    return name_ok or units_ok or std_ok or axis_ok
-
-
-def is_lonlat(obj: Union[xr.Dataset, xr.DataArray], dims: tuple[str, str]) -> bool:
-    """
-    Return True if the given (y, x) dims look like latitude/longitude.
-
-    Heuristics (any strong match is enough):
-      - dim names contain 'lat'/'lon' (case-insensitive)
-      - CF-ish units on coords: degrees_[north|east], degree, degrees
-      - CF axis attributes: axis='Y' with lat-like units, axis='X' with lon-like units
-    """
-    y, x = dims
-    # Where to look for coords (Dataset or DataArray)
-    coords = obj.coords if isinstance(obj, xr.DataArray) else obj
-
-    # If coords are missing, we can’t tell—assume not lon/lat
-    if (y not in coords) or (x not in coords):
-        return False
-
-    return _is_lat(y, coords) and _is_lon(x, coords)
 
 
 def get_spatial_dims(obj: Union[xr.Dataset, xr.DataArray]) -> tuple[str, str]:
@@ -135,35 +85,57 @@ def global_mean(da: xr.DataArray) -> xr.DataArray:
 # --- metric-aware horizontal derivatives in physical meters ---
 # --------------------------------------------------------------------------------------------------
 def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None) -> xr.DataArray:
-    """Metric-aware first derivative in **meters** along a horizontal dimension.
     """
+    Metric-aware first derivative **in meters** along `dim`.
 
+    - If `delta` is given (meters), assumes constant spacing along `dim`.
+    - If `dim` is longitude/latitude (per `_is_lon` / `_is_lat`), applies the spherical metric:
+        d/dx = (π/180)/(R cos φ) * d/dλ   (for longitude, if coord in degrees)
+        d/dy = (π/180)/R          * d/dφ   (for latitude,  if coord in degrees)
+      (If coords are already in radians, omit π/180.)
+    - Otherwise (Cartesian dims, incl. `z`), uses `.differentiate(dim)` and converts km→m if needed.
+    """
     if dim not in da.dims:
-        raise ValueError(
-            f"differentiate_metric: dim '{dim}' not in DataArray dims {tuple(da.dims)}")
+        raise ValueError(f"differentiate_metric: dim '{dim}' not in {tuple(da.dims)}")
 
-    # Cartesian path
-    if delta is not None:
-        target = xr.DataArray(np.arange(da.sizes[dim]) * delta, dims=dim, attrs={"units": "m"})
-        return da.assign_coords({dim: target}).differentiate(dim, edge_order=2)
+    # Fetch the coordinate
+    coord = da.coords.get(dim, None)
 
-    # Detect lon/lat from provided dims, if any
-    if get_spatial_dims(da) == ("lat", "lon"):
-        # degrees vs radians on 'dim'
-        coords = da.coords
-        unit_to_rad = np.pi / 180.0
+    if coord is None:
+        if delta is None:
+            raise ValueError(
+                f"differentiate_metric: No coordinate found for dim '{dim}' "
+                f"and no 'delta' provided; cannot determine metric spacing."
+            )
+        # index-based derivative (spacing=1) scaled by constant delta [m]
+        return da.differentiate(dim, edge_order=2) / float(delta)
 
-        if _is_lon(dim, coords):
-            # latitude derivative
-            phi_rad = np.deg2rad(coords['lat'])
-            factor = unit_to_rad / (earth_radius * np.cos(phi_rad))
-        else:
-            # latitude derivative
-            factor = unit_to_rad / (earth_radius * xr.ones_like(coords['lat']))
-    else:
-        factor = 1.0
+    # Longitude
+    if _is_lon(dim, da.coords):
+        # Need latitude for cos(phi)
+        lat = da.coords['lat']
+        phi = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
+        cos_phi = xr.ufuncs.cos(phi)
+        cos_phi = xr.where(cos_phi < 1e-12, 1e-12, cos_phi)
 
-    return factor * da.differentiate(dim, edge_order=2)
+        # convert from coord-units to per-meter
+        d_lam = (np.pi / 180.0) if _coord_is_degrees(coord) else 1.0
+        factor = d_lam / (earth_radius * cos_phi)  # rad/m
+
+        return factor * da.differentiate(dim, edge_order=2)
+
+    # Latitude
+    if _is_lat(dim, da.coords):
+        d_phi = (np.pi / 180.0) if _coord_is_degrees(coord) else 1.0
+        factor = d_phi / earth_radius  # rad/m
+        return factor * da.differentiate(dim, edge_order=2)
+
+    # Cartesian (incl. 'z'): convert km→m if the coord says 'km'
+    units = str(getattr(coord, "units", "")).lower()
+    if "km" in units and "m" not in units:
+        return (1e-3) * da.differentiate(dim, edge_order=2)
+
+    return da.differentiate(dim, edge_order=2)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -304,8 +276,7 @@ def _prep_bins(nx: int, ny: int, dx: float, dy: float, nyquist=True):
     kx = np.fft.rfftfreq(nx_pos, dx / (2 * np.pi))  # length nx (half-plane)
     ky = np.fft.fftshift(np.fft.fftfreq(ny, dy / (2 * np.pi)))  # length ny (centered)
 
-    Kx, Ky = np.meshgrid(kx, ky, indexing="xy")
-    kh_grid = np.hypot(Kx, Ky).astype(np.float64)
+    kh_grid = np.hypot(*np.meshgrid(kx, ky, indexing="xy")).astype(np.float64)
 
     delta = 2.0 * np.pi / min(dx * nx_pos, dy * ny)
 
@@ -439,6 +410,18 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray,
     return u_term + v_term
 
 
+def compute_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
+    """Horizontal divergence."""
+    y, x = get_spatial_dims(u)
+    return differentiate_metric(u, x) + differentiate_metric(v, y)
+
+
+def compute_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
+    """Vertical vorticity."""
+    y, x = get_spatial_dims(u)
+    return differentiate_metric(v, x) - differentiate_metric(u, y)
+
+
 def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = None,
                            name="hke") -> xr.DataArray:
     """Horizontal kinetic energy per unit mass spectrum: ½(|Û|² + |V̂|²)."""
@@ -446,7 +429,7 @@ def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = 
     return hke.rename(name)
 
 
-def nonlinear_kinetic_energy_transfer(
+def nonlinear_hke_transfer(
         u: xr.DataArray,
         v: xr.DataArray,
         w: xr.DataArray,
@@ -499,10 +482,60 @@ def nonlinear_kinetic_energy_transfer(
     return pi_nke.rename(name)
 
 
-def nonlinear_kinetic_energy_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
-                                                divergence: xr.DataArray, vorticity: xr.DataArray,
-                                                norm: str | None = None,
-                                                name="pi_nke") -> xr.DataArray:
+def nonlinear_hke_transfer_conservative(
+        u: xr.DataArray,
+        v: xr.DataArray,
+        w: xr.DataArray,
+        divergence: Union[xr.DataArray | None] = None,
+        norm: str | None = None,
+        name="pi_nke"
+) -> xr.DataArray:
+    """
+    Nonlinear transfer term for horizontal kinetic energy (HKE), conservative (divergence) form.
+
+    Implements, component-wise,
+        (u·∇)u = ∂x(u * u) + ∂y(u * v) + ∂z(u * w) − u (∂x u + ∂y v + ∂z w)
+        (u·∇)v = ∂x(v * u) + ∂y(v * v) + ∂z(v * w) − v (∂x u + ∂y v + ∂z w)
+
+    Horizontal derivatives are metric-aware via `differentiate_metric` (handles lon/lat);
+    vertical derivatives use `.differentiate("z")`.
+
+    Returns
+    -------
+    xr.DataArray
+        Spectral nonlinear HKE transfer:  -⟨u, (u·∇)u⟩ - ⟨v, (u·∇)v⟩
+        with dims ('ky','kx', ...).
+    """
+    y, x = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
+
+    # 3D divergence used for anelastic correction
+    if divergence is None:
+        divergence = compute_divergence(u, v)
+
+    # 3D divergence used for anelastic correction
+    divergence_3d = divergence + differentiate_metric(w, "z")
+
+    uv = u * v
+
+    adv_u = (differentiate_metric(u * u, x) + differentiate_metric(uv, y)
+             + differentiate_metric(u * w, 'z') - u * divergence_3d)
+
+    adv_v = (differentiate_metric(uv, x) + differentiate_metric(v * v, y)
+             + differentiate_metric(v * w, 'z') - v * divergence_3d)
+
+    # Stack vectors
+    wind = stack_vector(u, v, name="wind")  # (comp=2, z, y, x, …)
+    advection = stack_vector(adv_u, adv_v, name="advection")
+
+    # Spectral vector inner products (sum over components)
+    pi_nke = - vector_cross_spectrum(wind, advection, norm=norm)
+
+    return pi_nke.rename(name)
+
+
+def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                                     divergence: xr.DataArray, vorticity: xr.DataArray,
+                                     norm: str | None = None, name="pi_nke") -> xr.DataArray:
     """Invariant-form nonlinear KE transfer (Augier & Lindborg 2013, Eq. A2).
 
     Works in the current workflow using xarray stacking and spectral primitives:
@@ -524,6 +557,11 @@ def nonlinear_kinetic_energy_transfer_invariant(u: xr.DataArray, v: xr.DataArray
                               v.differentiate('z', edge_order=2),
                               name="wind_shear")
 
+    # Divergence and vorticity. Compute if any is absent for consistency.
+    if divergence is None or vorticity is None:
+        divergence = compute_divergence(u, v)
+        vorticity = compute_vorticity(u, v)
+
     # Rotational form advection vector
     advection = grad_hke + vorticity * rotate_vector(wind)
     advection += (divergence * wind + w * wind_shear) / 2.0
@@ -537,12 +575,60 @@ def nonlinear_kinetic_energy_transfer_invariant(u: xr.DataArray, v: xr.DataArray
     return pi_nke.rename(name)
 
 
-def turbulent_momentum_flux(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
-                            norm: str | None, name="vf_hke") -> xr.DataArray:
+def nonlinear_vke_transfer(
+        u: xr.DataArray,
+        v: xr.DataArray,
+        w: xr.DataArray,
+        divergence: Union[xr.DataArray | None] = None,
+        norm: str | None = None,
+        name="pi_vke"
+) -> xr.DataArray:
+    """Nonlinear transfer term for vertical kinetic energy (VKE), vectorized.
+
+    Uses the compact form:
+        T = -⟨w, Aw⟩ + ⟨∂z w, w^2⟩
+    where U = (u, v),
+          A = (u ∂x w + v ∂y w + ½ div·w + ½ w ∂z w) / 2
+
+    All horizontal derivatives use `differentiate_metric` (metric-aware on lon/lat).
+    Vertical derivatives use `.differentiate("z")`.
+    """
+    y, x = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
+
+    # Horizontal & vertical derivatives
+    dxw = differentiate_metric(w, x)
+    dyw = differentiate_metric(w, y)
+    dzw = w.differentiate("z", edge_order=2)
+
+    # Divergence (compute if absent)
+    if divergence is None:
+        divergence = compute_divergence(u, v)
+
+    # Advection-like vector A and transport vector wU
+    advection_w = (u * dxw + v * dyw) + 0.5 * (divergence * w) + 0.5 * (w * dzw)
+
+    # Spectral vector inner products (sum over components)
+    t_adv = - cross_spectrum(w, advection_w, norm=norm)  # -⟨w, Aw⟩
+    t_shear = vector_cross_spectrum(dzw, w * w, norm=norm)  # ⟨∂z w, w^2⟩
+
+    pi_nke = t_adv + t_shear
+
+    return pi_nke.rename(name)
+
+
+def turbulent_hke_flux(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                       norm: str | None, name="vf_hke") -> xr.DataArray:
     """Vertical flux of HKE: -½⟨u, w u⟩ - ½⟨v, w v⟩ in spectral space."""
 
     vf_hke = -0.5 * (cross_spectrum(u, w * u, norm) + cross_spectrum(v, w * v, norm))
     return vf_hke.rename(name)
+
+
+def turbulent_vke_flux(w: xr.DataArray, norm: str | None, name="vf_vke") -> xr.DataArray:
+    """Vertical flux of HKE: -½⟨u, w u⟩ - ½⟨v, w v⟩ in spectral space."""
+
+    vf_vke = -0.5 * cross_spectrum(w, w * w, norm)
+    return vf_vke.rename(name)
 
 
 def pressure_flux(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
@@ -579,18 +665,6 @@ def accumulate(da: xr.DataArray) -> xr.DataArray:
     """Cumulative integral toward low wavenumbers along ``k`` → ``wavenumber``."""
     sorted_da = da.sortby("wavenumber", ascending=False)
     return sorted_da.cumsum("wavenumber").sortby("wavenumber")
-
-
-def compute_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
-    """Horizontal divergence."""
-    y, x = get_spatial_dims(u)
-    return differentiate_metric(u, x) + differentiate_metric(v, y)
-
-
-def compute_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
-    """Vertical vorticity."""
-    y, x = get_spatial_dims(u)
-    return differentiate_metric(v, x) - differentiate_metric(u, y)
 
 
 def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
@@ -663,17 +737,17 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # in compute_budget:
     mode = getattr(cfg.compute, "transfer_form", "invariant")  # "invariant" | "flux"
 
-    if mode == "invariant" and divergence is not None and vorticity is not None:
-        transfer_2d = nonlinear_kinetic_energy_transfer_invariant(u, v, w,
-                                                                  divergence, vorticity,
-                                                                  norm=cfg.compute.norm)
+    if mode == "invariant":  # Rotational form of the horizontal advection term
+        transfer_2d = nonlinear_hke_transfer_invariant(u, v, w,
+                                                       divergence, vorticity,
+                                                       norm=cfg.compute.norm)
     else:
-        transfer_2d = nonlinear_kinetic_energy_transfer(u, v, w, divergence, norm=cfg.compute.norm)
+        transfer_2d = nonlinear_hke_transfer(u, v, w, divergence, norm=cfg.compute.norm)
 
     transfer_1d = isotropize(transfer_2d, dx, dy)
 
     # --- vertical flux of HKE and its divergence ---
-    fh_2d = turbulent_momentum_flux(u, v, w, cfg.compute.norm)
+    fh_2d = turbulent_hke_flux(u, v, w, cfg.compute.norm)
     fh_1d = isotropize(fh_2d, dx, dy)
     vfd_dke_1d = isotropize(fh_2d.differentiate('z', edge_order=2), dx, dy).rename("vfd_dke")
 

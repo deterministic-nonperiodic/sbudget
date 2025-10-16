@@ -1,7 +1,102 @@
 from pathlib import Path
-import xarray as xr
+
 import shutil
-from .budget import is_lonlat  # reuse heuristic
+import numpy as np
+import xarray as xr
+
+from typing import Union
+
+
+# ----------------------
+# Compact CF-aware utils
+# ----------------------
+def _has(cname: str, coords) -> bool:
+    """Return True if coordinate name exists."""
+    return cname in coords
+
+
+def _norm_units(u: str) -> str:
+    """Normalize CF-ish units for robust checks."""
+    u = (u or "").strip().lower()
+    u = u.replace("°", "degree").replace("-", "_").replace(" ", "_")
+    return u
+
+
+def _coord_is_degrees(
+        coord: xr.DataArray,
+        allow_infer: bool = True,
+        tol: float = 1e-12,
+) -> bool:
+    """
+    True if `coord` uses degrees (CF-compliant). If units are absent/ambiguous and
+    `is_lon` or `is_lat` is True, infer degrees when |values| exceed 2π (cannot be radians).
+    """
+    units = _norm_units(coord.attrs.get("units", ""))
+
+    # Explicit units
+    if "radian" in units:
+        return False
+    if units == "deg" or units.startswith("degree") or units.startswith("degrees"):
+        return True
+
+    # Heuristic inference for lon/lat when units missing/unknown
+    if allow_infer:
+        vals = np.asarray(coord.values)
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            max_abs = float(np.nanmax(np.abs(vals)))
+            if max_abs > (2.0 * np.pi + tol):
+                return True  # exceeds radians range → treat as degrees
+
+    return False
+
+
+def _is_lat(cname: str, coords) -> bool:
+    """CF-ish latitude detection with name/units/standard_name/axis signals."""
+    if not _has(cname, coords):
+        return False
+    da = coords[cname]
+    name = cname.lower()
+    units = _norm_units(da.attrs.get("units", ""))
+    stdn = (da.attrs.get("standard_name", "") or "").strip().lower()
+    axis = (da.attrs.get("axis", "") or "").strip().upper()
+
+    name_ok = ("lat" in name) or ("latitude" in name)
+    units_ok = ("degree" in units and ("north" in units or units in ("degree", "degrees", "deg")))
+    std_ok = (stdn == "latitude")
+    axis_ok = (axis == "Y" and ("degree" in units or "north" in units))
+    return name_ok or units_ok or std_ok or axis_ok
+
+
+def _is_lon(cname: str, coords) -> bool:
+    """CF-ish longitude detection with name/units/standard_name/axis signals."""
+    if not _has(cname, coords):
+        return False
+    da = coords[cname]
+    name = cname.lower()
+    units = _norm_units(da.attrs.get("units", ""))
+    stdn = (da.attrs.get("standard_name", "") or "").strip().lower()
+    axis = (da.attrs.get("axis", "") or "").strip().upper()
+
+    name_ok = ("lon" in name) or ("long" in name) or ("longitude" in name)
+    units_ok = ("degree" in units and ("east" in units or units in ("degree", "degrees", "deg")))
+    std_ok = (stdn == "longitude")
+    axis_ok = (axis == "X" and ("degree" in units or "east" in units))
+    return name_ok or units_ok or std_ok or axis_ok
+
+
+def is_lonlat(obj: Union[xr.Dataset, xr.DataArray], dims: tuple[str, str]) -> bool:
+    """
+    True if dims look like (lat, lon) by CF-ish signals on coords.
+    Requires both dims to be present as coords.
+    """
+    y, x = dims
+    coords = obj.coords if isinstance(obj, xr.DataArray) else obj
+
+    if (y not in coords) or (x not in coords):
+        return False
+
+    return _is_lat(y, coords) and _is_lon(x, coords)
 
 
 def open_dataset(cfg) -> xr.Dataset:
@@ -32,15 +127,12 @@ def open_dataset(cfg) -> xr.Dataset:
     if rename:
         ds = ds.rename(rename)
 
-    # 2) normalize coordinate names to standard ones
+    # Normalize coordinate names to standard ones
     # cfg.input.dims: the ORIGINAL dimension names in the file, e.g. ["z_mc", "lat", "lon"] or ["z", "y", "x"]
     z_name, y_name, x_name = cfg.input.dims
 
-    # Detect lon-lat-like
-    looks_lonlat = is_lonlat(ds, (y_name, x_name))
-
     # standard target names
-    if looks_lonlat:
+    if is_lonlat(ds, (y_name, x_name)):
         target_y, target_x = "lat", "lon"
         ds.attrs["grid_type"] = "lonlat"
     else:
@@ -61,7 +153,7 @@ def open_dataset(cfg) -> xr.Dataset:
     if dim_rename:
         ds = ds.rename_dims(dim_rename)
 
-    # 2) Rename coordinate variables if they still exist under their OLD names
+    # Rename coordinate variables if they still exist under their OLD names
     #    (compute this AFTER rename_dims so we check current membership)
     coord_rename = {}
     if z_name in ds.coords and z_name != "z":
@@ -74,7 +166,7 @@ def open_dataset(cfg) -> xr.Dataset:
     if coord_rename:
         ds = ds.rename(coord_rename)
 
-    # 3) (Optional) ensure that standardized coords are dimension/index coords
+    # (Optional) ensure that standardized coords are dimension/index coords
     #    This avoids the “rename does not create an index” warning paths.
     for cname in ("z", target_y, target_x):
         if cname in ds.coords and cname in ds.dims:
