@@ -85,6 +85,24 @@ def _is_lon(cname: str, coords) -> bool:
     return name_ok or units_ok or std_ok or axis_ok
 
 
+def _is_z(cname: str, coords) -> bool:
+    """CF-ish longitude detection with name/units/standard_name/axis signals."""
+    if not _has(cname, coords):
+        return False
+    da = coords[cname]
+    name = cname.lower()
+    units = _norm_units(da.attrs.get("units", ""))
+    stdn = (da.attrs.get("standard_name", "") or "").strip().lower()
+    axis = (da.attrs.get("axis", "") or "").strip().upper()
+
+    name_ok = ("z" in name) or ("height" in name) or ("geometric_height" in name) or ("altitude" in
+                                                                                      name)
+    units_ok = ("m" in units and ("meter" in units or units in ("meters",)))
+    std_ok = (stdn == "altitude")
+    axis_ok = (axis == "Z" and ("meter" in units))
+    return name_ok or units_ok or std_ok or axis_ok
+
+
 def is_lonlat(obj: Union[xr.Dataset, xr.DataArray], dims: tuple[str, str]) -> bool:
     """
     True if dims look like (lat, lon) by CF-ish signals on coords.
@@ -97,6 +115,22 @@ def is_lonlat(obj: Union[xr.Dataset, xr.DataArray], dims: tuple[str, str]) -> bo
         return False
 
     return _is_lat(y, coords) and _is_lon(x, coords)
+
+
+def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
+    """Interpolate to common vertical levels"""
+
+    z_candidate = []
+    for dim in ds.dims:
+        if dim not in ("time", "x", "y", target_name):
+            z_candidate.append(dim)
+
+    for z_dim in z_candidate:
+        # Check for metadata consistent with vertical coordinate
+        if _is_z(z_dim, ds.coords):
+            ds = ds.interp({z_dim: ds[target_name]}, method="linear").drop_vars(z_dim)
+
+    return ds
 
 
 def open_dataset(cfg) -> xr.Dataset:
@@ -173,6 +207,12 @@ def open_dataset(cfg) -> xr.Dataset:
             # Make sure the coord is indexed by its own dim
             # (no-op if already true; harmless otherwise)
             ds = ds.set_coords(cname)
+
+    # Interpolate to consistent vertical coordinates
+    ds = ensure_vertical_consistent(ds)
+
+    # Apply consistent rechunking:
+    ds = ds.chunk("auto")
 
     return ds
 
