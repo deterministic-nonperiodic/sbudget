@@ -120,15 +120,20 @@ def is_lonlat(obj: Union[xr.Dataset, xr.DataArray], dims: tuple[str, str]) -> bo
 def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
     """Interpolate to common vertical levels"""
 
-    z_candidate = []
-    for dim in ds.dims:
-        if dim not in ("time", "x", "y", target_name):
-            z_candidate.append(dim)
+    if target_name not in ds.coords:
+        raise ValueError(f"'target_name' '{target_name}' is not a coordinate in the dataset.")
+
+    # Candidate vertical dims: anything that's not the standardized horizontal/time or target_name
+    excluded = {"time", "x", "y", target_name}
+    z_candidate = [str(d) for d in ds.dims if _is_z(str(d), ds.coords) and (d not in excluded)]
 
     for z_dim in z_candidate:
         # Check for metadata consistent with vertical coordinate
-        if _is_z(z_dim, ds.coords):
-            ds = ds.interp({z_dim: ds[target_name]}, method="linear").drop_vars(z_dim)
+        print(f"Interpolating vertical coord {z_dim} --> {target_name} ...")
+        ds = ds.interp({z_dim: ds[target_name]}, method="linear")
+
+        if z_dim in ds.coords:
+            ds = ds.drop_vars(z_dim)
 
     return ds
 
