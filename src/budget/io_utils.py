@@ -1,10 +1,11 @@
 from pathlib import Path
 
 import shutil
+import math
 import numpy as np
 import xarray as xr
 
-from typing import Union
+from typing import Union, Tuple, Optional, Dict
 
 
 # ----------------------
@@ -138,6 +139,74 @@ def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
     return ds
 
 
+def ensure_optimal_chunking(
+        ds: xr.Dataset,
+        spatial_dims: Tuple[str, str] = ("lat", "lon"),  # e.g. ("y","x") or ("lat","lon")
+        vertical_dim: str = "z",
+        target_chunk_mb: int = 64,
+        preferred: Optional[Dict[str, int]] = None,  # any extra dims you want to chunk
+        quiet: bool = False,
+) -> xr.Dataset:
+    """
+    Rechunk for fast 2-D FFTs (physical space).
+
+    - Forces single chunks along `spatial_dims` (FFT axes).
+    - Tiles over 'time' and `vertical_dim` to aim for ~`target_chunk_mb` per chunk.
+    - `preferred` can add chunking for *other* dims (never overrides spatial dims).
+    """
+    preferred = dict(preferred or {})
+    y, x = spatial_dims
+    if y not in ds.dims or x not in ds.dims:
+        raise ValueError(f"Spatial dims {spatial_dims} must exist in dataset dims {tuple(ds.dims)}")
+
+    # element size (bytes): pick the max dtype across variables
+    item_size = max(
+        (int(getattr(v.data, "dtype", np.dtype("float64")).itemsize) for v in
+         ds.data_vars.values()),
+        default=8,
+    )
+
+    bytes_plane = item_size * ds.sizes[y] * ds.sizes[x]  # one full (y,x) plane
+    target_bytes = int(target_chunk_mb * 1024 ** 2)
+    budget_mult = max(1, target_bytes // max(1, bytes_plane))  # how many (time*z) we can pack
+
+    # build chunk plan
+    plan: Dict[str, int] = {y: -1, x: -1}  # single chunk along FFT axes
+
+    # choose time/z tiles within budget
+    t_guess = int(ds.sizes["time"]) if "time" in ds.dims else 1
+    z_guess = int(ds.sizes[vertical_dim]) if "z" in ds.dims else 1
+
+    if ("time" in ds.dims) and (vertical_dim in ds.dims):
+        # start from hints; if over budget, redistribute near-sqrt
+        t_chunk = t_guess
+        z_chunk = z_guess
+        if t_chunk * z_chunk > budget_mult:
+            z_chunk = max(1, min(z_guess, int(math.sqrt(budget_mult))))
+            t_chunk = max(1, min(t_guess, budget_mult // z_chunk))
+        plan["time"] = max(1, t_chunk)
+        plan[vertical_dim] = max(1, z_chunk)
+    elif "time" in ds.dims:
+        plan["time"] = max(1, min(int(t_guess), budget_mult))
+    elif vertical_dim in ds.dims:
+        plan[vertical_dim] = max(1, min(int(z_guess), budget_mult))
+
+    # any extra dims from preferred (don’t override spatial/time/z decisions)
+    for d, c in preferred.items():
+        if d not in plan and d in ds.dims:
+            plan[d] = max(1, min(int(c), ds.sizes[d]))
+
+    out = ds.unify_chunks().chunk(plan)
+
+    if not quiet:
+        est = bytes_plane * max(1, plan.get("time", 1)) * max(1, plan.get(vertical_dim, 1))
+        msg = ", ".join(f"{d}={'all' if c == -1 else c}" for d, c in plan.items())
+        print(f"[chunking] ({y},{x}) single-chunk; plan: {msg} | "
+              f"~{est / 1024 ** 2:.1f} MB/chunk (target {target_chunk_mb} MB)")
+
+    return out
+
+
 def open_dataset(cfg) -> xr.Dataset:
     """Open input dataset and normalize variable names using cfg.variables.
 
@@ -217,7 +286,8 @@ def open_dataset(cfg) -> xr.Dataset:
     ds = ensure_vertical_consistent(ds)
 
     # Apply consistent rechunking:
-    ds = ds.chunk("auto")
+    # ds = ds.chunk("auto")
+    ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), target_chunk_mb=64)
 
     return ds
 

@@ -1,6 +1,6 @@
 input:
   path: ./model_output.nc
-  dims: [ z_mc,  lat, lon ]          # or [y, x]
+  dims: [ z_mc,  lat, lon ] # or [y, x]
   engine: h5netcdf          # optional: h5netcdf | netcdf4 | scipy
 
 output:
@@ -9,6 +9,8 @@ output:
   overwrite: true
 
 compute:
+  mode: spectral            # Type of scale-transfer physical vs spectral ["spectral", "physical"]
+  scales: null              # Used with mode "physical" wavelengths (m), e.g., [1000, 5000, 10000]
   norm: null                # or 'ortho'
   dx: null                  # only for Cartesian grids; lon/lat inferred
   dy: null
@@ -23,6 +25,7 @@ variables:
   u: u                     # zonal velocity
   v: v
   w: w
+  # The following variables only apply to mode "spectral"
   theta: theta              # preferred; if missing, derive from pressure & temperature
   pressure: p               # optional if theta present
   temperature: temp         # optional if theta present

@@ -14,6 +14,8 @@ dependencies:
   - dask>=2024.5.0
   - distributed
   - pyyaml                # read config.yaml
+  - pint                  # handling physical units
+  - pyproj                # handling map projections
 
   # NetCDF I/O (both engines so xarray doesn't complain)
   - netcdf4               # enables engine="netcdf4"
