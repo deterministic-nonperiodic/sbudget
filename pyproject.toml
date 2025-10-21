@@ -7,8 +7,9 @@ name = "sbudget"
 version = "0.1.0"
 description = "Spectral energy budget of a non-hydrostatic atmosphere"
 readme = "README.md"
-authors = [{ name = "Bharath Krishnan", email = "krishnan@iap-kborn.de" },
-    { name = "Yanmichel A. Morfa", email = "morfa@iap-kborn.de" }]
+authors = [
+    { name = "Yanmichel A. Morfa", email = "morfa@iap-kborn.de" },
+    { name = "Bharath Krishnan", email = "krishnan@iap-kborn.de" }]
 requires-python = ">=3.10"
 dependencies = [
     "xarray>=2024.1.0",
