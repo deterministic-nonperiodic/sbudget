@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "budget"
+name = "sbudget"
 version = "0.1.0"
 description = "Spectral energy budget of a non-hydrostatic atmosphere"
 readme = "README.md"
@@ -21,4 +21,4 @@ dependencies = [
 ]
 
 [project.scripts]
-budget = "budget.client:main"
+sbudget = "budget.client:main"
