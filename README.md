@@ -28,7 +28,7 @@ Terms $H_h(k)$, $J_h(k)$, and $D_h(k)$ are model-physics dependent and therefore
 
 - FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along 
   non-horizontal spatial dimensions
-- NetCDF output with CF-style metadata (horizontal coordinates replaced with wavenumber in rad m$^{-1}$)
+- NetCDF output with CF-style metadata (horizontal coordinates replaced with wavenumber in rad/m)
 
 ### Inter-scale transfer mode (```--mode scale_transfer```)
 
