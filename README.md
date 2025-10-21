@@ -14,7 +14,7 @@ $$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}
 +D_h(k).$$
 
 * $E_h(k)$ — isotropic spectrum of HKE at wavenumber $k$.
-* $t_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
+* $T_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
 * $F_{\uparrow}(k)$ — net **vertical flux** of HKE + pressure **pressure-work** flux
 * $C_{A\to h}(k)$ — **conversion** from APE to HKE.
 * $\mathrm{Div}_h(k)$ — tendency from **3-D divergence** processes.
