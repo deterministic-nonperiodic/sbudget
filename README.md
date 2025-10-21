@@ -1,4 +1,4 @@
-# budget
+# sbudget
 
 ### Spectral transfer mode (```--mode spectral```)
 
@@ -56,28 +56,28 @@ pip install .
 ### Examples
 ```bash
   # Quick help
-  budget --help
+  sbudget --help
  ``` 
 
 Inspect configuration file
   ```bash
-  budget inspect examples/config.yaml
+  sbudget inspect examples/config.yaml
   ```
 
 Compute budget based on configuration file
   ```bash  
-  budget compute examples/config.yaml
+  sbudget compute examples/config.yaml
 ```
 
 Tip: For best FFT performance, keep spatial axes as single chunks (the tool can enforce this with --rechunk-spatial)
 and parallelize across time/z.
 ```bash
-  budget compute examples/config.yaml --rechunk-spatial
+  sbudget compute examples/config.yaml --rechunk-spatial
 ```
 
 Inspect with on-the-fly overrides (without editing config file)
 ```bash
-  budget inspect examples/config.yaml \
+  sbudget inspect examples/config.yaml \
   --input-path ./data/model_output.nc \
   --dims z,lat,lon \
   --engine h5netcdf
@@ -85,7 +85,7 @@ Inspect with on-the-fly overrides (without editing config file)
 
 Write to a different file or store type (NetCDF/Zarr)
 ```bash
-  budget compute examples/config.yaml \
+  sbudget compute examples/config.yaml \
   --output-path ./out/budget.nc \
   --store netcdf --overwrite
 ```
@@ -93,7 +93,7 @@ Write to a different file or store type (NetCDF/Zarr)
 Switch to physical mode and define wavelength bands (meters). This mode calculates inter-scale 
 transfers at specified wavelengths based on third-order structure functions.
 ```bash
-  budget compute examples/config.yaml \
+  sbudget compute examples/config.yaml \
   --mode physical \
   --scales 1000,5000,10000
 ```
