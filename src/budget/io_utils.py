@@ -271,14 +271,12 @@ def open_dataset(cfg) -> xr.Dataset:
         coord_rename[x_name] = target_x
 
     if coord_rename:
-        ds = ds.rename(coord_rename)
+        ds = ds.rename_vars(coord_rename)
 
     # (Optional) ensure that standardized coords are dimension/index coords
-    #    This avoids the “rename does not create an index” warning paths.
     for cname in ("z", target_y, target_x):
         if cname in ds.coords and cname in ds.dims:
             # Make sure the coord is indexed by its own dim
-            # (no-op if already true; harmless otherwise)
             ds = ds.set_coords(cname)
 
     # Interpolate to consistent vertical coordinates
