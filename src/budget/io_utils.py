@@ -286,7 +286,6 @@ def open_dataset(cfg) -> xr.Dataset:
     ds = ensure_vertical_consistent(ds)
 
     # Apply consistent rechunking:
-    # ds = ds.chunk("auto")
     ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), target_chunk_mb=64)
 
     return ds
@@ -301,7 +300,6 @@ def write_dataset(ds: xr.Dataset, cfg) -> None:
             shutil.rmtree(out)
         ds.to_zarr(out, mode="w")
     elif cfg.output.store == "netcdf":
-        print(ds)
         ds.to_netcdf(out)
     else:
         raise ValueError("output.store must be 'zarr' or 'netcdf'")

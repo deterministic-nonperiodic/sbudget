@@ -78,8 +78,17 @@ def _cmd_compute(args) -> None:
         control_dict = {
             "verbose": True,
             "scales": cfg.compute.scales,
+            "ls_chunk_size": 1,  # write one scale at a time to limit memory use
         }
         out = inter_scale_kinetic_energy_transfer(ds, **control_dict)
+
+        # rechunk output to match input dataset chunking
+        if getattr(ds, "chunks", None) and "time" in ds.chunks:
+            time_chunks = ds.chunks["time"]  # a tuple of chunk sizes
+        else:
+            time_chunks = "auto"
+
+        out = out.chunk({"time": time_chunks, "length_scale": control_dict["ls_chunk_size"]})
 
     write_dataset(out, cfg)
     print(f"Wrote: {cfg.output.path}")
