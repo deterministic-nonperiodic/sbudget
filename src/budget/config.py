@@ -82,53 +82,57 @@ def _set_nested(obj, path, value):
         setattr(cur, last, value)
 
 
+def _get(args, name, default=None):
+    return getattr(args, name, default)
+
+
 def apply_overrides(cfg, args):
-    """
-    Apply argparse overrides into cfg (yaml loaded as dict or SimpleNamespace/dataclass).
-    Returns the mutated cfg.
-    """
-    # Normalize norm: user may pass 'none' to clear
-    norm = None if getattr(args, "norm", None) in (None, "none") else args.norm
+    """Apply argparse overrides into cfg (yaml dict or object). Missing args are ignored."""
+    norm_cli = _get(args, "norm", None)
+    norm = None if norm_cli in (None, "none") else norm_cli
 
     # input
-    _set_nested(cfg, ["input", "path"], args.input_path)
-    if args.dims:
-        _set_nested(cfg, ["input", "dims"], args.dims)
-    _set_nested(cfg, ["input", "engine"], args.engine)
+    _set_nested(cfg, ["input", "path"], _get(args, "input_path"))
+    dims = _get(args, "dims")
+    if dims: _set_nested(cfg, ["input", "dims"], dims)
+    _set_nested(cfg, ["input", "engine"], _get(args, "engine"))
 
     # output
-    _set_nested(cfg, ["output", "path"], args.output_path)
-    _set_nested(cfg, ["output", "store"], args.store)
-    if args.overwrite is not None:
-        _set_nested(cfg, ["output", "overwrite"], bool(args.overwrite))
+    _set_nested(cfg, ["output", "path"], _get(args, "output_path"))
+    _set_nested(cfg, ["output", "store"], _get(args, "store"))
+    ow = _get(args, "overwrite")
+    if ow is not None:
+        _set_nested(cfg, ["output", "overwrite"], bool(ow))
 
     # compute
-    _set_nested(cfg, ["compute", "mode"], args.mode)
-    if args.scales:
-        _set_nested(cfg, ["compute", "scales"], _to_float_list(args.scales))
-    if norm is not None or getattr(args, "norm", None) == "none":
+    _set_nested(cfg, ["compute", "mode"], _get(args, "mode"))
+    scales = _get(args, "scales")
+    if scales: _set_nested(cfg, ["compute", "scales"], _to_float_list(scales))
+    if norm is not None or norm_cli == "none":
         _set_nested(cfg, ["compute", "norm"], norm)
-    if args.dx is not None:
-        _set_nested(cfg, ["compute", "dx"], float(args.dx))
-    if args.dy is not None:
-        _set_nested(cfg, ["compute", "dy"], float(args.dy))
-    if args.cumulative is not None:
-        _set_nested(cfg, ["compute", "cumulative"], bool(args.cumulative))
-    _set_nested(cfg, ["compute", "transfer_form"], args.transfer_form)
-    if args.rechunk_spatial is not None:
-        _set_nested(cfg, ["compute", "rechunk_spatial"], bool(args.rechunk_spatial))
-    if args.dask_allow_rechunk is not None:
-        _set_nested(cfg, ["compute", "dask_allow_rechunk"], bool(args.dask_allow_rechunk))
-    _set_nested(cfg, ["compute", "scheduler"], args.scheduler)
+    dx = _get(args, "dx")
+    dy = _get(args, "dy")
+    if dx is not None: _set_nested(cfg, ["compute", "dx"], float(dx))
+    if dy is not None: _set_nested(cfg, ["compute", "dy"], float(dy))
+
+    cum = _get(args, "cumulative")
+    if cum is not None: _set_nested(cfg, ["compute", "cumulative"], bool(cum))
+    _set_nested(cfg, ["compute", "transfer_form"], _get(args, "transfer_form"))
+
+    rs = _get(args, "rechunk_spatial")
+    if rs is not None: _set_nested(cfg, ["compute", "rechunk_spatial"], bool(rs))
+    dar = _get(args, "dask_allow_rechunk")
+    if dar is not None: _set_nested(cfg, ["compute", "dask_allow_rechunk"], bool(dar))
+    _set_nested(cfg, ["compute", "scheduler"], _get(args, "scheduler"))
 
     # variables
-    _set_nested(cfg, ["variables", "u"], args.var_u)
-    _set_nested(cfg, ["variables", "v"], args.var_v)
-    _set_nested(cfg, ["variables", "w"], args.var_w)
-    _set_nested(cfg, ["variables", "theta"], args.var_theta)
-    _set_nested(cfg, ["variables", "pressure"], args.var_pressure)
-    _set_nested(cfg, ["variables", "temperature"], args.var_temperature)
-    _set_nested(cfg, ["variables", "divergence"], args.var_divergence)
-    _set_nested(cfg, ["variables", "vorticity"], args.var_vorticity)
+    _set_nested(cfg, ["variables", "u"], _get(args, "var_u"))
+    _set_nested(cfg, ["variables", "v"], _get(args, "var_v"))
+    _set_nested(cfg, ["variables", "w"], _get(args, "var_w"))
+    _set_nested(cfg, ["variables", "theta"], _get(args, "var_theta"))
+    _set_nested(cfg, ["variables", "pressure"], _get(args, "var_pressure"))
+    _set_nested(cfg, ["variables", "temperature"], _get(args, "var_temperature"))
+    _set_nested(cfg, ["variables", "divergence"], _get(args, "var_divergence"))
+    _set_nested(cfg, ["variables", "vorticity"], _get(args, "var_vorticity"))
 
     return cfg

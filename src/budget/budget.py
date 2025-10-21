@@ -5,7 +5,7 @@ import numpy as np
 import xarray as xr
 
 from .constants import cp, ps, chi, earth_radius
-from .io_utils import _coord_is_degrees, _is_lon, _is_lat
+from .cf_coords import _coord_is_degrees, _is_lon, _is_lat, get_spatial_dims, infer_resolution
 
 
 # --------------------------------------------------------------------------------------------------
@@ -32,46 +32,20 @@ def _ensure_spatial_single_chunk(da: xr.DataArray, dims: tuple[str, str, str]) -
         return da
 
 
-def get_spatial_dims(obj: Union[xr.Dataset, xr.DataArray]) -> tuple[str, str]:
-    """Return standardized horizontal dims: ('lat','lon') if present, else ('y','x')."""
-    coords = obj.coords if isinstance(obj, xr.DataArray) else obj
-    if ("lat" in coords) and ("lon" in coords):
-        return "lat", "lon"
-    if ("y" in coords) and ("x" in coords):
-        return "y", "x"
-    # fallback: try dims attr
-    dims = getattr(obj, "dims", ())
-    if "lat" in dims and "lon" in dims:
-        return "lat", "lon"
-    if "y" in dims and "x" in dims:
-        return "y", "x"
-    raise ValueError("Could not determine horizontal dims; expected ('lat','lon') or ('y','x').")
-
-
-def infer_dx_dy(ds: xr.Dataset):
-    y, x = get_spatial_dims(ds)
-
-    ycoord = ds[y]
-    xcoord = ds[x]
-    if y == "lat" and x == "lon":
-        d_lat = np.deg2rad(float(ycoord.diff(y).median()))
-        d_lon = np.deg2rad(float(xcoord.diff(x).median()))
-        phi = np.deg2rad(float(ycoord.median()))
-        dy = earth_radius * d_lat
-        dx = earth_radius * np.cos(phi) * d_lon
-    else:
-        dy = float(ycoord.diff(y).median())
-        dx = float(xcoord.diff(x).median())
-    return dx, dy
-
-
 def global_mean(da: xr.DataArray) -> xr.DataArray:
+    """
+    cos(lat) weighted mean over (y,x).
+    Supports lat as 1-D (lat) or 2-D lat(y,x). Falls back to plain mean if no lat.
+    """
     y, x = get_spatial_dims(da)
 
-    if y == "lat" and x == "lon":
-        w = np.cos(np.deg2rad(da[y]))
-        return da.weighted(w).mean(dim=(y, x))
+    if _is_lat(y, da.coords):
+        lat = da["lat"]
+        lat_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
+
+        return da.weighted(np.cos(lat_rad)).mean(dim=(y, x))
     else:
+        # unexpected lat layout
         return da.mean(dim=(y, x))
 
 
@@ -633,6 +607,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # --- dims & spacing ---
     # Expect cfg.input.dims as [z, y, x] or [z, lat, lon]
     space_dims = ("z",) + get_spatial_dims(ds)
+    print(f"Resolved spatial dimensions {space_dims}")
 
     # After open_dataset(), variable names are normalized to logical names.
     u = ds["u"]
@@ -646,11 +621,11 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     # dx, dy infer if not set
     if cfg.compute.dx is None or cfg.compute.dy is None:
-        dx, dy = infer_dx_dy(ds)
+        dx, dy = infer_resolution(ds)
+        print(f"Estimated resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
     else:
         dx, dy = cfg.compute.dx, cfg.compute.dy
-
-    print(f"Estimated resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
+        print(f"Specified resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
 
     # --- potential temperature ---
     theta = ds.get("theta")

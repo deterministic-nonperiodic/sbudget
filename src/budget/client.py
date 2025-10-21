@@ -7,34 +7,7 @@ from .budget import compute_budget
 from .config import load_config, apply_overrides
 from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
 from .io_utils import open_dataset, write_dataset
-
-
-def _cf_guess(ds: xr.Dataset, target: str) -> str | None:
-    """Very light CF-based guess for a logical variable name.
-
-    Looks at ``standard_name`` and common units to suggest a candidate when a
-    configured variable is missing. This is *advisory* only.
-    """
-    cf_map = {
-        "u": {"standard_names": {"eastward_wind"}, "units": {"m s-1", "m/s"}},
-        "v": {"standard_names": {"northward_wind"}, "units": {"m s-1", "m/s"}},
-        "w": {"standard_names": {"upward_air_velocity", "vertical_velocity_in_air"},
-              "units": {"m s-1", "Pa s-1"}},
-        "pressure": {"standard_names": {"air_pressure"}, "units": {"Pa", "pascal"}},
-        "temperature": {"standard_names": {"air_temperature"}, "units": {"K", "kelvin"}},
-        "theta": {"standard_names": {"air_potential_temperature"}, "units": {"K", "kelvin"}},
-        "divergence": {"standard_names": {"divergence_of_wind"}, "units": {"s-1"}},
-        "vorticity": {"standard_names": {"relative_vorticity"}, "units": {"s-1"}},
-    }
-    rule = cf_map.get(target)
-    if rule is None:
-        return None
-    for name, da in ds.data_vars.items():
-        std = str(da.attrs.get("standard_name", ""))
-        units = str(da.attrs.get("units", ""))
-        if std in rule["standard_names"] or any(u in units for u in rule["units"]):
-            return name
-    return None
+from .cf_coords import _cf_guess
 
 
 def _report_var_existence(raw: xr.Dataset, cfg) -> str:
