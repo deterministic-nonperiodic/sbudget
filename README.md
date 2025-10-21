@@ -18,14 +18,16 @@ output on either regular lon–lat (equiangular) or Cartesian horizontal grids, 
 
 ### Inter-scale transfer mode (```--mode physical```)
 The user can switch to this mode, which computes local scale-to-scale transfers at specified 
-wavelengths based on third-order structure functions. This code is largely based on [LoSSETT](https://github.com/ElliotMG/LoSSETT).
-The energy transfer from scales larger than $\ell$ to scales smaller than $\ell$ is derived in 
+wavelengths based on third-order structure functions. This code is largely based on
+[LoSSETT](https://github.com/ElliotMG/LoSSETT). The energy transfer from scales larger than
+$\ell$ to scales smaller than $\ell$ is derived in 
 [Duchon & Robert (2000)](https://iopscience.iop.org/article/10.1088/0951-7715/13/1/312) as:
 
 $$\mathcal{D}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta \mathbf{u} 
 |\delta \mathbf{u}|^2 \mathrm{d}^d \mathbf{r},$$
-where, $\delta\mathbf{u}=\mathbf{u}(x + r) - \mathbf{u}(x)$ is a velocity increment, and $G_\ell
-(r)$ is a filter kernel with characteristic length scale $\ell$. See refences for more details.
+
+where, $\delta\mathbf{u}:=\mathbf{u}(x + r)-\mathbf{u}(x)$ is a velocity increment, and $G_{\ell}(r)$
+is a filter kernel with characteristic length scale $\ell$. See refences for more details.
 
 ### References:
 - J. Peng, L. Zhang, and J. Guan (2015). Applications of a Moist Nonhydrostatic Formulation of the
