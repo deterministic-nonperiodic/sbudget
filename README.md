@@ -24,6 +24,7 @@ Scale-to-Scale Energy Transfer Tool). The energy transfer from scales larger tha
 scales smaller than $\ell$ is derived in [Duchon & Robert (2000)](https://iopscience.iop.org/article/10.1088/0951-7715/13/1/312):
 
 $$\mathcal{D}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta \mathbf{u} |\delta \mathbf{u}|^2 \mathrm{d}^d \mathbf{r}.$$
+See refences for details.
 
 ### References:
 - J. Peng, L. Zhang, and J. Guan (2015). Applications of a Moist Nonhydrostatic Formulation of the
@@ -31,6 +32,9 @@ $$\mathcal{D}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta
   https://doi.org/10.1175/JAS-D-14-0306.1
 - Wang, Y., L. Zhang, J. Peng, and S. Liu, 2018: Mesoscale Horizontal Kinetic Energy Spectra of a Tropical Cyclone.
   J. Atmos. Sci., 75, 3579–3596, https://doi.org/10.1175/JAS-D-17-0391.1.
+
+- J. Duchon, and R. Robert (2000). Inertial energy dissipation for weak solutions of 
+  incompressible Euler and Navier-Stokes equations. Nonlinearity, 13(1), 249. https://doi.org/10.1088/0951-7715/13/1/312
 
 ### Install
 ```bash
