@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+import warnings
 
 import xarray as xr
 
@@ -63,14 +64,19 @@ def _cmd_compute(args) -> None:
     elif mode == "scale_transfer":
         # Validate scales
         scales = getattr(cfg.compute, "scales", None)
-        if not scales or not isinstance(scales, (list, tuple)):
-            raise ValueError(
-                "scale_transfer mode requires 'compute.scales' (list of wavelengths in meters)."
+        if not (isinstance(scales, (list, tuple))):
+            warnings.warn(
+                "scale_transfer: 'compute.scales' not provided. "
+                "Proceeding with automatic wavelength grid using a step based on the "
+                "maximum horizontal resolution up to the domain size. "
+                "NOTE: this can create very large arrays and increase memory usage.",
+                UserWarning,
+                stacklevel=2,
             )
 
         control_dict = {
             "verbose": True,
-            "scales": tuple(scales),
+            "scales": scales,
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
         }
         out = inter_scale_kinetic_energy_transfer(ds, **control_dict)
