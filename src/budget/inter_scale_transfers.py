@@ -377,7 +377,7 @@ def _get_spacing(coord: xr.DataArray, center: float, use_geode: Optional[bool], 
     if coord.size < 2:
         return 1.0
     if not use_geode:
-        return float(np.abs(np.mean(np.diff(coord.values))))
+        return float(np.abs(np.median(np.diff(coord.values))))
 
     if axis == 'x':
         _, _, dist = GEODE.inv(coord[0].item(), center, coord[1].item(), center)
