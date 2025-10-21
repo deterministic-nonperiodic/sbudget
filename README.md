@@ -75,33 +75,28 @@ pip install .
 
 ### Examples
 
+Quick help
 ```bash
-  # Quick help
   sbudget --help
  ``` 
 
 Inspect configuration file
-
   ```bash
   sbudget inspect examples/config.yaml
   ```
 
 Compute budget based on configuration file
-
   ```bash  
   sbudget compute examples/config.yaml
 ```
 
-Tip: For best FFT performance, keep spatial axes as single chunks (the tool can enforce this with
---rechunk-spatial)
+**Tip**: For best FFT performance, keep spatial axes as single chunks (enforce this with --rechunk-spatial)
 and parallelize across time/z.
-
 ```bash
   sbudget compute examples/config.yaml --rechunk-spatial
 ```
 
-Inspect with on-the-fly overrides (without editing config file)
-
+Inspect input file(s)
 ```bash
   sbudget inspect examples/config.yaml \
   --input-path ./data/model_output.nc \
@@ -110,18 +105,16 @@ Inspect with on-the-fly overrides (without editing config file)
 ```
 
 Write to a different file or store type (NetCDF/Zarr)
-
 ```bash
   sbudget compute examples/config.yaml \
   --output-path ./out/budget.nc \
   --store netcdf --overwrite
 ```
 
-Switch to physical mode and define wavelength bands (meters). This mode calculates inter-scale
-transfers at specified wavelengths based on third-order structure functions.
-
+Switch to scale transfer mode in physical space and define wavelengths (meters). This mode 
+calculates inter-scale transfers at specified wavelengths based on third-order structure functions.
 ```bash
   sbudget compute examples/config.yaml \
-  --mode physical \
+  --mode scale_transfer \
   --scales 1000,5000,10000
 ```
