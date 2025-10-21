@@ -44,26 +44,51 @@ def _cmd_compute(args) -> None:
     cfg = load_config(args.config)
     cfg = apply_overrides(cfg, args)
 
-    # Open dataset with normalized variable names
+    # Normalize/alias modes (backward compatibility)
+    _MODE_ALIASES = {
+        "spectral": "spectral_budget",
+        "physical": "scale_transfer",
+    }
+    mode_in = str(cfg.compute.mode).strip()
+    mode = _MODE_ALIASES.get(mode_in, mode_in)
+    if mode_in in _MODE_ALIASES:
+        print(f"[budget] NOTE: mode '{mode_in}' is deprecated; use '{mode}'")
+
+    # Open dataset with normalized variable/dimension names
     ds = open_dataset(cfg)
 
-    if cfg.compute.mode == "spectral":
+    if mode == "spectral_budget":
         out = compute_budget(ds, cfg)
-    else:
+
+    elif mode == "scale_transfer":
+        # Validate scales
+        scales = getattr(cfg.compute, "scales", None)
+        if not scales or not isinstance(scales, (list, tuple)):
+            raise ValueError(
+                "scale_transfer mode requires 'compute.scales' (list of wavelengths in meters)."
+            )
+
         control_dict = {
             "verbose": True,
-            "scales": cfg.compute.scales,
+            "scales": tuple(scales),
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
         }
         out = inter_scale_kinetic_energy_transfer(ds, **control_dict)
 
-        # rechunk output to match input dataset chunking
-        if getattr(ds, "chunks", None) and "time" in ds.chunks:
-            time_chunks = ds.chunks["time"]  # a tuple of chunk sizes
-        else:
-            time_chunks = "auto"
+        # Rechunk output to align with input's time tiling (if dask-backed)
+        time_chunks = None
+        if getattr(ds, "chunks", None):
+            time_chunks = ds.chunks.get("time")
+        out = out.chunk({
+            "time": time_chunks if time_chunks else "auto",
+            "length_scale": control_dict["ls_chunk_size"],
+        })
 
-        out = out.chunk({"time": time_chunks, "length_scale": control_dict["ls_chunk_size"]})
+    else:
+        raise ValueError(
+            f"Unknown compute.mode='{cfg.compute.mode}'. "
+            "Use 'spectral_budget' or 'scale_transfer'."
+        )
 
     write_dataset(out, cfg)
     print(f"Wrote: {cfg.output.path}")
@@ -140,7 +165,8 @@ def main(argv: list[str] | None = None) -> None:
                    "Overwrite output", "Do not overwrite output")
 
     # compute
-    p_compute.add_argument("--mode", choices=["spectral", "physical"], default="spectral")
+    p_compute.add_argument("--mode", choices=["spectral_budget", "scale_transfer"],
+                           default="spectral_budget")
     p_compute.add_argument("--scales", type=_csv_or_list,
                            help="Wavelengths in meters, e.g. '1000,5000,10000'")
     p_compute.add_argument("--norm", choices=["ortho", "none"],

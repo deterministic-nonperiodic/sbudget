@@ -1,24 +1,37 @@
 # sbudget
 
-### Spectral transfer mode (```--mode spectral```)
+### Spectral transfer mode (```--mode spectral_budget```)
 
 Tools to compute the spectral kinetic energy budget of a dry, non-hydrostatic atmosphere on
 regional domains. By default, this tool computes spectral budgets in wavenumber space using FFTs.
 This mode is suitable for studying spectral energy transfers across scales. The budget is
 computed following the formulation of [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1)
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1). The package targets model
-output on either regular lon–lat (equiangular) or Cartesian horizontal grids, with a
-geometric-height vertical coordinate.
+outputs on either regular lon–lat (equiangular) or Cartesian horizontal grids, with a
+geometric-height vertical coordinate. The spectral budget is formulated as follows:
+
+$$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}_h(k)+H_h(k)+J_h(k)
++D_h(k).$$
+
+* $E_h(k)$ — isotropic spectrum of HKE at wavenumber $k$.
+* $t_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
+* $F_{\uparrow}(k)$ — net **vertical flux** of HKE + pressure **pressure-work** flux
+* $C_{A\to h}(k)$ — **conversion** from APE to HKE.
+* $\mathrm{Div}_h(k)$ — tendency from **3-D divergence** processes.
+* $H_h(k)$ — **diabatic** tendency (heating/cooling).
+* $J_h(k)$ — **adiabatic nonconservative** tendency.
+* $D_h(k)$ — **diffusive/dissipative** tendency (viscosity, filters).
+
+Terms $H_h(k)$, $J_h(k)$, and $D_h(k)$ are model-physics dependent and therefore omitted here.
 
 #### Features
 
-- Horizontal kinetic-energy (HKE) spectra and budget terms (nonlinear spectral transfer, vertical
-  pressure and momentum fluxes/divergence, conversion from APE to HKE, divergence term)
-- FFT backed chunk-friendly xarray/dask implementation (out-of-core)
-- NetCDF output with CF-style metadata (horizontal coordinates are replaced with wavenumber in rad
-  m⁻¹)
+- FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along 
+  non-horizontal spatial dimensions
+- NetCDF output with CF-style metadata (horizontal coordinates replaced with wavenumber in rad 
+  m$^{-1}$)
 
-### Inter-scale transfer mode (```--mode physical```)
+### Inter-scale transfer mode (```--mode scale_transfer```)
 
 The user can switch to this mode, which computes local scale-to-scale transfers at specified
 wavelengths based on third-order structure functions. This code is largely based on
@@ -26,7 +39,7 @@ wavelengths based on third-order structure functions. This code is largely based
 $\ell$ to scales smaller than $\ell$ is derived in
 [Duchon & Robert (2000)](https://iopscience.iop.org/article/10.1088/0951-7715/13/1/312) as:
 
-$$\mathcal{D}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta \mathbf{u}
+$$\mathcal{T}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta \mathbf{u}
 |\delta \mathbf{u}|^2 \mathrm{d}^d \mathbf{r},$$
 
 where, $\delta\mathbf{u}:=\mathbf{u}(x + r)-\mathbf{u}(x)$ is a velocity increment,
