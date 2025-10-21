@@ -1,10 +1,11 @@
+from dataclasses import dataclass
+from typing import Union
+
 import numpy as np
 import xarray as xr
-from typing import Union
-from dataclasses import dataclass
 
-from .io_utils import _coord_is_degrees, _is_lon, _is_lat
 from .constants import cp, ps, chi, earth_radius
+from .io_utils import _coord_is_degrees, _is_lon, _is_lat
 
 
 # --------------------------------------------------------------------------------------------------

@@ -1,13 +1,13 @@
-import psutil
-import numpy as np
-import xarray as xr
-
-from pyproj import Geod
 from typing import Any, Optional
-from pint import Quantity
 
-from .constants import earth_radius
+import numpy as np
+import psutil
+import xarray as xr
+from pint import Quantity
+from pyproj import Geod
+
 from .budget import get_spatial_dims
+from .constants import earth_radius
 
 # Constants
 GEODE = Geod(ellps="WGS84")

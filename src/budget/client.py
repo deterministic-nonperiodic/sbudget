@@ -1,10 +1,12 @@
 import argparse
 from pathlib import Path
+
 import xarray as xr
-from .config import load_config, apply_overrides
+
 from .budget import compute_budget
-from .io_utils import open_dataset, write_dataset
+from .config import load_config, apply_overrides
 from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
+from .io_utils import open_dataset, write_dataset
 
 
 def _cf_guess(ds: xr.Dataset, target: str) -> str | None:
@@ -165,7 +167,7 @@ def main(argv: list[str] | None = None) -> None:
                    "Overwrite output", "Do not overwrite output")
 
     # compute
-    p_compute.add_argument("--mode", choices=["spectral", "physical"])
+    p_compute.add_argument("--mode", choices=["spectral", "physical"], default="spectral")
     p_compute.add_argument("--scales", type=_csv_or_list,
                            help="Wavelengths in meters, e.g. '1000,5000,10000'")
     p_compute.add_argument("--norm", choices=["ortho", "none"],
