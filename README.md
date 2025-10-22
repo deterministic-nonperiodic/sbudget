@@ -1,14 +1,17 @@
 # sbudget
 
+Tools for computing the spectral kinetic energy budget of a dry, fully compressible, 
+non-hydrostatic atmosphere on regional domains. Designed to analyze energy transfers across 
+scales in both wavenumber and physical space. The package targets model outputs on either 
+regular lon–lat (equiangular) or Cartesian horizontal grids, with a geometric-height vertical 
+coordinate.
+
 ### Spectral transfer mode (```--mode spectral_budget```)
 
-Tools to compute the spectral kinetic energy budget of a dry, non-hydrostatic atmosphere on
-regional domains. By default, this tool computes spectral budgets in wavenumber space using FFTs.
-This mode is suitable for studying spectral energy transfers across scales. The budget is
-computed following the formulation of [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1)
-and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1). The package targets model
-outputs on either regular lon–lat (equiangular) or Cartesian horizontal grids, with a
-geometric-height vertical coordinate. The spectral budget is formulated as follows:
+This mode computes spectral budgets in wavenumber space using FFTs, suitable for studying 
+spectral energy transfers across scales. The budget is formulated following 
+[Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1), 
+and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
 $$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}_h(k)+H_h(k)+J_h(k)
 +D_h(k).$$
