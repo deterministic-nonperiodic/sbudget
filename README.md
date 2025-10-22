@@ -8,15 +8,15 @@ coordinate.
 
 ### Spectral transfer mode (```--mode spectral_budget```)
 
-This mode computes spectral budgets in wavenumber space using FFTs, suitable for studying 
-spectral energy transfers across scales. The budget is formulated following 
+This mode computes the budget of horizontal kinetic energy (HKE) in wavenumber space using FFTs, 
+suitable for studying spectral energy transfers across scales. The budget is formulated following 
 [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1), 
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
 $$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}_h(k)+H_h(k)+J_h(k)
 +D_h(k).$$
 
-* $E_h(k)$ — isotropic spectrum of horizontal kinetic energy (HKE) at wavenumber $k$.
+* $E_h(k)$ — isotropic spectrum of HKE at wavenumber $k$.
 * $T_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
 * $F_{\uparrow}(k)$ — net **vertical flux** of HKE + pressure **pressure-work** flux
 * $C_{A\to h}(k)$ — **conversion** from available potential energy (APE) to HKE.
@@ -35,10 +35,9 @@ Terms $H_h(k)$, $J_h(k)$, and $D_h(k)$ are model-physics dependent and therefore
 
 ### Inter-scale transfer mode (```--mode scale_transfer```)
 
-The user can switch to this mode, which computes local scale-to-scale transfers at specified
-wavelengths based on third-order structure functions. This code is largely based on
-[LoSSETT](https://github.com/ElliotMG/LoSSETT). The energy transfer from scales larger than
-$\ell$ to scales smaller than $\ell$ is derived in
+This mode computes local scale-to-scale transfers at specified wavelengths based on third-order 
+structure functions. This code is largely based on [LoSSETT](https://github.com/ElliotMG/LoSSETT)
+. The energy transfer from scales larger than $\ell$ to scales smaller than $\ell$ is derived in
 [Duchon & Robert (2000)](https://iopscience.iop.org/article/10.1088/0951-7715/13/1/312) as:
 
 $$\mathcal{T}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta \mathbf{u}
