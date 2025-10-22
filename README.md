@@ -13,10 +13,10 @@ geometric-height vertical coordinate. The spectral budget is formulated as follo
 $$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}_h(k)+H_h(k)+J_h(k)
 +D_h(k).$$
 
-* $E_h(k)$ — isotropic spectrum of HKE at wavenumber $k$.
+* $E_h(k)$ — isotropic spectrum of horizontal kinetic energy (HKE) at wavenumber $k$.
 * $T_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
 * $F_{\uparrow}(k)$ — net **vertical flux** of HKE + pressure **pressure-work** flux
-* $C_{A\to h}(k)$ — **conversion** from APE to HKE.
+* $C_{A\to h}(k)$ — **conversion** from available potential energy (APE) to HKE.
 * $\mathrm{Div}_h(k)$ — tendency from **3-D divergence** processes.
 * $H_h(k)$ — **diabatic** tendency (heating/cooling).
 * $J_h(k)$ — **adiabatic nonconservative** tendency.
