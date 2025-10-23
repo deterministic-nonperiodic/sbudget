@@ -53,22 +53,18 @@ def _cumulative_trapezoidal(f: xr.DataArray, x: xr.DataArray,
     return out
 
 
-# ---------------------------
-# Core functions
-# ---------------------------
-
 def nh_pressure_derivative(f: xr.DataArray, p: xr.DataArray, zdim: str = "z",
                            edge_order: Literal[1, 2] = 2):
     # both f and p live on (..., z); this uses the actual dp/dz numerically
     df_dz = f.differentiate(zdim, edge_order=edge_order)
     dp_dz = p.differentiate(zdim, edge_order=edge_order)
 
-    out = df_dz / dp_dz
+    return df_dz / dp_dz
 
-    # optional: mask pathological spots where dp/dz ≈ 0 (inversions)
-    tol = np.abs(dp_dz).median(dim=zdim) * 1e-6
-    return out.where(np.abs(dp_dz) > tol)
 
+# ---------------------------
+# Core functions
+# ---------------------------
 
 def height_to_geopotential(height: Union[xr.DataArray | float]) -> Union[xr.DataArray | float]:
     r"""Φ = g R_e z / (R_e + z)"""
@@ -113,8 +109,14 @@ def static_stability(
     return - cn.Rd * (temperature / pressure) * ddp_ln_theta
 
 
-def density(pressure: xr.DataArray, temperature: xr.DataArray) -> xr.DataArray:
+def density(pressure: xr.DataArray, temperature: xr.DataArray,
+            mixing_ration: xr.DataArray = None) -> xr.DataArray:
     r"""ρ = p / (R_d T)"""
+
+    if mixing_ration is not None:
+        # TODO: virtual temperature correction
+        pass
+
     return pressure / (cn.Rd * temperature)
 
 
