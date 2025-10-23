@@ -22,14 +22,15 @@ class OutputConfig:
 class ComputeConfig:
     mode: str | None = "spectral"  # or "physical"
     scales: list[float] | None = None  # list of scales for physical-space mode
+    levels: list[float] | None = None  # list of levels for scale_transfer mode
     norm: str | None = None  # None or "ortho"
     dx: float | None = None
     dy: float | None = None
+    transfer_form: str | None = "flux"  # e.g. "invariant", "flux"
     cumulative: bool = True  # default True per request
     rechunk_spatial: bool = True  # ensure (y,x) are single chunks before FFTs
     dask_allow_rechunk: bool = True  # allow apply_ufunc to rechunk as fallback
     scheduler: str | None = None
-    transfer_form: str | None = "flux"  # e.g. "invariant", "flux"
 
 
 @dataclass
@@ -108,6 +109,10 @@ def apply_overrides(cfg, args):
     _set_nested(cfg, ["compute", "mode"], _get(args, "mode"))
     scales = _get(args, "scales")
     if scales: _set_nested(cfg, ["compute", "scales"], _to_float_list(scales))
+
+    levels = _get(args, "levels")
+    if levels: _set_nested(cfg, ["compute", "levels"], _to_float_list(levels))
+
     if norm is not None or norm_cli == "none":
         _set_nested(cfg, ["compute", "norm"], norm)
     dx = _get(args, "dx")

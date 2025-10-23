@@ -4,8 +4,9 @@ from typing import Union
 import numpy as np
 import xarray as xr
 
-from .constants import cp, ps, chi, earth_radius
+from .constants import cp, earth_radius
 from .cf_coords import _coord_is_degrees, _is_lon, _is_lat, get_spatial_dims, infer_resolution
+from .thermodynamics import potential_temperature, exner_function
 
 
 # --------------------------------------------------------------------------------------------------
@@ -73,10 +74,10 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
         if delta is None:
             raise ValueError(
                 f"differentiate_metric: No coordinate found for dim '{dim}' "
-                f"and no 'delta' provided; cannot determine metric spacing."
-            )
+                f"and no 'delta' provided; cannot determine metric spacing.")
         # index-based derivative (spacing=1) scaled by constant delta [m]
-        return da.differentiate(dim, edge_order=2) / float(delta)
+        delta = xr.full_like(da, fill_value=float(delta))
+        return da.differentiate(coord=dim, edge_order=2) / delta
 
     # Longitude
     if _is_lon(dim, da.coords):
@@ -634,7 +635,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         temperature = ds.get("temperature")
         if temperature is None:
             raise ValueError("Provide either 'theta' or both 'pressure' and 'temperature'.")
-        theta = temperature / (pressure / ps) ** chi
+        # compute potential temperature
+        theta = potential_temperature(pressure, temperature)
 
     # Ensure spatial single-chunking for FFT inputs (configurable)
     if _OPTIONS.rechunk_spatial:
@@ -668,9 +670,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     vfd_dke_1d = isotropize(fh_2d.differentiate('z', edge_order=2), dx, dy).rename("vfd_dke")
 
     # --- pressure work & conversion (if pressure available) ---
-    exner = (pressure / ps) ** chi
+    # scaled pressure perturbation with respect to reference state
+    exner = exner_function(pressure) - exner_function(global_mean(pressure))
+
     if _OPTIONS.rechunk_spatial:
         exner = _ensure_spatial_single_chunk(exner, space_dims)
+
     fp_2d = pressure_flux(theta, w, exner, cfg.compute.norm)
     vf_pres_1d = isotropize(fp_2d, dx, dy)
     vfd_pres_1d = isotropize(fp_2d.differentiate('z', edge_order=2), dx, dy).rename("vfd_pres")
@@ -714,9 +719,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         "vfd_dke": ("vertical_dke_flux_divergence",
                     "vertical flux divergence of horizontal kinetic energy"),
         "vf_hke": ("vertical_dke_flux", "vertical flux of horizontal kinetic energy"),
+        "vfd_pres": ("pressure_flux_divergence", "vertical divergence of pressure work"),
         "vf_pres": ("hke_pressure_vertical_flux",
                     "vertical flux of horizontal kinetic energy (pressure work)"),
-        "vfd_pres": ("pressure_flux_divergence", "vertical divergence of pressure work"),
         "div_hke": ("horizontal_ke_divergence", "horizontal divergence contribution to HKE budget"),
     }
 

@@ -79,6 +79,7 @@ def _cmd_compute(args) -> None:
             "scales": scales,
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
         }
+
         out = inter_scale_kinetic_energy_transfer(ds, **control_dict)
 
         # Rechunk output to align with input's time tiling (if dask-backed)
@@ -110,12 +111,9 @@ def _cmd_inspect(args) -> None:
     if str(p).endswith(".zarr"):
         raw = xr.open_zarr(p, chunks="auto")
     elif str(p).endswith(".nc"):
-        if engine:
-            raw = xr.open_dataset(p, chunks="auto", engine=engine)
-        else:
-            raw = xr.open_dataset(p, chunks="auto")
+        raw = xr.open_mfdataset(p, chunks="auto", engine=engine)
     else:
-        raw = xr.open_dataset(p, chunks="auto")
+        raw = xr.open_mfdataset(p, chunks="auto")
 
     report = _report_var_existence(raw, cfg)
 
@@ -175,6 +173,10 @@ def main(argv: list[str] | None = None) -> None:
                            default="spectral_budget")
     p_compute.add_argument("--scales", type=_csv_or_list,
                            help="Wavelengths in meters, e.g. '1000,5000,10000'")
+
+    p_compute.add_argument("--levels", type=_csv_or_list,
+                           help="Levels in vertical axis units, e.g. '1000,5000,10000'")
+
     p_compute.add_argument("--norm", choices=["ortho", "none"],
                            help="FFT normalization ('none' to clear)")
     p_compute.add_argument("--dx", type=float)
@@ -207,17 +209,19 @@ def main(argv: list[str] | None = None) -> None:
     p_inspect.add_argument("--input-path")
     p_inspect.add_argument("--dims", type=_csv_or_list)
     p_inspect.add_argument("--engine", choices=["h5netcdf", "netcdf4", "scipy"])
+    p_inspect.add_argument("--levels", type=_csv_or_list,
+                           help="Levels in vertical axis units, e.g. '1000,5000,10000'")
+    p_inspect.add_argument("--mode", choices=["spectral_budget", "scale_transfer"],
+                           default="spectral_budget")
+
     p_inspect.set_defaults(func=_cmd_inspect)
 
     args = parser.parse_args(argv)
 
     # optional echo of scheduler if present
-    try:
-        sched = getattr(load_config(args.config), 'compute').scheduler  # your existing loader
-        if sched:
-            print(f"[budget] scheduler={sched}")
-    except Exception:
-        pass
+    sched = getattr(load_config(args.config), 'compute').scheduler  # your existing loader
+    if sched:
+        print(f"[budget] scheduler={sched}")
 
     args.func(args)
 

@@ -29,20 +29,47 @@ def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
     return ds
 
 
+def _balanced_chunks(n: int, target: int, min_size: int) -> Tuple[int, ...]:
+    """
+    Split length n into m nearly-equal chunks, all >= min_size,
+    with average near `target`. Returns a tuple of chunk sizes.
+    """
+    if n <= 0:
+        return ()
+    # Choose number of chunks m so that each chunk >= min_size and near target
+    # Start with m = ceil(n / target), but cap so that floor(n/m) >= min_size
+    m = max(1, math.ceil(n / max(1, target)))
+    while m > 1 and (n // m) < min_size:
+        m -= 1
+    # Now spread n across m chunks as evenly as possible (sizes differ by <= 1)
+    base = n // m
+    rem = n % m
+    chunks = (base + 1,) * rem + (base,) * (m - rem)
+    # Safety: ensure all >= min_size; if not, fall back to packing with min_size
+    if any(c < min_size for c in chunks):
+        m = max(1, n // min_size)
+        base = n // m
+        rem = n % m
+        chunks = (base + 1,) * rem + (base,) * (m - rem)
+    return chunks
+
+
 def ensure_optimal_chunking(
         ds: xr.Dataset,
         spatial_dims: Tuple[str, str] = ("lat", "lon"),  # e.g. ("y","x") or ("lat","lon")
         vertical_dim: str = "z",
         target_chunk_mb: int = 64,
         preferred: Optional[Dict[str, int]] = None,  # any extra dims you want to chunk
+        deriv_edge_order: int = 2,  # minimum required per-chunk = edge_order + 1
         quiet: bool = False,
 ) -> xr.Dataset:
     """
-    Rechunk for fast 2-D FFTs (physical space).
+    Rechunk for fast 2-D FFTs, and ensure vertical chunks all satisfy
+    `chunk >= deriv_edge_order + 1` (for finite-difference edge_order constraints).
 
-    - Forces single chunks along `spatial_dims` (FFT axes).
-    - Tiles over 'time' and `vertical_dim` to aim for ~`target_chunk_mb` per chunk.
-    - `preferred` can add chunking for *other* dims (never overrides spatial dims).
+    - Single chunk along `spatial_dims`.
+    - Tiles over 'time' and `vertical_dim` to target ~`target_chunk_mb`.
+    - Builds explicit vertical chunk sizes so the *last* chunk is never too small.
     """
     preferred = dict(preferred or {})
     y, x = spatial_dims
@@ -60,26 +87,51 @@ def ensure_optimal_chunking(
     target_bytes = int(target_chunk_mb * 1024 ** 2)
     budget_mult = max(1, target_bytes // max(1, bytes_plane))  # how many (time*z) we can pack
 
-    # build chunk plan
-    plan: Dict[str, int] = {y: -1, x: -1}  # single chunk along FFT axes
+    plan: Dict = {y: -1, x: -1}  # -1 → single chunk along FFT axes
 
-    # choose time/z tiles within budget
-    t_guess = int(ds.sizes["time"]) if "time" in ds.dims else 1
-    z_guess = int(ds.sizes[vertical_dim]) if "z" in ds.dims else 1
+    # guesses
+    t_guess = int(ds.sizes.get("time", 1))
+    z_guess = int(ds.sizes.get(vertical_dim, 1))
 
-    if ("time" in ds.dims) and (vertical_dim in ds.dims):
-        # start from hints; if over budget, redistribute near-sqrt
-        t_chunk = t_guess
-        z_chunk = z_guess
-        if t_chunk * z_chunk > budget_mult:
-            z_chunk = max(1, min(z_guess, int(math.sqrt(budget_mult))))
-            t_chunk = max(1, min(t_guess, budget_mult // z_chunk))
-        plan["time"] = max(1, t_chunk)
-        plan[vertical_dim] = max(1, z_chunk)
-    elif "time" in ds.dims:
-        plan["time"] = max(1, min(int(t_guess), budget_mult))
-    elif vertical_dim in ds.dims:
-        plan[vertical_dim] = max(1, min(int(z_guess), budget_mult))
+    needs_t = "time" in ds.dims
+    needs_z = vertical_dim in ds.dims
+    min_required = deriv_edge_order + 1
+
+    # Distribute budget between time and z
+    if needs_t and needs_z:
+        # near-sqrt split within budget
+        z_chunk_target = min(z_guess, max(1, int(math.sqrt(budget_mult))))
+        t_chunk_target = max(1, budget_mult // max(1, z_chunk_target))
+        t_chunk = min(t_guess, max(1, t_chunk_target))
+        # We'll compute z chunks explicitly below; keep target for guidance
+    elif needs_t:
+        t_chunk = min(t_guess, budget_mult)
+        z_chunk_target = None
+    elif needs_z:
+        t_chunk = None
+        z_chunk_target = min(z_guess, budget_mult)
+    else:
+        t_chunk = None
+        z_chunk_target = None
+
+    if needs_t:
+        plan["time"] = max(1, int(t_chunk))
+
+    # Build explicit vertical chunks so every chunk >= min_required
+    if needs_z:
+        # If no target proposed, aim to use budget as much as possible
+        if z_chunk_target is None:
+            # If time is chunked, try to keep product near budget
+            if needs_t and "time" in plan:
+                z_chunk_target = max(1, budget_mult // max(1, plan["time"]))
+            else:
+                z_chunk_target = min(z_guess, budget_mult)
+
+        # Ensure the target itself respects the minimum
+        z_chunk_target = max(min_required, int(z_chunk_target))
+
+        z_chunks = _balanced_chunks(z_guess, z_chunk_target, min_required)
+        plan[vertical_dim] = z_chunks  # explicit tuple of sizes
 
     # any extra dims from preferred (don’t override spatial/time/z decisions)
     for d, c in preferred.items():
@@ -89,10 +141,27 @@ def ensure_optimal_chunking(
     out = ds.unify_chunks().chunk(plan)
 
     if not quiet:
-        est = bytes_plane * max(1, plan.get("time", 1)) * max(1, plan.get(vertical_dim, 1))
-        msg = ", ".join(f"{d}={'all' if c == -1 else c}" for d, c in plan.items())
-        print(f"[chunking] ({y},{x}) single-chunk; plan: {msg} | "
+        # Estimate size from avg z chunk (works even if plan[vertical_dim] is a tuple)
+        z_eff = 1
+        if needs_z:
+            zv = plan[vertical_dim]
+            z_eff = (sum(zv) / len(zv)) if isinstance(zv, (tuple, list)) else int(zv)
+        t_eff = int(plan.get("time", 1))
+        est = bytes_plane * max(1, t_eff) * max(1, z_eff)
+        msg_parts = []
+        for d, c in plan.items():
+            if isinstance(c, (tuple, list)):
+                msg_parts.append(f"{d}={list(c)}")
+            else:
+                msg_parts.append(f"{d}={'all' if c == -1 else c}")
+        print(f"[chunking] ({y},{x}) single-chunk; plan: {', '.join(msg_parts)} | "
               f"~{est / 1024 ** 2:.1f} MB/chunk (target {target_chunk_mb} MB)")
+
+        if needs_z and any(ch < min_required for ch in (
+                plan[vertical_dim] if isinstance(plan[vertical_dim], (tuple, list)) else [
+                    plan[vertical_dim]])):
+            print(
+                f"[chunking][WARN] Some {vertical_dim} chunks < {min_required} required for edge_order={deriv_edge_order}")
 
     return out
 
@@ -115,7 +184,11 @@ def open_dataset(cfg) -> xr.Dataset:
     if str(p).endswith(".zarr"):
         ds = xr.open_zarr(p, chunks="auto")
     else:
-        ds = xr.open_dataset(p, chunks="auto")
+        engine = getattr(cfg.input, "engine", None)
+        ds = xr.open_mfdataset(p, chunks="auto", engine=engine)
+
+    # unify data type
+    ds = ds.astype("float32")
 
     # Rename dataset variables to logical names used by the code
     rename = {}
@@ -170,6 +243,15 @@ def open_dataset(cfg) -> xr.Dataset:
             # Make sure the coord is indexed by its own dim
             ds = ds.set_coords(cname)
 
+    # select specified vertical levels
+    levels = getattr(cfg.compute, "levels", None)
+    mode = str(cfg.compute.mode).strip()
+
+    # select specified vertical levels
+    if levels is not None and mode == "scale_transfer":
+        ds = ds.sel(z=levels, method='nearest')
+        print("Calculating transfers on selected levels: ", ds.z.values)
+
     # Interpolate to consistent vertical coordinates
     ds = ensure_vertical_consistent(ds)
 
@@ -188,6 +270,7 @@ def write_dataset(ds: xr.Dataset, cfg) -> None:
             shutil.rmtree(out)
         ds.to_zarr(out, mode="w")
     elif cfg.output.store == "netcdf":
-        ds.to_netcdf(out)
+        engine = getattr(cfg.input, "engine", None)
+        ds.to_netcdf(out, engine=engine)
     else:
         raise ValueError("output.store must be 'zarr' or 'netcdf'")
