@@ -83,15 +83,6 @@ def _cmd_compute(args) -> None:
 
         out = inter_scale_kinetic_energy_transfer(ds, **control_dict)
 
-        # Rechunk output to align with input's time tiling (if dask-backed)
-        time_chunks = None
-        if getattr(ds, "chunks", None):
-            time_chunks = ds.chunks.get("time")
-        out = out.chunk({
-            "time": time_chunks if time_chunks else "auto",
-            "scale": control_dict["ls_chunk_size"],
-        })
-
     else:
         raise ValueError(
             f"Unknown compute.mode='{cfg.compute.mode}'. "
