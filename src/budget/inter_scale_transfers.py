@@ -552,9 +552,9 @@ def scale_space_integral(
         if not isinstance(length_scales, np.ndarray):
             length_scales = np.array(length_scales)
 
-        length_scales = length_scales[length_scales < r_coord.max().values]
+        length_scales = length_scales[length_scales <= r_coord.max().values]
 
-        if verbose:
+        if verbose and length_scales.size:
             print(f"Externally defined length_scales:")
             min_scale = length_scales.min()
             max_scale = length_scales.max()
@@ -562,9 +562,9 @@ def scale_space_integral(
             print("==============================================================")
 
     if not length_scales.size:
-        if verbose: print("Warning: No valid length scales to use in integration.")
-        return xr.full_like(integrand, np.nan).mean("r", skipna=True).expand_dims(
-            length_scale=0).drop_vars("r").assign_coords(length_scale=[]).rename(name)
+        if verbose: print("Warning: No valid length scales to use in integration. Largest r "
+                          "selected")
+        length_scales = np.atleast_1d(r_coord.max().values)
 
     # Compute dG/dr
     _, dg_dr = get_integration_kernels(r_coord, length_scales,

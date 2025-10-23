@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import warnings
 
+import numpy as np
 import xarray as xr
 
 from .budget import compute_budget
@@ -76,7 +77,7 @@ def _cmd_compute(args) -> None:
 
         control_dict = {
             "verbose": True,
-            "scales": scales,
+            "scales": np.asarray(scales, dtype=np.float32),
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
         }
 
