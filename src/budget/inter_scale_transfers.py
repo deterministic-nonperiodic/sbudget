@@ -183,7 +183,7 @@ def _normalize_mollifier_2d(mollifier: np.ndarray,
     return mollifier_normalized, integrals
 
 
-def get_integration_kernels(r_da: xr.DataArray, length_scales: np.ndarray, normalization="2D",
+def get_integration_kernels(r_da: xr.DataArray, scales: np.ndarray, normalization="2D",
                             return_derivative=True) -> tuple[xr.DataArray, xr.DataArray]:
     """
     Compute mollifier kernels and optionally their derivatives over a set of radial distances
@@ -193,7 +193,7 @@ def get_integration_kernels(r_da: xr.DataArray, length_scales: np.ndarray, norma
     ----------
     r_da : xr.DataArray
         1D array of radial distances
-    length_scales : np.ndarray
+    scales : np.ndarray
         1D array of filter length scales
     normalization : str
         One of {"2D", "sphere", "3D"} to determine area weighting
@@ -209,10 +209,9 @@ def get_integration_kernels(r_da: xr.DataArray, length_scales: np.ndarray, norma
     """
     radial_positions = r_da.values
     r_name = r_da.name or "r"
-    length_scales = np.asarray(length_scales)
+    scales = np.asarray(scales)
 
-    mollifier, derivative = _evaluate_mollifier_and_derivative(radial_positions,
-                                                               length_scales)
+    mollifier, derivative = _evaluate_mollifier_and_derivative(radial_positions, scales)
     mollifier_normalized, integrals = _normalize_mollifier_2d(mollifier,
                                                               radial_positions,
                                                               normalization)
@@ -220,7 +219,7 @@ def get_integration_kernels(r_da: xr.DataArray, length_scales: np.ndarray, norma
     mollifier_da = xr.DataArray(
         mollifier_normalized,
         dims=["scale", r_name],
-        coords={"scale": length_scales, r_name: radial_positions},
+        coords={"scale": scales, r_name: radial_positions},
         name="G_kernel"
     )
 
@@ -229,11 +228,11 @@ def get_integration_kernels(r_da: xr.DataArray, length_scales: np.ndarray, norma
         derivative_da = xr.DataArray(
             derivative_normalized,
             dims=["scale", r_name],
-            coords={"scale": length_scales, r_name: radial_positions},
+            coords={"scale": scales, r_name: radial_positions},
             name="dG_dr_kernel"
         )
     else:
-        derivative_da = xr.full_like(mollifier_da, np.nan, name="dG_dr_kernel")
+        derivative_da = xr.full_like(mollifier_da, fill_value=np.nan).rename("dG_dr_kernel")
 
     return mollifier_da, derivative_da
 
@@ -332,11 +331,10 @@ def roll_with_boundary_handling(
             return shifted.where(edge_mask, other=fill_value)
 
         elif boundary in ("reflect", "nearest"):
-            mode = "reflect" if boundary == "reflect" else "edge"
+            mode = boundary if boundary == "reflect" else "edge"
             padded = ds.pad({dim: (pad_width, pad_width)}, mode=mode)
             rolled = padded.roll({dim: -shift}, roll_coords=False)
             return rolled.isel({dim: slice(pad_width, pad_width + dim_size)})
-
         else:
             raise ValueError(f"Unsupported boundary type: {boundary}")
 
@@ -411,6 +409,7 @@ def scale_increments(
 
     dx = max(_get_spacing(x_coord, y_center, use_geode=use_geode, axis='x'), 1e-6)
     dy = max(_get_spacing(y_coord, x_center, use_geode=use_geode, axis='y'), 1e-6)
+
     r_step = max(dx, dy)
 
     x_min = float(x_coord.min())

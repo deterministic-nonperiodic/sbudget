@@ -1,8 +1,7 @@
 import numpy as np
 import xarray as xr
 from typing import Tuple, Union
-
-from .constants import earth_radius
+from pyproj import Geod
 
 __all__ = [
     "_cf_guess",
@@ -230,22 +229,19 @@ def infer_resolution(ds: xr.Dataset) -> tuple[float, float]:
     # Geographic lat/lon in degrees
     if (y in ("lat", "latitude")) and (x in ("lon", "longitude")):
         if y_in_degrees and x_in_degrees:
-            d_lat = np.deg2rad(float(ycoord.diff(y).median()))
-            d_lon = np.deg2rad(float(xcoord.diff(x).median()))
-            phi = np.deg2rad(float(ycoord.median()))
-            dy = earth_radius * d_lat
-            dx = earth_radius * np.cos(phi) * d_lon
+            GEODE = Geod(ellps="WGS84")
+
+            y_center = float(ycoord.median())
+            x_center = float(xcoord.median())
+
+            # equivalent to median resolution at domain center
+            _, _, dx = GEODE.inv(xcoord[0].item(), y_center, xcoord[1].item(), y_center)
+            _, _, dy = GEODE.inv(x_center, ycoord[0].item(), x_center, ycoord[1].item())
+
             return dx, dy
-        # else fall through
 
     # Projected / Cartesian axes in meters
     if _is_meter_like(ycoord) and _is_meter_like(xcoord):
-        dy = float(ycoord.diff(y).median())
-        dx = float(xcoord.diff(x).median())
-        return dx, dy
-
-    # Fallback: units missing or non-standard but not degrees → assume meters
-    if (not y_in_degrees) and (not x_in_degrees):
         dy = float(ycoord.diff(y).median())
         dx = float(xcoord.diff(x).median())
         return dx, dy
