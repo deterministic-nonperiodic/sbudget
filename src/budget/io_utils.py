@@ -157,12 +157,6 @@ def ensure_optimal_chunking(
         print(f"[chunking] ({y},{x}) single-chunk; plan: {', '.join(msg_parts)} | "
               f"~{est / 1024 ** 2:.1f} MB/chunk (target {target_chunk_mb} MB)")
 
-        if needs_z and any(ch < min_required for ch in (
-                plan[vertical_dim] if isinstance(plan[vertical_dim], (tuple, list)) else [
-                    plan[vertical_dim]])):
-            print(
-                f"[chunking][WARN] Some {vertical_dim} chunks < {min_required} required for edge_order={deriv_edge_order}")
-
     return out
 
 
@@ -199,7 +193,6 @@ def open_dataset(cfg) -> xr.Dataset:
         ds = ds.rename(rename)
 
     # Normalize coordinate names to standard ones
-    # cfg.input.dims: the ORIGINAL dimension names in the file, e.g. ["z_mc", "lat", "lon"] or ["z", "y", "x"]
     z_name, y_name, x_name = cfg.input.dims
 
     # standard target names
@@ -256,7 +249,7 @@ def open_dataset(cfg) -> xr.Dataset:
     ds = ensure_vertical_consistent(ds)
 
     # Apply consistent rechunking:
-    ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), target_chunk_mb=64)
+    ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), target_chunk_mb=128)
 
     return ds
 

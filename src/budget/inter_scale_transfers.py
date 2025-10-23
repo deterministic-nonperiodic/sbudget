@@ -219,8 +219,8 @@ def get_integration_kernels(r_da: xr.DataArray, length_scales: np.ndarray, norma
 
     mollifier_da = xr.DataArray(
         mollifier_normalized,
-        dims=["length_scale", r_name],
-        coords={"length_scale": length_scales, r_name: radial_positions},
+        dims=["scale", r_name],
+        coords={"scale": length_scales, r_name: radial_positions},
         name="G_kernel"
     )
 
@@ -228,8 +228,8 @@ def get_integration_kernels(r_da: xr.DataArray, length_scales: np.ndarray, norma
         derivative_normalized = (derivative.T / integrals).T
         derivative_da = xr.DataArray(
             derivative_normalized,
-            dims=["length_scale", r_name],
-            coords={"length_scale": length_scales, r_name: radial_positions},
+            dims=["scale", r_name],
+            coords={"scale": length_scales, r_name: radial_positions},
             name="dG_dr_kernel"
         )
     else:
@@ -575,7 +575,7 @@ def scale_space_integral(
     _, integrand_broadcasted = xr.broadcast(dg_dr, integrand)
 
     # Mask to truncate at r <= 2*ell
-    integration_mask = r_broadcasted <= 2 * dg_dr.length_scale
+    integration_mask = r_broadcasted <= 2 * dg_dr.scale
 
     # Compute integrand: (dG/dr * r) * integrand, then apply mask
     term_to_integrate = (dg_dr * r_broadcasted) * integrand_broadcasted
@@ -587,10 +587,10 @@ def scale_space_integral(
 
     # Integrate and normalize by retained fraction
     integral = term_to_integrate_masked.integrate("r") / retention_fraction
-    integral = integral.rename(name).assign_coords(length_scale=dg_dr.length_scale)
+    integral = integral.rename(name).assign_coords(length_scale=dg_dr.scale)
 
     if hasattr(integral.data, "chunks"):
-        integral = integral.chunk({"length_scale": length_scale_chunk})
+        integral = integral.chunk({"scale": length_scale_chunk})
 
     if verbose:
         print(f"Finished calculating scale-space integral '{name}'. Shape: {integral.shape}")
@@ -901,9 +901,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     energy_transfer_rate.attrs.update({
         'units': "W/kg",
         'standard_name': "specific_kinetic_energy_transfer_rate",
-        'long_name': "Specific kinetic energy inter-scale transfer rate",
-        'description': "Kinetic energy transfer across scales, "
-                       "calculated using structure functions and mollifier-based filtering."
+        'long_name': "Specific kinetic energy inter-scale transfer rate"
     })
 
     # reassign coordinates from data
@@ -914,9 +912,16 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Check if the result fits in memory (the result is length_scale times the input's size)
     energy_transfer_rate = energy_transfer_rate.to_dataset()
 
+    # add scale coordinate attributes
+    energy_transfer_rate["scale"].attrs.update({
+        "standard__name": "horizontal_scale",
+        "long_name": "horizontal scale",
+        "units": "m"
+    })
+
     # --- ADD: enforce one-scale-at-a-time tasks for reductions/writes ---
     if hasattr(energy_transfer_rate[list(energy_transfer_rate.data_vars)[0]].data, "chunks"):
-        energy_transfer_rate = energy_transfer_rate.chunk({"length_scale": 1})
+        energy_transfer_rate = energy_transfer_rate.chunk({"scale": 1})
 
     if verbose:
         # Avoid triggering a full compute if Dask-backed (expensive convolutions)

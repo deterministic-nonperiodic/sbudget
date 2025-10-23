@@ -89,7 +89,7 @@ def _cmd_compute(args) -> None:
             time_chunks = ds.chunks.get("time")
         out = out.chunk({
             "time": time_chunks if time_chunks else "auto",
-            "length_scale": control_dict["ls_chunk_size"],
+            "scale": control_dict["ls_chunk_size"],
         })
 
     else:
@@ -98,6 +98,7 @@ def _cmd_compute(args) -> None:
             "Use 'spectral_budget' or 'scale_transfer'."
         )
 
+    # Write output to disk
     write_dataset(out, cfg)
     print(f"Wrote: {cfg.output.path}")
 
