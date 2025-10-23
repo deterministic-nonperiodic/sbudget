@@ -63,15 +63,22 @@ is a filter kernel with characteristic length scale $\ell$. See refences for mor
 ### Install
 
 ```bash
+# Install package directly via git
+pip install git+https://github.com/deterministic-nonperiodic/sbudget.git
+```
+
+Manual install with clean environment (recommended)
+```bash
 # clone repository
 git clone https://github.com/deterministic-nonperiodic/sbudget.git
 cd sbudget
 
-# Install clean environment (recommended)
+# Install clean environment
 conda env create -f environment.yml
 conda activate budget
 
-pip install .
+# editable install
+pip install -e .
 ```
 
 ### Examples
