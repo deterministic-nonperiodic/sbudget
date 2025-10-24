@@ -1,4 +1,4 @@
-from typing import Any, Optional, Union, List, Dict, Tuple
+from typing import Any, Optional, Union, List
 
 import dask.array as da
 import numpy as np
@@ -254,14 +254,14 @@ def delta_u_cubed_geographic(
     delta_w = ds_increment.get("w", None)
 
     # Magnitude of increment vector |δu|²
-    mag_sq = delta_u ** 2 + delta_v ** 2
+    delta_u_squared = delta_u ** 2 + delta_v ** 2
     if delta_w is not None:
-        mag_sq += delta_w ** 2
+        delta_u_squared += delta_w ** 2
 
     # Directional projection: δu ⋅ r̂ = δu cos(θ) + δv sin(θ)
     delta_dot_r = delta_u * np.cos(angle_grid) + delta_v * np.sin(angle_grid)
 
-    return (delta_dot_r * mag_sq).rename("delta_u_cubed")
+    return (delta_dot_r * delta_u_squared).rename("delta_u_cubed")
 
 
 def roll_with_boundary_handling(
@@ -591,145 +591,86 @@ def scale_space_integral(
         length_scales: Optional[np.ndarray] = None,
         weighting: str = "2D",
         verbose: bool = False,
-        length_scale_chunk: Optional[int] = -1
+        scale_chunk_size: Optional[int] = -1
 ) -> xr.DataArray:
+    """
+    Computes the scale-space integral (convolution) of the integrand.
+
+    The core calculation is: Integral[0 to 2*ell] (dG/dr * r * integrand) dr,
+    with a normalization correction for truncation.
+    """
     if verbose: print(f"Calculating scale-space integral for '{name}'...")
 
     r_coord = integrand.r
 
+    # --- Handle edge cases and length_scales initialization ---
     if r_coord.size == 0:
-        if verbose: print("Warning: Integrand has no 'r' dimension or it's empty.")
-        return xr.full_like(integrand, np.nan).mean("r", skipna=True).expand_dims(
-            length_scale=0).drop_vars("r").assign_coords(length_scale=[]).rename(name)
+        raise ValueError("Warning: Integrand has no 'r' dimension or it's empty.")
 
     if length_scales is None:
-        length_scales = r_coord.values[1:] if r_coord.size > 1 else r_coord.values[:1]
-    else:
-        if not isinstance(length_scales, np.ndarray):
-            length_scales = np.array(length_scales)
+        # Use all available r coordinates as the integration scales
+        length_scales = r_coord.values
 
-        length_scales = length_scales[length_scales <= r_coord.max().values]
+    if not isinstance(length_scales, np.ndarray):
+        length_scales = np.array(length_scales)
 
-        if verbose and length_scales.size:
-            print(f"Externally defined length_scales:")
-            min_scale = length_scales.min()
-            max_scale = length_scales.max()
-            print(f"  Effective scale limits: {min_scale:8.2f} m - {max_scale:8.2f} m)")
-            print("==============================================================")
+    # Filter scales that exceed the maximum available r value
+    length_scales = length_scales[length_scales <= r_coord.max().values]
+
+    if verbose and length_scales.size:
+        print(f"Externally defined length_scales:")
+        min_scale = length_scales.min()
+        max_scale = length_scales.max()
+        print(f"  Effective scale limits: {min_scale:8.2f} m - {max_scale:8.2f} m)")
+        print("==============================================================")
 
     if not length_scales.size:
-        if verbose: print("Warning: No valid length scales to use in integration. Largest r "
-                          "selected")
+        if verbose: print(f"Warning: No valid length scales to use in integration."
+                          f"Using {r_coord.max()}")
+
         length_scales = np.atleast_1d(r_coord.max().values)
 
-    # Compute dG/dr
+    # --- Get Integration Kernel and Prepare Data ---
+
+    # dg_dr has dimensions (scale, r)
     _, dg_dr = get_integration_kernels(r_coord, length_scales,
-                                       normalization=weighting, return_derivative=True)
+                                       normalization=weighting,
+                                       return_derivative=True)
 
-    # Broadcast r and dG_dr
-    r_broadcasted, _ = xr.broadcast(r_coord, dg_dr)
-    _, integrand_broadcasted = xr.broadcast(dg_dr, integrand)
+    # The r coordinate must be promoted to the same shape as dg_dr for the mask
+    r_coord = r_coord.to_dataset(name='R', promote_attrs=False)['R']
 
-    # Mask to truncate at r <= 2*ell
-    integration_mask = r_broadcasted <= 2 * dg_dr.scale
+    # Xarray automatically broadcasts R (dim: r) to match dg_dr (dims: scale, r)
+    term_to_integrate = (dg_dr * r_coord) * integrand
 
-    # Compute integrand: (dG/dr * r) * integrand, then apply mask
-    term_to_integrate = (dg_dr * r_broadcasted) * integrand_broadcasted
+    # Mask to truncate at r <= 2 * ell (where ell = dg_dr.scale)
+    integration_mask = r_coord <= 2 * dg_dr.scale
+
+    # Apply mask, setting values outside the integration limit to 0.0
     term_to_integrate_masked = term_to_integrate.where(integration_mask, other=0.0)
 
-    # Correction: estimate the retained fraction of the integrand
+    # Estimate the fraction of the integral retained after applying the 2*ell mask
+    # This must be calculated *before* integration.
     retention_fraction = term_to_integrate_masked.sum("r") / term_to_integrate.sum("r")
+
+    # Safety: If the denominator is zero or near-zero, use 1.0 to prevent division errors.
     retention_fraction = retention_fraction.where(retention_fraction > 1e-6, 1.0)
 
-    # Integrate and normalize by retained fraction
+    # Integrate the masked term and normalize by the retained fraction
     integral = term_to_integrate_masked.integrate("r") / retention_fraction
-    integral = integral.rename(name).assign_coords(length_scale=dg_dr.scale)
+
+    # Assign final coordinates and rename
+    integral = integral.rename(name).assign_coords(scale=dg_dr.scale)
 
     if hasattr(integral.data, "chunks"):
-        integral = integral.chunk({"scale": length_scale_chunk})
+        # Explicitly chunk the 'scale' dimension if a chunk size is provided
+        integral = integral.chunk({"scale": scale_chunk_size})
 
     if verbose:
         print(f"Finished calculating scale-space integral '{name}'. Shape: {integral.shape}")
 
     return integral
 
-
-def process_single_r_for_field_chunk(
-        field_chunk_ds: xr.Dataset,
-        r_scalar_val: float,
-        scale_mask_for_r: xr.DataArray,
-        scale_angle_grid: xr.DataArray,
-        nx_shift_coords: xr.DataArray,
-        ny_shift_coords: xr.DataArray,
-        angle_weight_grid: xr.DataArray,
-        x_dim: str,
-        y_dim: str,
-        x_boundary_type: str,
-        y_boundary_type: str,
-        transform_type: str,
-) -> xr.DataArray:
-    """
-    Processes a single spatial chunk of the field for a specific scale r.
-    Optimized version with reduced code redundancy, Dask compatibility,
-    and angular weighting normalization.
-    """
-    if transform_type != "delta_u_cubed":
-        raise ValueError(f"Transform_type: {transform_type}, not implemented.")
-
-    valid_indices = np.argwhere(scale_mask_for_r.data)
-    if not valid_indices.size:
-        return xr.full_like(
-            field_chunk_ds[list(field_chunk_ds.data_vars)[0]].isel({x_dim: 0, y_dim: 0}),
-            0.0
-        ).assign_coords(r=r_scalar_val)
-
-    angles = scale_angle_grid.data[valid_indices[:, 0], valid_indices[:, 1]]
-    weights = angle_weight_grid.data[valid_indices[:, 0], valid_indices[:, 1]]
-    n_x_values = nx_shift_coords.data[valid_indices[:, 1]]
-    n_y_values = ny_shift_coords.data[valid_indices[:, 0]]
-
-    # Normalize weights to sum to 2π for consistency with continuous angular integration
-    weights *= 2.0 * np.pi / np.sum(weights)
-
-    weighted_sum = None
-    total_weight = 0.0
-
-    for phi, n_x, n_y, weight_val in zip(angles, n_x_values, n_y_values, weights):
-
-        rolled = roll_with_boundary_handling(
-            field_chunk_ds, int(n_x), int(n_y),
-            x_dim, y_dim, x_boundary_type, y_boundary_type
-        )
-        result = delta_u_cubed_geographic(field_chunk_ds, rolled, phi)
-
-        if weighted_sum is None:
-            weighted_sum = result * weight_val
-        else:
-            weighted_sum += result * weight_val
-        total_weight += weight_val
-
-    if weighted_sum is None or total_weight == 0:
-        return xr.full_like(
-            field_chunk_ds[list(field_chunk_ds.data_vars)[0]].isel({x_dim: 0, y_dim: 0}),
-            0.0
-        ).assign_coords(r=r_scalar_val)
-
-    integrand = weighted_sum / total_weight
-
-    for coord_to_drop in [x_dim, y_dim]:
-        if coord_to_drop in integrand.coords:
-            integrand = integrand.drop_vars(coord_to_drop)
-
-    # Assign field coordinates to the integrand for broadcasting
-    integrand = integrand.assign_coords(**{'r': r_scalar_val,
-                                           x_dim: field_chunk_ds[x_dim],
-                                           y_dim: field_chunk_ds[y_dim]})
-    return integrand
-
-
-# -------------------------------------------------------------
-# MAIN FUNCTION: Optimized with Shift Caching
-# -------------------------------------------------------------
 
 def process_single_r_for_field_chunk_optimized(
         field_chunk_ds: xr.Dataset,  # This now contains u, v, w
@@ -773,41 +714,32 @@ def process_single_r_for_field_chunk_optimized(
     # Combine all parameters into a list of tuples for iteration
     angle_params = list(zip(angles, nx_values, ny_values, weights))
 
-    # Identify unique shifts and prepare cache
-    unique_shifts = sorted(list(set(zip(nx_values, ny_values))))
-    rolled_ds_cache: Dict[Tuple[int, int], xr.Dataset] = {}
-
-    # Pre-calculate and cache the rolled Dataset for each unique shift
-    for nx_shift, ny_shift in unique_shifts:
-        # Roll the dataset once per unique shift
-        rolled_ds = roll_with_boundary_handling(
-            field_chunk_ds, int(nx_shift), int(ny_shift),
-            x_dim, y_dim, x_boundary_type, y_boundary_type
-        )
-
-        # Cache the result
-        rolled_ds_cache[(nx_shift, ny_shift)] = rolled_ds
-
     # Initialize weighted_sum DataArray to zero (using 'u' as the template)
     dims = field_chunk_ds["u"].dims
     coords = field_chunk_ds["u"].coords
     weighted_sum = xr.DataArray(
         da.zeros_like(field_chunk_ds["u"].data, dtype=np.float32),
-        dims=dims, coords=coords, name="weighted_sum_integrand"
+        dims=dims,
+        coords=coords,
+        name="weighted_sum_integrand"
     )
 
+    # Loop over all angles, recalculating the shift graph N_angles times,
+    # but avoiding the N_unique_shifts memory footprint.
     for phi, nx_shift, ny_shift, weight in angle_params:
-        # Lookup the pre-computed rolled dataset
-        rolled_ds = rolled_ds_cache[(nx_shift, ny_shift)]
+        # Roll the data (DASK GRAPH RECONSTRUCTION)
+        rolled_ds = roll_with_boundary_handling(field_chunk_ds,
+                                                int(nx_shift), int(ny_shift), x_dim, y_dim,
+                                                x_boundary_type, y_boundary_type)
 
-        # Compute the cubed difference
+        # Compute the cubed difference (Efficient positional subtraction)
         result = delta_u_cubed_geographic(field_chunk_ds, rolled_ds, phi)
 
         # Accumulate the weighted sum
         weighted_sum += result * weight
 
-        # Cleanup (No need to del rolled_ds as it's from cache)
-        del result
+        # Cleanup (Crucial for memory safety)
+        del rolled_ds, result
 
     # Final result is average over all angles (weighted sum / total weight)
     integrand = weighted_sum / total_weight.clip(min=1e-12)
@@ -1021,7 +953,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     )
 
     # Ensure the increments fit in memory or compute in chunks along non-spatial dimensions
-    chunk_size = 32  # MB target chunk size for spatial dims. Keep small to limit memory use.
+    chunk_size = 1  # MB target chunk size for spatial dims. Keep small to limit memory use.
     wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name), target_chunk_mb=chunk_size)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
@@ -1048,8 +980,10 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         length_scales=length_scales,
         weighting="2D",
         verbose=verbose,
-        length_scale_chunk=ls_chunk_size
+        scale_chunk_size=ls_chunk_size
     )
+
+    print(energy_transfer_rate.chunks)
 
     energy_transfer_rate.attrs.update({
         'units': "W/kg",
@@ -1072,9 +1006,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         "units": "m"
     })
 
-    # --- ADD: enforce one-scale-at-a-time tasks for reductions/writes ---
-    if hasattr(energy_transfer_rate[list(energy_transfer_rate.data_vars)[0]].data, "chunks"):
-        energy_transfer_rate = energy_transfer_rate.chunk({"scale": 1})
+    # --- enforce one-scale-at-a-time tasks for reductions/writes ---
+    energy_transfer_rate = energy_transfer_rate.chunk({"scale": 1})
 
     if verbose:
         # Avoid triggering a full compute if Dask-backed (expensive convolutions)
