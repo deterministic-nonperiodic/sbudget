@@ -979,8 +979,6 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         scale_chunk_size=ls_chunk_size
     )
 
-    print(energy_transfer_rate.chunks)
-
     energy_transfer_rate.attrs.update({
         'units': "W/kg",
         'standard_name': "specific_kinetic_energy_transfer_rate",
