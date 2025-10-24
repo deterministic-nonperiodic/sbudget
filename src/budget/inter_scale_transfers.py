@@ -644,13 +644,9 @@ def scale_space_integral(
     term_to_integrate = (dg_dr * r_coord) * integrand
 
     # Mask to truncate at r <= 2 * ell (where ell = dg_dr.scale)
-    integration_mask = r_coord <= 2 * dg_dr.scale
-
-    # Apply mask, setting values outside the integration limit to 0.0
-    term_to_integrate_masked = term_to_integrate.where(integration_mask, other=0.0)
+    term_to_integrate_masked = term_to_integrate.where(r_coord <= 2 * dg_dr.scale, other=0.0)
 
     # Estimate the fraction of the integral retained after applying the 2*ell mask
-    # This must be calculated *before* integration.
     retention_fraction = term_to_integrate_masked.sum("r") / term_to_integrate.sum("r")
 
     # Safety: If the denominator is zero or near-zero, use 1.0 to prevent division errors.
