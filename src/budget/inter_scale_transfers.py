@@ -1,5 +1,6 @@
-from typing import Any, Optional
+from typing import Any, Optional, Union, List, Dict, Tuple
 
+import dask.array as da
 import numpy as np
 import psutil
 import xarray as xr
@@ -8,6 +9,7 @@ from pyproj import Geod
 
 from .budget import get_spatial_dims
 from .constants import earth_radius
+from .io_utils import ensure_optimal_chunking
 
 # Constants
 GEODE = Geod(ellps="WGS84")
@@ -384,6 +386,61 @@ def _get_spacing(coord: xr.DataArray, center: float, use_geode: Optional[bool], 
     return dist
 
 
+def get_max_radial_distance(
+        length_scales: Optional[Union[np.ndarray, List[float]]],
+        max_r_input: Union[float, Quantity, None] = None) -> float:
+    """
+    Determines the maximum radial distance (max_r_m) for structure function
+    computation, constrained by twice the largest length scale.
+
+    Parameters
+    ----------
+    length_scales : Optional[Union[np.ndarray, List[float]]]
+        Array or list of filter length scales (in meters) being analyzed.
+        Used to constrain max_r to 2 * max(length_scales).
+    max_r_input : Optional[Union[float, pint.Quantity]]
+        The user-provided maximum radial distance. Defaults to 500 km
+        if length_scales is None, otherwise defaults to max(length_scales).
+
+    Returns
+    -------
+    max_r_m : float
+        The constrained maximum radial distance in meters.
+    """
+
+    # Set default max_r_input based on presence of length_scales
+    if max_r_input is None:
+        max_r_m_default = 500e3 if length_scales is None else max(length_scales)
+    else:
+        max_r_m_default = max_r_input
+
+    if isinstance(max_r_m_default, Quantity):
+        # Convert Quantity to meters
+        max_r_m = max_r_m_default.to("meter").magnitude
+    else:
+        # Assume float is already in meters if coming from max(length_scales) or 500e3
+        max_r_m = float(max_r_m_default)
+
+    # Apply the 2 * l_max constraint
+    if length_scales is not None:
+
+        # Calculate the maximum required radial distance
+        max_scale_limit = 2 * max(length_scales)
+
+        # Ensure the limit is in meters if length_scales were provided as Quantity (e.g., in max_r_m_default)
+        if isinstance(max_r_m_default, Quantity):
+            # Assuming length_scales itself is a NumPy array of meter values.
+            max_scale_limit_m = max_scale_limit
+        else:
+            # Assume length_scales elements are already in meters
+            max_scale_limit_m = max_scale_limit
+
+        # Enforce that max_r_m does not exceed 2 * l_max
+        max_r_m = min(max_r_m, max_scale_limit_m)
+
+    return max_r_m
+
+
 def scale_increments(
         x_coord: xr.DataArray,
         y_coord: xr.DataArray,
@@ -670,6 +727,101 @@ def process_single_r_for_field_chunk(
     return integrand
 
 
+# -------------------------------------------------------------
+# MAIN FUNCTION: Optimized with Shift Caching
+# -------------------------------------------------------------
+
+def process_single_r_for_field_chunk_optimized(
+        field_chunk_ds: xr.Dataset,  # This now contains u, v, w
+        r_scalar_val: float,
+        scale_mask_for_r: xr.DataArray,
+        scale_angle_grid: xr.DataArray,
+        nx_shift_coords: xr.DataArray,
+        ny_shift_coords: xr.DataArray,
+        angle_weight_grid: xr.DataArray,
+        x_dim: str,
+        y_dim: str,
+        x_boundary_type: str,
+        y_boundary_type: str,
+        transform_type: str,
+) -> xr.DataArray:
+    """
+    Optimized: Implements shift caching to compute pad/roll only once per unique
+    shift vector (nx, ny), drastically reducing Dask graph overhead inside the
+    angle loop.
+    """
+    if transform_type != "delta_u_cubed":
+        raise ValueError(f"Transform_type: {transform_type}, not implemented.")
+
+    # --- 1. Identify valid angle/shift combinations and extract parameters ---
+    valid_mask = scale_mask_for_r.data.astype(bool)
+
+    # --- 2. Extract and Normalize Parameters (NumPy) ---
+    if not np.any(valid_mask):
+        raise ValueError(f"No valid value found for {r_scalar_val} m.")
+
+    angles = scale_angle_grid.data[valid_mask]
+    weights = angle_weight_grid.data[valid_mask]
+    ny_idx, nx_idx = np.where(valid_mask)
+    nx_values = nx_shift_coords.data[nx_idx].astype(int)
+    ny_values = ny_shift_coords.data[ny_idx].astype(int)
+
+    # Normalize weights to sum to 2π
+    weights *= 2.0 * np.pi / np.sum(weights)
+    total_weight = weights.sum()
+
+    # Combine all parameters into a list of tuples for iteration
+    angle_params = list(zip(angles, nx_values, ny_values, weights))
+
+    # Identify unique shifts and prepare cache
+    unique_shifts = sorted(list(set(zip(nx_values, ny_values))))
+    rolled_ds_cache: Dict[Tuple[int, int], xr.Dataset] = {}
+
+    # Pre-calculate and cache the rolled Dataset for each unique shift
+    for nx_shift, ny_shift in unique_shifts:
+        # Roll the dataset once per unique shift
+        rolled_ds = roll_with_boundary_handling(
+            field_chunk_ds, int(nx_shift), int(ny_shift),
+            x_dim, y_dim, x_boundary_type, y_boundary_type
+        )
+
+        # Cache the result
+        rolled_ds_cache[(nx_shift, ny_shift)] = rolled_ds
+
+    # Initialize weighted_sum DataArray to zero (using 'u' as the template)
+    dims = field_chunk_ds["u"].dims
+    coords = field_chunk_ds["u"].coords
+    weighted_sum = xr.DataArray(
+        da.zeros_like(field_chunk_ds["u"].data, dtype=np.float32),
+        dims=dims, coords=coords, name="weighted_sum_integrand"
+    )
+
+    for phi, nx_shift, ny_shift, weight in angle_params:
+        # Lookup the pre-computed rolled dataset
+        rolled_ds = rolled_ds_cache[(nx_shift, ny_shift)]
+
+        # Compute the cubed difference
+        result = delta_u_cubed_geographic(field_chunk_ds, rolled_ds, phi)
+
+        # Accumulate the weighted sum
+        weighted_sum += result * weight
+
+        # Cleanup (No need to del rolled_ds as it's from cache)
+        del result
+
+    # Final result is average over all angles (weighted sum / total weight)
+    integrand = weighted_sum / total_weight.clip(min=1e-12)
+
+    # Handle final coordinate assignment (unchanged)
+    if 'r' in integrand.coords:
+        integrand = integrand.drop_vars('r')
+
+    integrand = integrand.rename(transform_type)
+    integrand = integrand.expand_dims({'r': [r_scalar_val]})
+
+    return integrand.transpose('r', ...)
+
+
 def build_map_blocks_template(field: xr.Dataset, transform_type: str, r_vals: np.ndarray,
                               x_dim: str, y_dim: str) -> xr.DataArray:
     """
@@ -703,7 +855,7 @@ def increment_integrand(
 
     def block_fn(field_chunk: xr.Dataset) -> xr.DataArray:
         return xr.concat(
-            (process_single_r_for_field_chunk(
+            (process_single_r_for_field_chunk_optimized(
                 field_chunk_ds=field_chunk,
                 r_scalar_val=r,
                 scale_mask_for_r=increments["mask"].sel(r=r),
@@ -729,7 +881,13 @@ def increment_integrand(
         y_dim=y_dim
     )
 
-    return xr.map_blocks(block_fn, field, template=template)
+    # calculate the integrand using map_blocks
+    integrand = xr.map_blocks(block_fn, field, template=template)
+
+    # This prepares the array for efficient integration/reduction in the next step.
+    integrand = integrand.chunk({"r": 1})
+
+    return integrand
 
 
 def ensure_nonspatial_chunking(
@@ -849,13 +1007,11 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     if verbose:
         print(f"Inferred boundary conditions -> x: {x_boundary}, y: {y_boundary}")
 
-    # Handle max_r input with unit checking
-    max_r_input = kwargs.get("max_r", 500e3 if length_scales is None else max(length_scales))
-
-    if isinstance(max_r_input, Quantity):
-        max_r_m = max_r_input.to("meter").magnitude
-    else:
-        max_r_m = float(max_r_input)
+    # Infer max_r input from user-defined length scales if given with (r <= 2 l_max) constraints
+    max_r_m = get_max_radial_distance(
+        length_scales=length_scales,
+        max_r_input=kwargs.get("max_r", None)
+    )
 
     # Compute scale increments
     increments = scale_increments(
@@ -865,10 +1021,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     )
 
     # Ensure the increments fit in memory or compute in chunks along non-spatial dimensions
-    wind = ensure_nonspatial_chunking(wind, x_name, y_name,
-                                      expansion_factor=len(increments.r),
-                                      memory_threshold_ratio=0.5,
-                                      verbose=verbose)
+    wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name), target_chunk_mb=128)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
     nan_mask = xr.concat(
@@ -887,7 +1040,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         transform_type="delta_u_cubed"
     ).where(~nan_mask)
 
-    # Apply mollifier normalization
+    # Apply normalized mollifier kernel
     energy_transfer_rate = scale_space_integral(
         integrand=integrand,
         name="energy_transfer",
