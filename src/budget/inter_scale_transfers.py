@@ -1021,7 +1021,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     )
 
     # Ensure the increments fit in memory or compute in chunks along non-spatial dimensions
-    wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name), target_chunk_mb=128)
+    chunk_size = 32  # MB target chunk size for spatial dims. Keep small to limit memory use.
+    wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name), target_chunk_mb=chunk_size)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
     nan_mask = xr.concat(
