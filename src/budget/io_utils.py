@@ -257,7 +257,7 @@ def open_dataset(cfg) -> xr.Dataset:
     ds = ensure_vertical_consistent(ds)
 
     # Apply consistent rechunking:
-    rechunk_spatial = getattr(cfg.compute, "levels", True)
+    rechunk_spatial = getattr(cfg.compute, "rechunk_spatial", True)
 
     ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), target_chunk_mb=128,
                                  rechunk_spatial=rechunk_spatial)

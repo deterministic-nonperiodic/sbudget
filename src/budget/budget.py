@@ -26,19 +26,31 @@ _OPTIONS = _SpectralOptions()
 # --------------------------------------------------------------------------------------------------
 def domain_mean(da: xr.DataArray) -> xr.DataArray:
     """
-    cos(lat) weighted mean over (y,x).
-    Supports lat as 1-D (lat) or 2-D lat(y,x). Falls back to plain mean if no lat.
-    """
-    y, x = get_spatial_dims(da)
+    cos(lat) weighted mean over spatial dimensions (y, x).
 
-    if _is_geographic(da.coords[y], "lat"):
-        lat = da["lat"]
+    Supports latitude coordinate identified as the Y-dimension (y) via CF attributes,
+    regardless of dimensionality (1D or 2D). Falls back to a plain mean if a
+    latitude coordinate cannot be identified.
+    """
+    # 1. Get the names of the spatial dimensions to reduce over
+    y_dim, x_dim = get_spatial_dims(da)
+
+    # Get the coordinate associated with the y-dimension name
+    # This coordinate may be 1D ('lat') or 2D ('y' with latitude data)
+    y_coord = da.coords[y_dim]
+
+    # Check if the y-coordinate is a geographic latitude
+    if _is_geographic(y_coord, "lat"):
+        lat = y_coord
+
+        # Convert to radians if units are detected as degrees
         lat_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
 
-        return da.weighted(np.cos(lat_rad)).mean(dim=(y, x))
+        # Calculate the weighted mean over the spatial dimensions
+        return da.weighted(np.cos(lat_rad)).mean(dim=(y_dim, x_dim))
     else:
-        # unexpected lat layout
-        return da.mean(dim=(y, x))
+        # Fallback for non-geographic, projected, or unknown grids
+        return da.mean(dim=(y_dim, x_dim))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -308,8 +320,9 @@ def isotropize(spectrum: xr.DataArray, dx: float, dy: float,
     """
     if not {"ky", "kx"} <= set(spectrum.dims):
         # allow physical dims as a fallback, but you should be feeding spectra here
-        y, x = get_spatial_dims(spectrum)
-        spectrum = spectrum.rename({y: "ky", x: "kx"})
+        y_dim, x_dim = get_spatial_dims(spectrum)
+
+        spectrum = spectrum.rename({y_dim: "ky", x_dim: "kx"})
 
     # Get kappa bins and 2D bin index array
     nky, nkx = int(spectrum.sizes["ky"]), int(spectrum.sizes["kx"])
@@ -385,14 +398,14 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray,
 
 def compute_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """Horizontal divergence."""
-    y, x = get_spatial_dims(u)
-    return differentiate_metric(u, x) + differentiate_metric(v, y)
+    y_dim, x_dim = get_spatial_dims(u)
+    return differentiate_metric(u, x_dim) + differentiate_metric(v, y_dim)
 
 
 def compute_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """Vertical vorticity."""
-    y, x = get_spatial_dims(u)
-    return differentiate_metric(v, x) - differentiate_metric(u, y)
+    y_dim, x_dim = get_spatial_dims(u)
+    return differentiate_metric(v, x_dim) - differentiate_metric(u, y_dim)
 
 
 def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = None,
@@ -421,13 +434,13 @@ def nonlinear_hke_transfer_flux(
     All horizontal derivatives use `differentiate_metric` (metric-aware on lon/lat).
     Vertical derivatives use `.differentiate("z")`.
     """
-    y, x = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
+    y_dim, x_dim = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
 
     # Horizontal & vertical derivatives
-    dxu = differentiate_metric(u, x)
-    dxv = differentiate_metric(v, x)
-    dyu = differentiate_metric(u, y)
-    dyv = differentiate_metric(v, y)
+    dxu = differentiate_metric(u, x_dim)
+    dxv = differentiate_metric(v, x_dim)
+    dyu = differentiate_metric(u, y_dim)
+    dyv = differentiate_metric(v, y_dim)
     dzu = u.differentiate("z", edge_order=2)
     dzv = v.differentiate("z", edge_order=2)
 
@@ -463,12 +476,12 @@ def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.Dat
     - Use physical-space gradients and shears
     - Convert to spectral space via component-wise cross spectra and sum
     """
-    y, x = get_spatial_dims(u)
+    y_dim, x_dim = get_spatial_dims(u)
 
     # Physical-space kinetic energy and its horizontal gradient (vector)
     hke_phys = 0.5 * (u ** 2 + v ** 2)
-    grad_hke = stack_vector(differentiate_metric(hke_phys, x),
-                            differentiate_metric(hke_phys, y),
+    grad_hke = stack_vector(differentiate_metric(hke_phys, x_dim),
+                            differentiate_metric(hke_phys, y_dim),
                             name="grad_hke")
 
     # Wind vector and vertical shear vector
@@ -513,11 +526,11 @@ def nonlinear_vke_transfer(
     All horizontal derivatives use `differentiate_metric` (metric-aware on lon/lat).
     Vertical derivatives use `.differentiate("z")`.
     """
-    y, x = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
+    y_dim, x_dim = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
 
     # Horizontal & vertical derivatives
-    dxw = differentiate_metric(w, x)
-    dyw = differentiate_metric(w, y)
+    dxw = differentiate_metric(w, x_dim)
+    dyw = differentiate_metric(w, y_dim)
     dzw = w.differentiate("z", edge_order=2)
 
     # Divergence (compute if absent)

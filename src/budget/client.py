@@ -189,6 +189,7 @@ def main(argv: list[str] | None = None) -> None:
     p_compute.add_argument("--var-w")
     p_compute.add_argument("--var-theta")
     p_compute.add_argument("--var-pressure")
+    p_compute.add_argument("--var-density")
     p_compute.add_argument("--var-temperature")
     p_compute.add_argument("--var-divergence")
     p_compute.add_argument("--var-vorticity")
