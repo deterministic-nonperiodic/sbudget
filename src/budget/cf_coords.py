@@ -132,7 +132,7 @@ def _coord_is_degrees(
     return False
 
 
-def _is_z(cname: str, coords: Dict[str, Any]) -> bool:
+def _is_z(cname: str, coords: Union[xr.DataArray, Any]) -> bool:
     """CF-ish vertical detection using name/units/standard_name/axis signals."""
     if not _has(cname, coords):
         return False

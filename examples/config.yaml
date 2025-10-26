@@ -29,7 +29,7 @@ variables:
   theta: theta              # preferred; if missing, derive from pressure & temperature
   pressure: p               # optional if theta present
   temperature: temp         # optional if theta present
-  density: rho              # optional if theta present
+  density: rho              # optional; derive from pressure & temperature
   # Optional precomputed diagnostics (used if present)
   divergence: div
   vorticity: vor

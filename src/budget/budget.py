@@ -94,7 +94,7 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
     # Cartesian (incl. 'z'): convert km→m if the coord says 'km'
     units = str(getattr(coord, "units", "")).lower()
     if "km" in units and "m" not in units:
-        return (1e-3) * da.differentiate(dim, edge_order=2)
+        return 1e-3 * da.differentiate(dim, edge_order=2)
 
     return da.differentiate(dim, edge_order=2)
 
