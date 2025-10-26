@@ -975,7 +975,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
     # add scale coordinate attributes
     energy_transfer_rate["scale"].attrs.update({
-        "standard__name": "horizontal_scale",
+        "standard_name": "horizontal_scale",
         "long_name": "horizontal scale",
         "units": "m"
     })
