@@ -295,7 +295,14 @@ def _azimuthal_bincount(block: np.ndarray, bin_idx2d: np.ndarray, n_bins: int) -
     return binned_block
 
 
-def isotropize(spectrum: xr.DataArray, dx: float, dy: float, nyquist: bool = True) -> xr.DataArray:
+def accumulate(da: xr.DataArray) -> xr.DataArray:
+    """Cumulative integral toward low wavenumbers along ``k`` → ``wavenumber``."""
+    sorted_da = da.sortby("wavenumber", ascending=False)
+    return sorted_da.cumsum("wavenumber").sortby("wavenumber")
+
+
+def isotropize(spectrum: xr.DataArray, dx: float, dy: float,
+               nyquist: bool = True, cumulative: bool = False) -> xr.DataArray:
     """Variance-conserving azimuthally average a 2-D spectrum to a 1-D isotropic spectrum.
 
     Accepts spectra with dims ('ky','kx'), where kx is the rFFT half-plane.
@@ -336,7 +343,12 @@ def isotropize(spectrum: xr.DataArray, dx: float, dy: float, nyquist: bool = Tru
     )
 
     spec1d = spec1d.rename(spec1d.name or "spectrum_1d")
-    return spec1d.assign_coords(wavenumber=("wavenumber", wavenumber))
+    spec1d = spec1d.assign_coords(wavenumber=("wavenumber", wavenumber))
+
+    if cumulative:
+        spec1d = accumulate(spec1d)
+
+    return spec1d
 
 
 # --------------------------------------------------------------------------------------------------
@@ -596,12 +608,6 @@ def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
     return anc_hke.rename(name)
 
 
-def accumulate(da: xr.DataArray) -> xr.DataArray:
-    """Cumulative integral toward low wavenumbers along ``k`` → ``wavenumber``."""
-    sorted_da = da.sortby("wavenumber", ascending=False)
-    return sorted_da.cumsum("wavenumber").sortby("wavenumber")
-
-
 def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     """Compute the spectral non‑hydrostatic energy budget.
 
@@ -670,10 +676,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # ----------------------------------------------------------------------------------------------
     # Spectral energy budget terms
     # ----------------------------------------------------------------------------------------------
+    # --- accumulation (optional; defaults True) ---
+    cumulative = getattr(cfg.compute, "cumulative", True)
 
     # --- spectra: HKE 2D and isotropic 1D ---
     hke_2d = kinetic_energy_spectra(u, v, norm=cfg.compute.norm)
-    hke_1d = isotropize(hke_2d, dx, dy)
+    hke_1d = isotropize(hke_2d, dx, dy, cumulative=False)  # non-cumulative HKE spectra
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
     divergence = ds.get("divergence", None)
@@ -689,12 +697,15 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     else:
         transfer_2d = nonlinear_hke_transfer_flux(u, v, w, divergence, norm=cfg.compute.norm)
 
-    transfer_1d = isotropize(transfer_2d, dx, dy)
+    pi_nke = isotropize(transfer_2d, dx, dy, cumulative=cumulative)
 
     # --- vertical flux of HKE and its divergence ---
     fh_2d = turbulent_hke_flux(u, v, w, cfg.compute.norm)
-    fh_1d = isotropize(fh_2d, dx, dy)
-    vfd_dke_1d = isotropize(fh_2d.differentiate('z', edge_order=2), dx, dy).rename("vfd_dke")
+    vf_hke = isotropize(fh_2d, dx, dy, cumulative=cumulative)
+
+    vfd_dke = isotropize(
+        fh_2d.differentiate('z', edge_order=2), dx, dy, cumulative=cumulative
+    ).rename("vfd_dke")
 
     #  --- adiabatic non-conservative term ---
     # Compute density if not given
@@ -707,7 +718,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         rho = _ensure_spatial_single_chunk(rho, space_dims)
 
     jh_2d = nonconservative_adiabatic(u, v, w, rho, vf_hke=fh_2d, norm=cfg.compute.norm)
-    jh_1d = isotropize(jh_2d, dx, dy)
+    jh = isotropize(jh_2d, dx, dy, cumulative=cumulative)
 
     # --- pressure work & conversion (if pressure available) ---
     # scaled pressure perturbation with respect to reference state
@@ -717,30 +728,18 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         exner = _ensure_spatial_single_chunk(exner, space_dims)
 
     fp_2d = pressure_flux(theta, w, exner, cfg.compute.norm)
-    vf_pres_1d = isotropize(fp_2d, dx, dy)
-    vfd_pres_1d = isotropize(fp_2d.differentiate('z', edge_order=2), dx, dy).rename("vfd_pres")
+    vf_pres = isotropize(fp_2d, dx, dy, cumulative=cumulative)
+
+    vfd_pres = isotropize(
+        fp_2d.differentiate('z', edge_order=2), dx, dy, cumulative=cumulative
+    ).rename("vfd_pres")
 
     cad_2d = conversion_ape_to_dke(theta, w, exner, cfg.compute.norm)
-    cad_1d = isotropize(cad_2d, dx, dy)
+    cad = isotropize(cad_2d, dx, dy, cumulative=cumulative)
 
     # --- horizontal KE divergence term ---
     div_hke_2d = divergence_hke(u, v, w, divergence, cfg.compute.norm)
-    div_hke_1d = isotropize(div_hke_2d, dx, dy)
-
-    # --- accumulation (optional; defaults True) ---
-    do_acc = getattr(cfg.compute, "cumulative", True)
-
-    def maybe_accumulate(da):
-        return accumulate(da) if do_acc else da
-
-    pi_nke = maybe_accumulate(transfer_1d)
-    vfd_dke = maybe_accumulate(vfd_dke_1d)
-    vf_pres = maybe_accumulate(vf_pres_1d)
-    vfd_pres = maybe_accumulate(vfd_pres_1d)
-    cad = maybe_accumulate(cad_1d)
-    div_hke = maybe_accumulate(div_hke_1d)
-    vf_hke = maybe_accumulate(fh_1d)
-    jh = maybe_accumulate(jh_1d)
+    div_hke = isotropize(div_hke_2d, dx, dy, cumulative=cumulative)
 
     # --- assemble ---
     fields = [hke_1d, pi_nke, vfd_dke, div_hke, vf_hke, vf_pres, vfd_pres, cad, jh]
