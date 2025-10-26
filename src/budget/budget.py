@@ -735,11 +735,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     fields = [hke_1d, pi_nke, vfd_dke, div_hke, vf_hke, vf_pres, vfd_pres, cad, jh]
     fluxes = xr.Dataset({da.name: da for da in fields if da is not None})
 
-    # attrs
-    fluxes.wavenumber.attrs.update({'standard_name': 'wavenumber',
-                                    'long_name': 'horizontal wavenumber',
-                                    'axis': 'X', 'units': 'rad / m'})
-
+    # Set attributes
     units = "watt / kilogram"
     meta = {
         "cad": ("conversion_ape_dke",
@@ -765,4 +761,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
                 {"standard_name": std_name, "long_name": long_name, "units": units}
             )
 
-    return fluxes
+    # wavenumber coord attrs
+    fluxes.wavenumber.attrs.update({'standard_name': 'wavenumber',
+                                    'long_name': 'horizontal wavenumber',
+                                    'axis': 'X', 'units': 'rad / m'})
+
+    return fluxes.transpose(..., "wavenumber")  # ensure k is last dim

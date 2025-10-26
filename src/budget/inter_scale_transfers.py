@@ -962,10 +962,12 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     energy_transfer_rate.attrs.update({
         'units': "W/kg",
         'standard_name': "specific_kinetic_energy_transfer_rate",
-        'long_name': "Specific kinetic energy inter-scale transfer rate"
+        'long_name': "Specific transfer rate of kinetic energy across scales",
+        'description': "Computed using third-order structure functions and mollifier kernels. "
+                       "Positive means energy transfer from larger to smaller scales"
     })
 
-    # reassign coordinates from data
+    # reassign coordinates from input data
     energy_transfer_rate = energy_transfer_rate.assign_coords(**{x_name: x_coord, y_name: y_coord})
     energy_transfer_rate[x_name].attrs = x_coord.attrs
     energy_transfer_rate[y_name].attrs = y_coord.attrs
@@ -980,8 +982,11 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         "units": "m"
     })
 
+    # transpose to have scale as the last dimension
+    energy_transfer_rate = energy_transfer_rate.transpose(..., "scale")
+
     # --- enforce one-scale-at-a-time tasks for reductions/writes ---
-    energy_transfer_rate = energy_transfer_rate.chunk({"scale": 1})
+    energy_transfer_rate = energy_transfer_rate.chunk(scale=1)
 
     if verbose:
         # Avoid triggering a full compute if Dask-backed (expensive convolutions)
