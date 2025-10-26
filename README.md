@@ -25,7 +25,7 @@ $$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}
 * $J_h(k)$ — **adiabatic nonconservative** tendency.
 * $D_h(k)$ — **diffusive/dissipative** tendency (viscosity, filters).
 
-Terms $H_h(k)$, $J_h(k)$, and $D_h(k)$ are model-physics dependent and therefore omitted here.
+Terms $H_h(k)$ and $D_h(k)$ are model-physics dependent and therefore omitted here.
 
 #### Features
 
