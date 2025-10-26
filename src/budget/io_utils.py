@@ -6,7 +6,7 @@ from typing import Tuple, Optional, Dict
 import numpy as np
 import xarray as xr
 
-from .cf_coords import _is_z, is_lonlat
+from .cf_coords import _is_z, is_geographic_grid
 
 
 def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
@@ -63,6 +63,7 @@ def ensure_optimal_chunking(
         preferred: Optional[Dict[str, int]] = None,  # any extra dims you want to chunk
         deriv_edge_order: int = 2,  # minimum required per-chunk = edge_order + 1
         quiet: bool = False,
+        rechunk_spatial=True
 ) -> xr.Dataset:
     """
     Rechunk for fast 2-D FFTs, and ensure vertical chunks all satisfy
@@ -88,7 +89,12 @@ def ensure_optimal_chunking(
     target_bytes = int(target_chunk_mb * 1024 ** 2)
     budget_mult = max(1, target_bytes // max(1, bytes_plane))  # how many (time*z) we can pack
 
-    plan: Dict = {y: -1, x: -1}  # -1 → single chunk along FFT axes
+    if rechunk_spatial:
+        spatial_chunks = {y: -1, x: -1}
+    else:
+        spatial_chunks = {y: "auto", x: "auto"}
+
+    plan: Dict = spatial_chunks  # -1 → single chunk along FFT axes
 
     # guesses
     t_guess = int(ds.sizes.get("time", 1))
@@ -198,7 +204,7 @@ def open_dataset(cfg) -> xr.Dataset:
     z_name, y_name, x_name = cfg.input.dims
 
     # standard target names
-    if is_lonlat(ds, (y_name, x_name)):
+    if is_geographic_grid(ds[x_name], ds[y_name]):
         target_y, target_x = "lat", "lon"
         ds.attrs["grid_type"] = "lonlat"
     else:
@@ -251,7 +257,10 @@ def open_dataset(cfg) -> xr.Dataset:
     ds = ensure_vertical_consistent(ds)
 
     # Apply consistent rechunking:
-    ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), target_chunk_mb=128)
+    rechunk_spatial = getattr(cfg.compute, "levels", True)
+
+    ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), target_chunk_mb=128,
+                                 rechunk_spatial=rechunk_spatial)
 
     return ds
 

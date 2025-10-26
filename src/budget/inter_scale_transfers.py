@@ -8,14 +8,12 @@ from pint import Quantity
 from pyproj import Geod
 
 from .budget import get_spatial_dims
+from .cf_coords import is_geographic_grid
 from .constants import earth_radius
 from .io_utils import ensure_optimal_chunking
 
 # Constants
 GEODE = Geod(ellps="WGS84")
-
-ALLOWED_UNITS = ["deg", "degrees", "degrees_north", "degrees_east",
-                 "m", "meters", "km", "kilometers"]
 
 
 def estimate_dataset_bytes(ds: xr.Dataset) -> int:
@@ -357,22 +355,6 @@ def filter_by_directional_coverage(scale_incs: xr.Dataset,
 
 
 # --- Core Computational Functions (Refactored) ---
-def _infer_coordinate_units(coord: xr.DataArray, name: str) -> str:
-    units = coord.attrs.get("units", "").lower()
-    if not units:
-        raise ValueError(f"Missing 'units' attribute for {name} coordinate.")
-    if units not in ALLOWED_UNITS:
-        raise ValueError(f"Invalid units for {name}: '{units}'. Allowed: {ALLOWED_UNITS}")
-    return units
-
-
-def _is_geographic(units_x: str, units_y: str) -> bool:
-    return np.logical_and(
-        any(u in units_x for u in ["deg", "degrees", "degrees_east"]),
-        any(u in units_y for u in ["deg", "degrees", "degrees_north"])
-    )
-
-
 def _get_spacing(coord: xr.DataArray, center: float, use_geode: Optional[bool], axis: str) -> float:
     if coord.size < 2:
         return 1.0
@@ -457,9 +439,7 @@ def scale_increments(
         if coord.ndim != 1:
             raise ValueError(f"{name}_coord must be 1-dimensional")
 
-    units_x = _infer_coordinate_units(x_coord, 'x')
-    units_y = _infer_coordinate_units(y_coord, 'y')
-    use_geode = _is_geographic(units_x, units_y)
+    use_geode = is_geographic_grid(x_coord, y_coord)
 
     x_center = float(x_coord.mean())
     y_center = float(y_coord.mean())

@@ -4,7 +4,7 @@ from typing import Union
 import numpy as np
 import xarray as xr
 
-from .cf_coords import _coord_is_degrees, _is_lon, _is_lat, get_spatial_dims, infer_resolution
+from .cf_coords import _coord_is_degrees, _is_geographic, get_spatial_dims, infer_resolution
 from .constants import cp, earth_radius
 from .thermodynamics import potential_temperature, exner_function, density
 
@@ -24,15 +24,6 @@ _OPTIONS = _SpectralOptions()
 # --------------------------------------------------------------------------------------------------
 # Helper functions
 # --------------------------------------------------------------------------------------------------
-def _ensure_spatial_single_chunk(da: xr.DataArray, dims: tuple[str, str, str]) -> xr.DataArray:
-    """Rechunk so each core spatial dimension is a single Dask chunk."""
-    _, y, x = dims
-    try:
-        return da.chunk({y: -1, x: -1})
-    except Exception:
-        return da
-
-
 def domain_mean(da: xr.DataArray) -> xr.DataArray:
     """
     cos(lat) weighted mean over (y,x).
@@ -40,7 +31,7 @@ def domain_mean(da: xr.DataArray) -> xr.DataArray:
     """
     y, x = get_spatial_dims(da)
 
-    if _is_lat(y, da.coords):
+    if _is_geographic(da.coords[y], "lat"):
         lat = da["lat"]
         lat_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
 
@@ -59,9 +50,9 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
 
     - If `delta` is given (meters), assumes constant spacing along `dim`.
     - If `dim` is longitude/latitude (per `_is_lon` / `_is_lat`), applies the spherical metric:
-        d/dx = (π/180)/(R cos φ) * d/dλ   (for longitude, if coord in degrees)
-        d/dy = (π/180)/R          * d/dφ   (for latitude,  if coord in degrees)
-      (If coords are already in radians, omit π/180.)
+        d/dx = (π/180)/(a cos φ) * d/dλ   (for longitude, if coord in degrees)
+        d/dy = (π/180)/a         * d/dφ   (for latitude,  if coord in degrees)
+      where "a" is Earth's radius. If coords are already in radians, omit π/180.
     - Otherwise (Cartesian dims, incl. `z`), uses `.differentiate(dim)` and converts km→m if needed.
     """
     if dim not in da.dims:
@@ -71,16 +62,17 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
     coord = da.coords.get(dim, None)
 
     if coord is None:
-        if delta is None:
+        if delta is not None:
+            # index-based derivative (spacing=1) scaled by constant delta [m]
+            delta = xr.full_like(da, fill_value=float(delta))
+            return da.differentiate(coord=dim, edge_order=2) / delta
+        else:
             raise ValueError(
                 f"differentiate_metric: No coordinate found for dim '{dim}' "
                 f"and no 'delta' provided; cannot determine metric spacing.")
-        # index-based derivative (spacing=1) scaled by constant delta [m]
-        delta = xr.full_like(da, fill_value=float(delta))
-        return da.differentiate(coord=dim, edge_order=2) / delta
 
     # Longitude
-    if _is_lon(dim, da.coords):
+    if _is_geographic(coord, "lon"):
         # Need latitude for cos(phi)
         lat = da.coords['lat']
         phi = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
@@ -94,7 +86,7 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
         return factor * da.differentiate(dim, edge_order=2)
 
     # Latitude
-    if _is_lat(dim, da.coords):
+    if _is_geographic(coord, "lat"):
         d_phi = (np.pi / 180.0) if _coord_is_degrees(coord) else 1.0
         factor = d_phi / earth_radius  # rad/m
         return factor * da.differentiate(dim, edge_order=2)
@@ -664,15 +656,6 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         # compute potential temperature
         theta = potential_temperature(pressure, temperature)
 
-    # Ensure spatial single-chunking for FFT inputs (configurable)
-    if _OPTIONS.rechunk_spatial:
-        u = _ensure_spatial_single_chunk(u, space_dims)
-        v = _ensure_spatial_single_chunk(v, space_dims)
-        w = _ensure_spatial_single_chunk(w, space_dims)
-        theta = _ensure_spatial_single_chunk(theta, space_dims)
-        pressure = _ensure_spatial_single_chunk(pressure, space_dims)
-        temperature = _ensure_spatial_single_chunk(temperature, space_dims)
-
     # ----------------------------------------------------------------------------------------------
     # Spectral energy budget terms
     # ----------------------------------------------------------------------------------------------
@@ -714,18 +697,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     if rho is None:
         rho = density(pressure, temperature)
 
-    if _OPTIONS.rechunk_spatial:
-        rho = _ensure_spatial_single_chunk(rho, space_dims)
-
     jh_2d = nonconservative_adiabatic(u, v, w, rho, vf_hke=fh_2d, norm=cfg.compute.norm)
     jh = isotropize(jh_2d, dx, dy, cumulative=cumulative)
 
     # --- pressure work & conversion (if pressure available) ---
     # scaled pressure perturbation with respect to reference state
     exner = exner_function(pressure) - exner_function(domain_mean(pressure))
-
-    if _OPTIONS.rechunk_spatial:
-        exner = _ensure_spatial_single_chunk(exner, space_dims)
 
     fp_2d = pressure_flux(theta, w, exner, cfg.compute.norm)
     vf_pres = isotropize(fp_2d, dx, dy, cumulative=cumulative)
