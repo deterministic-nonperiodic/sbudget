@@ -126,3 +126,10 @@ calculates inter-scale transfers at specified wavelengths based on third-order s
   --mode scale_transfer \
   --scales 1000,5000,10000
 ```
+
+Perform analysis on selected levels and scales. Note, level selection is ignored in 
+"spectral_budget" mode since continuous sampling is required for computing vertical gradients
+```bash
+  sbudget compute examples/config.yaml --mode scale_transfer \ 
+  --levels 60e3 --scales 20e3,35e3
+```
