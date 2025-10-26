@@ -4,9 +4,9 @@ from typing import Union
 import numpy as np
 import xarray as xr
 
-from .constants import cp, earth_radius
 from .cf_coords import _coord_is_degrees, _is_lon, _is_lat, get_spatial_dims, infer_resolution
-from .thermodynamics import potential_temperature, exner_function
+from .constants import cp, earth_radius
+from .thermodynamics import potential_temperature, exner_function, density
 
 
 # --------------------------------------------------------------------------------------------------
@@ -33,7 +33,7 @@ def _ensure_spatial_single_chunk(da: xr.DataArray, dims: tuple[str, str, str]) -
         return da
 
 
-def global_mean(da: xr.DataArray) -> xr.DataArray:
+def domain_mean(da: xr.DataArray) -> xr.DataArray:
     """
     cos(lat) weighted mean over (y,x).
     Supports lat as 1-D (lat) or 2-D lat(y,x). Falls back to plain mean if no lat.
@@ -192,8 +192,8 @@ def scalar_spectrum(field: xr.DataArray, norm: str | None = None) -> xr.DataArra
     return power
 
 
-def cross_spectrum(field1: xr.DataArray, field2: xr.DataArray,
-                   norm: str | None = None) -> xr.DataArray:
+def scalar_cross_spectrum(field1: xr.DataArray, field2: xr.DataArray,
+                          norm: str | None = None) -> xr.DataArray:
     """Return 2-D cross-spectrum F1*(k) F2(k) over the horizontal dims.
 
     rFFT path (half-plane in kx, ky shifted). Interior-kx ×2 will be applied
@@ -374,8 +374,8 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray,
     """
     if "comp" not in vec1.dims or "comp" not in vec2.dims:
         raise ValueError("vector_cross_spectrum expects inputs with 'comp' dimension")
-    u_term = cross_spectrum(vec1.sel(comp="u"), vec2.sel(comp="u"), norm)
-    v_term = cross_spectrum(vec1.sel(comp="v"), vec2.sel(comp="v"), norm)
+    u_term = scalar_cross_spectrum(vec1.sel(comp="u"), vec2.sel(comp="u"), norm)
+    v_term = scalar_cross_spectrum(vec1.sel(comp="v"), vec2.sel(comp="v"), norm)
     return u_term + v_term
 
 
@@ -524,8 +524,8 @@ def nonlinear_vke_transfer(
     advection_w = (u * dxw + v * dyw) + 0.5 * (divergence * w) + 0.5 * (w * dzw)
 
     # Spectral vector inner products (sum over components)
-    t_adv = - cross_spectrum(w, advection_w, norm=norm)  # -⟨w, Aw⟩
-    t_shear = vector_cross_spectrum(dzw, w * w, norm=norm)  # ⟨∂z w, w^2⟩
+    t_adv = - scalar_cross_spectrum(w, advection_w, norm=norm)  # -⟨w, Aw⟩
+    t_shear = scalar_cross_spectrum(dzw, w * w, norm=norm)  # ⟨∂z w, w^2⟩
 
     pi_nke = t_adv + t_shear
 
@@ -536,31 +536,34 @@ def turbulent_hke_flux(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                        norm: str | None, name="vf_hke") -> xr.DataArray:
     """Vertical flux of HKE: -½⟨u, w u⟩ - ½⟨v, w v⟩ in spectral space."""
 
-    vf_hke = -0.5 * (cross_spectrum(u, w * u, norm) + cross_spectrum(v, w * v, norm))
+    wind = stack_vector(u, v, name="wind")
+
+    vf_hke = -0.5 * vector_cross_spectrum(wind, w * wind, norm)
+
     return vf_hke.rename(name)
 
 
 def turbulent_vke_flux(w: xr.DataArray, norm: str | None, name="vf_vke") -> xr.DataArray:
     """Vertical flux of HKE: -½⟨u, w u⟩ - ½⟨v, w v⟩ in spectral space."""
 
-    vf_vke = -0.5 * cross_spectrum(w, w * w, norm)
+    vf_vke = -0.5 * scalar_cross_spectrum(w, w * w, norm)
     return vf_vke.rename(name)
 
 
 def pressure_flux(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
                   norm: str | None, name="vf_pres") -> xr.DataArray:
     """Vertical pressure work flux term: -cp·θ·⟨w, exner⟩."""
-    p_flux = -cp * global_mean(theta) * cross_spectrum(w, exner, norm)
+    p_flux = -cp * domain_mean(theta) * scalar_cross_spectrum(w, exner, norm)
 
     return p_flux.rename(name)
 
 
 def conversion_ape_to_dke(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
                           norm: str | None, name="cad") -> xr.DataArray:
-    """APE→DKE conversion term: cp·θ·⟨w, ∂z exner⟩."""
+    """APE to DKE conversion term: cp·θ·⟨w, ∂z exner⟩."""
     dz_exner = exner.differentiate('z', edge_order=2)
 
-    cad = cp * global_mean(theta) * cross_spectrum(w, dz_exner, norm)
+    cad = cp * domain_mean(theta) * scalar_cross_spectrum(w, dz_exner, norm)
 
     return cad.rename(name)
 
@@ -571,10 +574,26 @@ def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
     if divergence is None:
         divergence = compute_divergence(u, v)
 
-    s = w.differentiate("z", edge_order=2) + divergence
-    div_hke = 0.5 * (cross_spectrum(u, u * s, norm) + cross_spectrum(v, v * s, norm))
+    wind = stack_vector(u, v, name="wind")
+    divergence_3d = divergence + w.differentiate("z", edge_order=2)
+
+    div_hke = 0.5 * vector_cross_spectrum(wind, wind * divergence_3d, norm)
 
     return div_hke.rename(name)
+
+
+def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                              rho: xr.DataArray, vf_hke: xr.DataArray = None,
+                              norm: str | None = None, name="j_hke") -> xr.DataArray:
+    """Nonconservative adiabatic contribution to the HKE budget."""
+
+    if vf_hke is None:
+        vf_hke = turbulent_hke_flux(u, v, w, norm=norm)
+
+    # vf_jke(..., wavenumber) * ∂z( rho_avg )
+    anc_hke = vf_hke * domain_mean(rho).differentiate("z", edge_order=2)
+
+    return anc_hke.rename(name)
 
 
 def accumulate(da: xr.DataArray) -> xr.DataArray:
@@ -631,8 +650,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # --- potential temperature ---
     theta = ds.get("theta")
     pressure = ds.get("pressure")
+    temperature = ds.get("temperature")
+
     if theta is None and pressure is not None:
-        temperature = ds.get("temperature")
         if temperature is None:
             raise ValueError("Provide either 'theta' or both 'pressure' and 'temperature'.")
         # compute potential temperature
@@ -643,14 +663,21 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         u = _ensure_spatial_single_chunk(u, space_dims)
         v = _ensure_spatial_single_chunk(v, space_dims)
         w = _ensure_spatial_single_chunk(w, space_dims)
+        theta = _ensure_spatial_single_chunk(theta, space_dims)
+        pressure = _ensure_spatial_single_chunk(pressure, space_dims)
+        temperature = _ensure_spatial_single_chunk(temperature, space_dims)
+
+    # ----------------------------------------------------------------------------------------------
+    # Spectral energy budget terms
+    # ----------------------------------------------------------------------------------------------
 
     # --- spectra: HKE 2D and isotropic 1D ---
     hke_2d = kinetic_energy_spectra(u, v, norm=cfg.compute.norm)
     hke_1d = isotropize(hke_2d, dx, dy)
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
-    divergence = ds.get("divergence")
-    vorticity = ds.get("vorticity")
+    divergence = ds.get("divergence", None)
+    vorticity = ds.get("vorticity", None)
 
     # in compute_budget:
     mode = getattr(cfg.compute, "transfer_form", "invariant")  # "invariant" | "flux"
@@ -669,9 +696,22 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     fh_1d = isotropize(fh_2d, dx, dy)
     vfd_dke_1d = isotropize(fh_2d.differentiate('z', edge_order=2), dx, dy).rename("vfd_dke")
 
+    #  --- adiabatic non-conservative term ---
+    # Compute density if not given
+    rho = ds.get("density", None)
+
+    if rho is None:
+        rho = density(pressure, temperature)
+
+    if _OPTIONS.rechunk_spatial:
+        rho = _ensure_spatial_single_chunk(rho, space_dims)
+
+    jh_2d = nonconservative_adiabatic(u, v, w, rho, vf_hke=fh_2d, norm=cfg.compute.norm)
+    jh_1d = isotropize(jh_2d, dx, dy)
+
     # --- pressure work & conversion (if pressure available) ---
     # scaled pressure perturbation with respect to reference state
-    exner = exner_function(pressure) - exner_function(global_mean(pressure))
+    exner = exner_function(pressure) - exner_function(domain_mean(pressure))
 
     if _OPTIONS.rechunk_spatial:
         exner = _ensure_spatial_single_chunk(exner, space_dims)
@@ -700,9 +740,10 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     cad = maybe_accumulate(cad_1d)
     div_hke = maybe_accumulate(div_hke_1d)
     vf_hke = maybe_accumulate(fh_1d)
+    jh = maybe_accumulate(jh_1d)
 
     # --- assemble ---
-    fields = [hke_1d, pi_nke, vfd_dke, div_hke, vf_hke, vf_pres, vfd_pres, cad]
+    fields = [hke_1d, pi_nke, vfd_dke, div_hke, vf_hke, vf_pres, vfd_pres, cad, jh]
     fluxes = xr.Dataset({da.name: da for da in fields if da is not None})
 
     # attrs
@@ -723,6 +764,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         "vf_pres": ("hke_pressure_vertical_flux",
                     "vertical flux of horizontal kinetic energy (pressure work)"),
         "div_hke": ("horizontal_ke_divergence", "horizontal divergence contribution to HKE budget"),
+        "j_hke": ("adiabatic_nonconservative",
+                  "adiabatic nonconservative contribution to HKE budget"),
     }
 
     # apply attrs only to variables that are present and recognized

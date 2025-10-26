@@ -32,6 +32,7 @@ def _cf_guess(ds: xr.Dataset, target: str) -> str | None:
               "units": {"m s-1", "Pa s-1"}},
         "pressure": {"standard_names": {"air_pressure"}, "units": {"Pa", "pascal"}},
         "temperature": {"standard_names": {"air_temperature"}, "units": {"K", "kelvin"}},
+        "density": {"standard_names": {"air_density"}, "units": {"kg / m**3", "kg m-3"}},
         "theta": {"standard_names": {"air_potential_temperature"}, "units": {"K", "kelvin"}},
         "divergence": {"standard_names": {"divergence_of_wind"}, "units": {"s-1"}},
         "vorticity": {"standard_names": {"relative_vorticity"}, "units": {"s-1"}},

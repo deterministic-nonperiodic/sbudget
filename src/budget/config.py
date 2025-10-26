@@ -137,6 +137,7 @@ def apply_overrides(cfg, args):
     _set_nested(cfg, ["variables", "theta"], _get(args, "var_theta"))
     _set_nested(cfg, ["variables", "pressure"], _get(args, "var_pressure"))
     _set_nested(cfg, ["variables", "temperature"], _get(args, "var_temperature"))
+    _set_nested(cfg, ["variables", "density"], _get(args, "var_density"))
     _set_nested(cfg, ["variables", "divergence"], _get(args, "var_divergence"))
     _set_nested(cfg, ["variables", "vorticity"], _get(args, "var_vorticity"))
 

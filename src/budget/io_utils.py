@@ -171,6 +171,7 @@ def open_dataset(cfg) -> xr.Dataset:
           w: W
           pressure: pres
           temperature: temp
+          density: rho     # optional; if absent, computed from pressure & temperature
           theta: theta     # optional; if absent, computed from pressure & temperature
           divergence: div  # optional, else computed
           vorticity: vor   # optional, else computed
