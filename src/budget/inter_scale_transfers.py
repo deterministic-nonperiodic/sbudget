@@ -961,7 +961,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
     energy_transfer_rate.attrs.update({
         'units': "W/kg",
-        'standard_name': "specific_kinetic_energy_transfer_rate",
+        'standard_name': "specific_kinetic_energy_transfer",
         'long_name': "Specific transfer rate of kinetic energy across scales",
         'description': "Computed using third-order structure functions and mollifier kernels. "
                        "Positive means energy transfer from larger to smaller scales"
