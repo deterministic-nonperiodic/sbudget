@@ -644,10 +644,14 @@ def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
     if vf_hke is None:
         vf_hke = turbulent_hke_flux(u, v, w, norm=norm)
 
-    # vf_jke(..., wavenumber) * ∂z( rho_avg )
-    ln_rho = np.log(domain_mean(rho))
+    # Calculate the spatially averaged density at each height (z)
+    rho_mean = domain_mean(rho)
 
-    anc_hke = - vf_hke * ln_rho.differentiate("z", edge_order=2)
+    # Calculate the vertical derivative of the log of the mean density: ∂z( ln(rho_mean) )
+    ddz_ln_rho = np.log(rho_mean).differentiate("z", edge_order=2)
+
+    # Compute the budget term: - vf_hke * [∂z( ln(rho_mean) )]
+    anc_hke = - vf_hke * ddz_ln_rho
 
     return anc_hke.rename(name)
 
