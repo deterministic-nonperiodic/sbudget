@@ -1,5 +1,6 @@
 import math
 import shutil
+from datetime import date
 from pathlib import Path
 from typing import Tuple, Optional, Dict
 
@@ -7,6 +8,11 @@ import numpy as np
 import xarray as xr
 
 from .cf_coords import _is_z, is_geographic_grid
+
+_global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git',
+                 'institution': 'Leibniz Institute for Atmospheric Physics (IAP)',
+                 'history': date.today().strftime('Created on %c'),
+                 'references': '', 'Conventions': 'CF-1.6'}
 
 
 def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
@@ -269,6 +275,10 @@ def write_dataset(ds: xr.Dataset, cfg) -> None:
     out = Path(cfg.output.path)
     if out.exists() and not cfg.output.overwrite:
         raise FileExistsError(f"{out} exists; set output.overwrite: true to replace")
+
+    # Add global attributes to output file
+    ds.attrs.update(_global_attrs)
+
     if cfg.output.store == "zarr":
         if out.exists():
             shutil.rmtree(out)
