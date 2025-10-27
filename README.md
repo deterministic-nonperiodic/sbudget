@@ -1,16 +1,16 @@
 # sbudget
 
-Tools for computing the spectral kinetic energy budget of a dry, fully compressible, 
-non-hydrostatic atmosphere on regional domains. Designed to analyze energy transfers across 
-scales in both wavenumber and physical space. The package targets model outputs on either 
-regular lon–lat (equiangular) or Cartesian horizontal grids, with a geometric-height vertical 
+Tools for computing the spectral kinetic energy budget of a dry, fully compressible,
+non-hydrostatic atmosphere on regional domains. Designed to analyze energy transfers across
+scales in both wavenumber and physical space. The package targets model outputs on either
+regular lon–lat (equiangular) or Cartesian horizontal grids, with a geometric-height vertical
 coordinate.
 
 ### Spectral transfer mode (```--mode spectral_budget```)
 
-This mode computes the budget of horizontal kinetic energy (HKE) in wavenumber space using FFTs, 
-suitable for studying spectral energy transfers across scales. The budget is formulated following 
-[Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1), 
+This mode computes the budget of horizontal kinetic energy (HKE) in wavenumber space using FFTs,
+suitable for studying spectral energy transfers across scales. The budget is formulated following
+[Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1),
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
 $$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}_h(k)+H_h(k)+J_h(k)
@@ -29,13 +29,13 @@ Terms $H_h(k)$ and $D_h(k)$ are model-physics dependent and therefore omitted he
 
 #### Features
 
-- FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along 
+- FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along
   non-horizontal spatial dimensions
 - NetCDF output with CF-style metadata (horizontal coordinates replaced with wavenumber in rad/m)
 
 ### Inter-scale transfer mode (```--mode scale_transfer```)
 
-This mode computes local scale-to-scale transfers at specified wavelengths based on third-order 
+This mode computes local scale-to-scale transfers at specified wavelengths based on third-order
 structure functions. This code is largely based on [LoSSETT](https://github.com/ElliotMG/LoSSETT)
 . The energy transfer from scales larger than $\ell$ to scales smaller than $\ell$ is derived in
 [Duchon & Robert (2000)](https://iopscience.iop.org/article/10.1088/0951-7715/13/1/312) as:
@@ -68,6 +68,7 @@ pip install git+https://github.com/deterministic-nonperiodic/sbudget.git
 ```
 
 Manual install with clean environment (recommended)
+
 ```bash
 # clone repository
 git clone https://github.com/deterministic-nonperiodic/sbudget.git
@@ -84,27 +85,33 @@ pip install -e .
 ### Examples
 
 Quick help
+
 ```bash
   sbudget --help
- ``` 
+``` 
 
 Inspect configuration file
-  ```bash
+
+```bash
   sbudget inspect examples/config.yaml
-  ```
+```
 
 Compute budget based on configuration file
-  ```bash  
+
+```bash  
   sbudget compute examples/config.yaml
 ```
 
-**Tip**: For best FFT performance, keep spatial axes as single chunks (enforce this with --rechunk-spatial)
+**Tip**: For best FFT performance, keep spatial axes as single chunks (enforce this with
+--rechunk-spatial)
 and parallelize across time/z.
+
 ```bash
   sbudget compute examples/config.yaml --rechunk-spatial
 ```
 
 Inspect input file(s)
+
 ```bash
   sbudget inspect examples/config.yaml \
   --input-path ./data/model_output.nc \
@@ -113,22 +120,25 @@ Inspect input file(s)
 ```
 
 Write to a different file or store type (NetCDF/Zarr)
+
 ```bash
   sbudget compute examples/config.yaml \
   --output-path ./out/budget.nc \
   --store netcdf --overwrite
 ```
 
-Switch to scale transfer mode in physical space and define wavelengths (meters). This mode 
+Switch to scale transfer mode in physical space and define wavelengths (meters). This mode
 calculates inter-scale transfers at specified wavelengths based on third-order structure functions.
+
 ```bash
   sbudget compute examples/config.yaml \
   --mode scale_transfer \
   --scales 1000,5000,10000
 ```
 
-Perform analysis on selected levels and scales. Note, level selection is ignored in 
+Perform analysis on selected levels and scales. Note, level selection is ignored in
 "spectral_budget" mode since continuous sampling is required for computing vertical gradients
+
 ```bash
   sbudget compute examples/config.yaml --mode scale_transfer \ 
   --levels 60e3 --scales 20e3,35e3

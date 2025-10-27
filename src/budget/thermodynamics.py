@@ -1,9 +1,10 @@
-import xarray as xr
+from typing import Union, Literal
+
 import numpy as np
+import xarray as xr
+
 from . import constants as cn
 from .cf_coords import _is_z
-
-from typing import Union, Literal
 
 
 # ---------------------------

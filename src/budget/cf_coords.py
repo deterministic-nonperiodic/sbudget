@@ -136,11 +136,11 @@ def _is_z(cname: str, coords: Union[xr.DataArray, Any]) -> bool:
     """CF-ish vertical detection using name/units/standard_name/axis signals."""
     if not _has(cname, coords):
         return False
-    da = coords[cname]
+    dim = coords[cname]
     name = cname.lower()
-    units = _normalize_unit(da.attrs.get("units", ""))
-    standard_name = (da.attrs.get("standard_name", "") or "").strip().lower()
-    axis = (da.attrs.get("axis", "") or "").strip().upper()
+    units = _normalize_unit(dim.attrs.get("units", ""))
+    standard_name = (dim.attrs.get("standard_name", "") or "").strip().lower()
+    axis = (dim.attrs.get("axis", "") or "").strip().upper()
 
     name_ok = any(k in name for k in ("z", "height", "geometric_height", "altitude"))
     # accept metre variants; avoid overly-broad substring matches

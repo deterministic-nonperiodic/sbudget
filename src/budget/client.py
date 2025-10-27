@@ -1,15 +1,15 @@
 import argparse
-from pathlib import Path
 import warnings
+from pathlib import Path
 
 import numpy as np
 import xarray as xr
 
 from .budget import compute_budget
+from .cf_coords import _cf_guess
 from .config import load_config, apply_overrides
 from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
 from .io_utils import open_dataset, write_dataset
-from .cf_coords import _cf_guess
 
 
 def _report_var_existence(raw: xr.Dataset, cfg) -> str:

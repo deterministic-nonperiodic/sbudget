@@ -200,6 +200,21 @@ def scalar_cross_spectrum(field1: xr.DataArray, field2: xr.DataArray,
                           norm: str | None = None) -> xr.DataArray:
     """Return 2-D cross-spectrum F1*(k) F2(k) over the horizontal dims.
 
+    Parameters
+    ----------
+    field1 : xr.DataArray
+        First input field.
+    field2 : xr.DataArray
+        Second input field.
+    norm : str | None
+        FFT normalization ('ortho', 'backward', or None for legacy).
+    Returns
+    -------
+    xr.DataArray
+        2-D cross-spectrum over the horizontal dims.
+
+    Notes
+    -----
     rFFT path (half-plane in kx, ky shifted). Interior-kx ×2 will be applied
     in isotropize (not here) to preserve total variance consistently.
     """
@@ -234,24 +249,44 @@ def scalar_cross_spectrum(field1: xr.DataArray, field2: xr.DataArray,
     return power
 
 
-def _prep_bins(nx: int, ny: int, dx: float, dy: float, nyquist=True):
+def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True):
     """
     Precompute bin index. Non-overlapping, variance-conserving radial bins.
 
-    rFFT-aware:
+    Parameters
+    ----------
+    nx_fft : int
+        Spectral size along x (rFFT half-plane): Nx//2 + 1
+    ny : int
+        Spectral size along y: Ny
+    dx : float
+        Physical spacing along x (meters)
+    dy : float
+        Physical spacing along y (meters)
+    nyquist : bool
+        Whether to explicitly cut off at the Nyquist wavenumber.
+    Returns
+    -------
+    centers : (n_bins,) float64
+        Bin center wavenumbers (radians/meter), aligned to legacy spacing.
+    bin_idx2d : (ny, nx_fft) int32
+        2-D bin index array; -1 for out-of-bounds.
+    Notes
+    -----
+      - rFFT-aware
       - kx is non-negative via rfftfreq(nx), while ky is symmetric
       - Δ = 2π / min(dx*Nx_full, dy*ny)  (legacy center spacing)
       - centers at nΔ (drop inner < Δ/2 ring), identical to legacy layout
     """
     # reconstruct physical Nx from rFFT spectral size
-    nx_pos = 2 * (nx - 1)
+    nx = 2 * (nx_fft - 1)
 
-    kx = np.fft.rfftfreq(nx_pos, dx / (2 * np.pi))  # length nx (half-plane)
+    kx = np.fft.rfftfreq(nx, dx / (2 * np.pi))  # length nx (half-plane)
     ky = np.fft.fftshift(np.fft.fftfreq(ny, dy / (2 * np.pi)))  # length ny (centered)
 
     kh_grid = np.hypot(*np.meshgrid(kx, ky, indexing="xy")).astype(np.float64)
 
-    delta = 2.0 * np.pi / min(dx * nx_pos, dy * ny)
+    delta = 2.0 * np.pi / min(dx * nx, dy * ny)
 
     # Explicit Nyquist cutoff (if requested)
     nyq = np.pi / max(dx, dy)
@@ -270,9 +305,10 @@ def _prep_bins(nx: int, ny: int, dx: float, dy: float, nyquist=True):
     centers = delta * np.rint(centers / delta)
 
     # 2-D bin index array
-    idx2d = np.digitize(kh_grid, edges, right=False) - 1
-    idx2d[(idx2d < 0) | (idx2d >= n_bins)] = -1
-    return centers, idx2d
+    bin_idx2d = np.digitize(kh_grid, edges, right=False) - 1
+    bin_idx2d[(bin_idx2d < 0) | (bin_idx2d >= n_bins)] = -1
+
+    return centers, bin_idx2d
 
 
 def _azimuthal_bincount(block: np.ndarray, bin_idx2d: np.ndarray, n_bins: int) -> np.ndarray:
@@ -329,12 +365,12 @@ def isotropize(spectrum: xr.DataArray, dx: float, dy: float,
 
     # bins & index
     wavenumber, idx2d = _prep_bins(nkx, nky, dx, dy, nyquist=nyquist)
+    idx2d = xr.DataArray(idx2d, dims=("ky", "kx"))
 
+    # Apply binning of 2D to 1D spectrum
     spec1d = xr.apply_ufunc(
         _azimuthal_bincount,
-        spectrum,
-        xr.DataArray(idx2d, dims=("ky", "kx")),
-        wavenumber.size,
+        spectrum, idx2d, wavenumber.size,
         input_core_dims=[("ky", "kx"), ("ky", "kx"), []],
         output_core_dims=[["wavenumber"]],
         vectorize=True,
@@ -347,6 +383,7 @@ def isotropize(spectrum: xr.DataArray, dx: float, dy: float,
         keep_attrs=True,
     )
 
+    # assign coords and name: Should retain name from input if present
     spec1d = spec1d.rename(spec1d.name or "spectrum_1d")
     spec1d = spec1d.assign_coords(wavenumber=("wavenumber", wavenumber))
 
