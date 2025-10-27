@@ -645,7 +645,7 @@ def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
         vf_hke = turbulent_hke_flux(u, v, w, norm=norm)
 
     # vf_jke(..., wavenumber) * ∂z( rho_avg )
-    ln_rho = xr.apply_ufunc(np.log, domain_mean(rho))
+    ln_rho = np.log(domain_mean(rho))
 
     anc_hke = - vf_hke * ln_rho.differentiate("z", edge_order=2)
 
