@@ -13,13 +13,14 @@ suitable for studying spectral energy transfers across scales. The budget is for
 [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1),
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
-$$\partial_t E_h(k)=T_h(k)+\partial_z F_{\uparrow}(k)+C_{A\to h}(k)+\mathrm{Div}_h(k)+H_h(k)+J_h(k)
-+D_h(k).$$
+$$\partial_t E_h(k)=C_{A\to h}(k)+T_h(k)+L_h(k)+\partial_z F_{\uparrow}(k)+\mathrm{Div}_h(k)+H_h
+(k)+J_h(k)+D_h(k).$$
 
 * $E_h(k)$ — isotropic spectrum of HKE at wavenumber $k$.
-* $T_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
-* $F_{\uparrow}(k)$ — net **vertical flux** of HKE + pressure **pressure-work** flux
 * $C_{A\to h}(k)$ — **conversion** from available potential energy (APE) to HKE.
+* $T_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
+* $L_h(k)$ — linear **spectral transfer** of HKE due to Coriolis.
+* $F_{\uparrow}(k)$ — net **vertical flux** of HKE + pressure **pressure-work** flux
 * $\mathrm{Div}_h(k)$ — tendency from **3-D divergence** processes.
 * $H_h(k)$ — **diabatic** tendency (heating/cooling).
 * $J_h(k)$ — **adiabatic nonconservative** tendency.
