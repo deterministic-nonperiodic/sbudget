@@ -68,7 +68,7 @@ is a filter kernel with characteristic length scale $\ell$. See refences for mor
 pip install git+https://github.com/deterministic-nonperiodic/sbudget.git
 ```
 
-Manual install with clean environment (recommended)
+Install manually with clean environment (recommended)
 
 ```bash
 # clone repository
@@ -101,14 +101,6 @@ Compute budget based on configuration file
 
 ```bash  
   sbudget compute examples/config.yaml
-```
-
-**Tip**: For best FFT performance, keep spatial axes as single chunks (enforce this with
---rechunk-spatial)
-and parallelize across time/z.
-
-```bash
-  sbudget compute examples/config.yaml --rechunk-spatial
 ```
 
 Inspect input file(s)
