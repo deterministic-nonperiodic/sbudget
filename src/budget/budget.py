@@ -641,6 +641,7 @@ def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                               norm: str | None = None, name="j_hke") -> xr.DataArray:
     """Nonconservative adiabatic contribution to the HKE budget."""
 
+    # Vertical flux of HKE (compute if absent)
     if vf_hke is None:
         vf_hke = turbulent_hke_flux(u, v, w, norm=norm)
 
