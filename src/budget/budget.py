@@ -4,8 +4,8 @@ import numpy as np
 import xarray as xr
 from xarray import set_options
 
-from .cf_coords import get_spatial_dims, infer_resolution
-from .constants import cp
+from .cf_coords import get_spatial_dims, infer_resolution, _is_geographic, _coord_is_degrees
+from .constants import cp, Omega
 from .numeric_tools import compute_divergence, compute_vorticity, isotropize
 from .numeric_tools import differentiate_metric, domain_mean, stack_vector, rotate_vector
 from .numeric_tools import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
@@ -26,6 +26,9 @@ _BUDGET_META = {
             "conversion from available potential energy to kinetic energy", _BUDGET_UNITS),
     "pi_nke": ("nonlinear_hke_transfer",
                "Nonlinear spectral transfer of horizontal kinetic energy", _BUDGET_UNITS),
+    "pi_lke": ("linear_hke_transfer",
+               "Linear spectral transfer of horizontal kinetic energy due to Coriolis",
+               _BUDGET_UNITS),
     "vfd_dke": ("vertical_dke_flux_divergence",
                 "vertical flux divergence of horizontal kinetic energy", _BUDGET_UNITS),
     "vf_hke": ("vertical_dke_flux",
@@ -183,6 +186,31 @@ def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.Dat
 
 
 @budget_metadata
+def coriolis_linear_transfer(u: xr.DataArray, v: xr.DataArray,
+                             norm: str | None = None, name="pi_lke") -> xr.DataArray:
+    """Coriolis linear transfer term for horizontal kinetic energy (HKE), vectorized."""
+
+    lat_dim = get_spatial_dims(u)[0]  # e.g., "y
+    if _is_geographic(u[lat_dim], "lat"):
+        # Convert to radians if units are detected as degrees
+        lat = u[lat_dim]
+        lat_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
+
+        # Coriolis parameter f = 2 Ω sin(φ)
+        fc = 2 * Omega * np.sin(lat_rad)
+    else:
+        # Cartesian f-plane
+        print("Assuming no rotation (f-plane Coriolis parameter at the Equator)")
+        fc = 0.0
+
+    # Coriolis linear transfer
+    wind = stack_vector(u, v, name="wind")
+
+    pi_lke = - vector_cross_spectrum(wind, fc * rotate_vector(wind), norm=norm)
+    return pi_lke.rename(name)
+
+
+@budget_metadata
 def nonlinear_vke_transfer(
         u: xr.DataArray,
         v: xr.DataArray,
@@ -302,8 +330,8 @@ def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
 
 
 @budget_metadata
-def vertical_gradient_flux(da: xr.DataArray, vertical_dim: str = 'z',
-                           name="vfd_generic") -> xr.DataArray:
+def vertical_gradient_flux(da: xr.DataArray, vertical_dim: str = 'z', name="vfd_generic") -> (
+        xr.DataArray):
     """Generic vertical gradient flux term: ⟨∂z da, w·da⟩."""
     dza = da.differentiate(vertical_dim, edge_order=2)
 
@@ -397,6 +425,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     pi_nke = isotropize(pi_nke_2d, dx, dy, cumulative=cumulative)
 
+    pi_lke_2d = coriolis_linear_transfer(u, v, norm=norm, name="pi_lke")
+    pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
+
     # --- VERTICAL HKE FLUX (vf_hke) and its DIVERGENCE (vfd_dke) ---
     vf_hke_2d = turbulent_hke_flux(u, v, w, norm=norm, name="vf_hke")
     vf_hke = isotropize(vf_hke_2d, dx, dy, cumulative=cumulative)
@@ -432,7 +463,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     div_hke = isotropize(div_hke_2d, dx, dy, cumulative=cumulative)
 
     # --- ASSEMBLE ---
-    fluxes = [hke_1d, pi_nke, vfd_dke, j_hke, vf_hke, vf_pres, vfd_pres, cad, div_hke]
+    fluxes = [hke_1d, pi_nke, pi_lke, vfd_dke, j_hke, vf_hke, vf_pres, vfd_pres, cad, div_hke]
 
     # Filter out None and assemble into Dataset
     fluxes = xr.Dataset({da.name: da for da in fluxes if da is not None})

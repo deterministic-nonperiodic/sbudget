@@ -3,7 +3,7 @@ import xarray as xr
 from xarray import set_options
 
 from .cf_coords import _coord_is_degrees, _is_geographic, get_spatial_dims
-from .constants import earth_radius
+from .constants import earth_radius, epsilon
 
 set_options(keep_attrs=True)
 
@@ -76,7 +76,7 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
         lat = da.coords['lat']
         phi = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
         cos_phi = xr.ufuncs.cos(phi)
-        cos_phi = xr.where(cos_phi < 1e-12, 1e-12, cos_phi)
+        cos_phi = xr.where(cos_phi < epsilon, epsilon, cos_phi)
 
         # convert from coord-units to per-meter
         d_lam = (np.pi / 180.0) if _coord_is_degrees(coord) else 1.0
@@ -280,13 +280,13 @@ def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True):
     k_cut = min(nyq, float(kh_grid.max())) if nyquist else float(kh_grid.max())
 
     start = 0.5 * delta
-    n_bins = int(np.floor((k_cut - start) / delta + 1e-12))
-    if (k_cut - start) - n_bins * delta > 1e-12:
+    n_bins = int(np.floor((k_cut - start) / delta + epsilon))
+    if (k_cut - start) - n_bins * delta > epsilon:
         n_bins += 1
 
     # bin edges and centers
     edges = start + np.arange(0, n_bins, dtype=np.float64) * delta
-    edges = np.concatenate([edges, [max(k_cut + 1e-15 * delta, start + n_bins * delta)]])
+    edges = np.concatenate([edges, [max(k_cut + epsilon * delta, start + n_bins * delta)]])
 
     centers = 0.5 * (edges[:-1] + edges[1:])
     centers = delta * np.rint(centers / delta)
