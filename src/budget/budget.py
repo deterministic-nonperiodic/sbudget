@@ -2,7 +2,6 @@ from typing import Union, Callable, Any
 
 import numpy as np
 import xarray as xr
-from xarray import set_options
 
 from .cf_coords import get_spatial_dims, infer_resolution, _is_geographic, _coord_is_degrees
 from .constants import cp, Omega
@@ -10,8 +9,6 @@ from .numeric_tools import compute_divergence, compute_vorticity, isotropize
 from .numeric_tools import differentiate_metric, domain_mean, stack_vector, rotate_vector
 from .numeric_tools import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
 from .thermodynamics import potential_temperature, exner_function, density
-
-set_options(keep_attrs=True)
 
 # --------------------------------------------------------------------------------------------------
 # Global spectral options
@@ -190,12 +187,12 @@ def coriolis_linear_transfer(u: xr.DataArray, v: xr.DataArray,
                              norm: str | None = None, name="pi_lke") -> xr.DataArray:
     """Coriolis linear transfer term for horizontal kinetic energy (HKE), vectorized."""
 
-    lat_dim = get_spatial_dims(u)[0]  # e.g., "y
-    if _is_geographic(u[lat_dim], "lat"):
-        # Convert to radians if units are detected as degrees
-        lat = u[lat_dim]
-        lat_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
+    lat_dim = get_spatial_dims(u)[0]
+    lat = u[lat_dim]
 
+    if _is_geographic(lat, "lat"):
+        # Convert to radians if units are detected as degrees
+        lat_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
         # Coriolis parameter f = 2 Ω sin(φ)
         fc = 2 * Omega * np.sin(lat_rad)
     else:
@@ -206,7 +203,9 @@ def coriolis_linear_transfer(u: xr.DataArray, v: xr.DataArray,
     # Coriolis linear transfer
     wind = stack_vector(u, v, name="wind")
 
+    # Linear transfer term: -⟨U, f·(k̂ × U)⟩
     pi_lke = - vector_cross_spectrum(wind, fc * rotate_vector(wind), norm=norm)
+
     return pi_lke.rename(name)
 
 
