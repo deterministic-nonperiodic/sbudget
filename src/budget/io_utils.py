@@ -7,7 +7,7 @@ from typing import Tuple, Optional, Dict
 import numpy as np
 import xarray as xr
 
-from .cf_coords import _is_z, is_geographic_grid
+from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter, convert_units
 
 _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git',
                  'institution': 'Leibniz Institute for Atmospheric Physics (IAP)',
@@ -32,6 +32,14 @@ def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
 
         if z_dim in ds.coords:
             ds = ds.drop_vars(z_dim)
+
+    # Check vertical coordinate units
+    if target_name in ds.coords:
+        z_coord = ds[target_name]
+        if not _coord_is_meter(z_coord):
+            # Assume km if not meters
+            print(f"Converting vertical coordinate '{target_name}' to meters ...")
+            ds = ds.assign_coords({target_name: convert_units(z_coord, "km", "m")})
 
     return ds
 
@@ -250,6 +258,9 @@ def open_dataset(cfg) -> xr.Dataset:
             # Make sure the coord is indexed by its own dim
             ds = ds.set_coords(cname)
 
+    # Interpolate to consistent vertical coordinates and convert to meters if needed
+    ds = ensure_vertical_consistent(ds, target_name='z')
+
     # select specified vertical levels
     levels = getattr(cfg.compute, "levels", None)
     mode = str(cfg.compute.mode).strip()
@@ -258,9 +269,6 @@ def open_dataset(cfg) -> xr.Dataset:
     if levels is not None and mode == "scale_transfer":
         ds = ds.sel(z=levels, method='nearest')
         print("Calculating transfers on selected levels: ", ds.z.values)
-
-    # Interpolate to consistent vertical coordinates
-    ds = ensure_vertical_consistent(ds)
 
     # Apply consistent rechunking:
     rechunk_spatial = getattr(cfg.compute, "rechunk_spatial", True)

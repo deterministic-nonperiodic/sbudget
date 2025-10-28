@@ -4,7 +4,7 @@ import numpy as np
 import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
-from .constants import cp, Omega
+from .constants import cp, Omega, epsilon
 from .numeric_tools import domain_mean, stack_vector, rotate_vector, isotropize
 from .numeric_tools import horizontal_advection, horizontal_gradient
 from .numeric_tools import horizontal_divergence, relative_vorticity
@@ -90,20 +90,21 @@ def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = 
                            name="hke") -> xr.DataArray:
     """Horizontal kinetic energy per unit mass spectrum: ½(|Û|² + |V̂|²)."""
     hke = 0.5 * (scalar_spectrum(u, norm) + scalar_spectrum(v, norm))
+
     return hke.rename(name)
 
 
 @budget_metadata
 def divergent_kinetic_energy_spectra(divergence: xr.DataArray, dx: float, dy: float,
                                      norm: str | None = None, name="dke") -> xr.DataArray:
-    """Divergent kinetic energy per unit mass spectrum: k² DKE = ½ |∂|²."""
+    """Divergent kinetic energy per unit mass spectrum: DKE = ½ |∂|² / k²."""
     dke = scalar_spectrum(divergence, norm=norm)
 
     # Scale by k²
     nx, ny = 2 * (dke['kx'].size - 1), dke['ky'].size
     kh = horizontal_wavenumber_magnitude(nx, ny, 2.0 * np.pi * dx, 2.0 * np.pi * dy)
 
-    dke = 0.5 * dke / (kh ** 2)
+    dke = 0.5 * dke / kh.clip(min=epsilon) ** 2
 
     return dke.rename(name)
 
@@ -111,14 +112,14 @@ def divergent_kinetic_energy_spectra(divergence: xr.DataArray, dx: float, dy: fl
 @budget_metadata
 def rotational_kinetic_energy_spectra(vorticity: xr.DataArray, dx: float, dy: float,
                                       norm: str | None = None, name="rke") -> xr.DataArray:
-    """Rotational kinetic energy per unit mass spectrum: k² DKE = ½ |∂|²."""
+    """Rotational kinetic energy per unit mass spectrum: RKE = ½ |ζ|² / k²."""
     rke = scalar_spectrum(vorticity, norm=norm)
 
     # Scale by k²
     nx, ny = 2 * (rke['kx'].size - 1), rke['ky'].size
     kh = horizontal_wavenumber_magnitude(nx, ny, 2.0 * np.pi * dx, 2.0 * np.pi * dy)
 
-    rke = 0.5 * rke / (kh ** 2)
+    rke = 0.5 * rke / kh.clip(min=epsilon) ** 2
 
     return rke.rename(name)
 
@@ -418,7 +419,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     divergence = ds.get("divergence", None)
     vorticity = ds.get("vorticity", None)
 
-    # Divergence and vorticity. Compute if any is absent for consistency.
+    # Divergence and vorticity. Compute if any is absent for numerical consistency.
     if divergence is None or vorticity is None:
         divergence = horizontal_divergence(u, v)
         vorticity = relative_vorticity(u, v)

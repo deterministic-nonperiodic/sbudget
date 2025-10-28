@@ -12,6 +12,8 @@ __all__: List[str] = [
     "_coord_is_degrees",
     "_is_geographic",
     "_is_z",
+    "_coord_is_meter",
+    "convert_units",
     "is_geographic_grid",
     "get_spatial_dims",
     "infer_grid_resolution",
@@ -85,7 +87,9 @@ expected_units = {
     "divergence": "1/s",
     "vorticity": "1/s",
     "temperature": "K",
-    "pressure": "Pa"
+    "pressure": "Pa",
+    'lat': 'degrees_north',
+    'lon': 'degrees_east',
 }
 
 # from Metpy
@@ -94,6 +98,17 @@ UNITS_REG = pint.UnitRegistry()
 
 # from Metpy
 cmd = re.compile(r"(?<=[A-Za-z)])(?![A-Za-z)])(?<![0-9\-][eE])(?<![0-9\-])(?=[0-9\-])")
+
+
+def _normalize_unit(units: Union[str, None]) -> str:
+    """Normalize CF-ish units for robust checks."""
+    units = (units or "").strip().lower()
+    return units.replace("°", "degree").replace("-", "_")
+
+
+def _get_units_str(c: xr.DataArray) -> str:
+    """Extracts and normalizes the units string from a DataArray."""
+    return _normalize_unit(c.attrs.get("units", ""))
 
 
 def _parse_units(unit_str):
@@ -135,9 +150,37 @@ def get_conversion_components(from_units: str, to_units: str) -> Tuple[float, fl
     return multiplier, offset
 
 
+def convert_units(da: xr.DataArray, from_units: str, to_units: str) -> xr.DataArray:
+    """
+    Converts the units of a DataArray, respecting Dask chunking and Xarray immutability.
+    """
+    # Use the units attached to the DataArray as the source unit
+    source_units = _get_units_str(da) or from_units
+
+    if equivalent_units(source_units, to_units) or source_units == to_units:
+        # Units are already equivalent; no conversion needed
+        return da
+
+    if compatible_units(source_units, to_units):
+        # Calculate scalar conversion factor
+        multiplier, offset = get_conversion_components(source_units, to_units)
+
+        # Apply conversion formula Y = X * M + O lazily. This is Dask-aware.
+        result_data = multiplier * da + offset
+
+        # FIX: Create a new DataArray to ensure immutability and update the units attribute.
+        new_da = da.copy(data=result_data.data)
+        new_da.attrs.update({"units": to_units})
+
+        return new_da
+
+    # Units are incompatible
+    raise ValueError(f"Cannot convert due to incompatible units: '{source_units}' to '{to_units}'!")
+
+
 def check_convert_units(ds: Union[xr.Dataset, xr.DataArray]) -> Union[xr.Dataset, xr.DataArray]:
     """
-    Checks and converts the units of variables within an Xarray Dataset or DataArray
+    Checks and converts the units of variables within a Xarray Dataset or DataArray
     to match predefined expected units, while respecting Dask chunking.
 
     Assumes the existence of:
@@ -160,35 +203,22 @@ def check_convert_units(ds: Union[xr.Dataset, xr.DataArray]) -> Union[xr.Dataset
         if varname not in expected_units:
             continue
 
-        var_units = ds[varname].attrs.get("units")
+        # var_units = ds[varname].attrs.get("units")
+        var_units = _get_units_str(ds[varname])
         expected_unit = expected_units[str(varname)]
 
         # --- Handle missing units (Unit inference based on value range) ---
-        if var_units is None:
+        if var_units == "":
             print(f"Warning: Units not found for variable {varname}. Assumed '{expected_unit}'.")
             continue
 
         # --- Handle existing units needing Dask-compatible conversion ---
-        if not equivalent_units(var_units, expected_unit):
-            if compatible_units(var_units, expected_unit):
-                # Calculate scalar conversion factor (must be computed using the unit library only)
-                multiplier, offset = get_conversion_components(var_units, expected_unit)
-
-                # Apply conversion formula Y = X * M + O lazily.
-                # This preserves Dask chunking for both multiplicative and offset conversions.
-                ds[varname] = ds[varname] * multiplier + offset
-
-                # Update the units attribute of the variable
-                ds[varname].attrs["units"] = expected_unit
-            else:
-                # Units are incompatible
-                raise ValueError(f"Cannot convert {varname} due to incompatible units: "
-                                 f"'{var_units}' to '{expected_unit}'!")
+        ds[varname] = convert_units(ds[varname], var_units, expected_unit)
 
     # Return original type
     if is_array:
         # Convert back to DataArray. Use to_array() / squeeze / drop_vars for a clean return.
-        return ds.to_array().squeeze('variable', drop=True).drop_vars('variable')
+        return ds.to_array().squeeze('variable', drop=True)
     else:
         return ds
 
@@ -196,22 +226,6 @@ def check_convert_units(ds: Union[xr.Dataset, xr.DataArray]) -> Union[xr.Dataset
 # ----------------------
 # Compact CF-aware utils
 # ----------------------
-def _has(cname: str, coords: Dict[str, Any]) -> bool:
-    """True if coordinate name exists in coords mapping."""
-    return cname in coords
-
-
-def _normalize_unit(units: Union[str, None]) -> str:
-    """Normalize CF-ish units for robust checks."""
-    units = (units or "").strip().lower()
-    return units.replace("°", "degree").replace("-", "_").replace(" ", "_")
-
-
-def _units_str(c: xr.DataArray) -> str:
-    """Extracts and normalizes the units string from a DataArray."""
-    return _normalize_unit(c.attrs.get("units", ""))
-
-
 def _infer_coordinate_units(coord: xr.DataArray, name: str) -> str:
     """Infers and validates coordinate units against ALLOWED_UNITS."""
     units = coord.attrs.get("units", "").lower()
@@ -233,7 +247,7 @@ def _coord_is_degrees(
     If units are absent/ambiguous, and we need to infer, treat as degrees
     when |values| exceed 2π (cannot be radians).
     """
-    units = _normalize_unit(coord.attrs.get("units", ""))
+    units = _get_units_str(coord)
 
     # Explicit units
     if "radian" in units:
@@ -254,13 +268,13 @@ def _coord_is_degrees(
 
 def _is_z(cname: str, coords: Union[xr.DataArray, Any]) -> bool:
     """CF-ish vertical detection using name/units/standard_name/axis signals."""
-    if not _has(cname, coords):
+    if not cname in coords:
         return False
-    dim = coords[cname]
+    coord = coords[cname]
     name = cname.lower()
-    units = _normalize_unit(dim.attrs.get("units", ""))
-    standard_name = (dim.attrs.get("standard_name", "") or "").strip().lower()
-    axis = (dim.attrs.get("axis", "") or "").strip().upper()
+    units = _get_units_str(coord)
+    standard_name = (coord.attrs.get("standard_name", "") or "").strip().lower()
+    axis = (coord.attrs.get("axis", "") or "").strip().upper()
 
     name_ok = any(k in name for k in ("z", "height", "geometric_height", "altitude"))
     # accept metre variants; avoid overly-broad substring matches
@@ -270,16 +284,17 @@ def _is_z(cname: str, coords: Union[xr.DataArray, Any]) -> bool:
     return name_ok or units_ok or std_ok or axis_ok
 
 
-def _is_geographic(da: xr.DataArray, coord_type: str) -> bool:
+def _is_geographic(coord: xr.DataArray, coord_type: str) -> bool:
     """
     Performs CF-ish checks for a single coordinate (Lat or Lon) using a lookup dictionary.
     """
     lookup = _CF_COORDS_LOOKUP[coord_type]
 
     # 1. Attributes and Names
-    name = str(da.name).lower() if da.name else ""
-    attrs: Dict[str, Any] = da.attrs
-    units = _normalize_unit(attrs.get("units", ""))
+    name = str(coord.name).lower() if coord.name else ""
+    attrs: Dict[str, Any] = coord.attrs
+    units = _get_units_str(coord)
+
     standard_name = (attrs.get("standard_name", "") or "").strip().lower()
     axis = (attrs.get("axis", "") or "").strip().upper()
 
@@ -360,7 +375,7 @@ def get_spatial_dims(obj: Union[xr.Dataset, xr.DataArray]) -> Tuple[str, str]:
 # ----------------------
 def _coord_is_meter(c: xr.DataArray) -> bool:
     """Checks if the coordinate units are meter-like."""
-    u = _normalize_unit(_units_str(c))
+    u = _get_units_str(c)
     return (u in _METER_UNITS) or any(tok in u for tok in ("metre", "meter"))
 
 
@@ -405,4 +420,4 @@ def infer_grid_resolution(ds: xr.Dataset) -> tuple[float, float]:
 
     raise ValueError(
         "infer_resolution: could not infer spacing. "
-        f"Dims=({y},{x}), units=({_units_str(ycoord)}, {_units_str(xcoord)})")
+        f"Dims=({y},{x}), units=({_get_units_str(ycoord)}, {_get_units_str(xcoord)})")

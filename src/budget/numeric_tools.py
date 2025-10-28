@@ -4,7 +4,7 @@ import numpy as np
 import xarray as xr
 from xarray import set_options
 
-from .cf_coords import _coord_is_degrees, _coord_is_meter
+from .cf_coords import _coord_is_degrees
 from .cf_coords import _is_geographic, get_spatial_dims, is_geographic_grid
 from .constants import earth_radius, epsilon
 
@@ -73,7 +73,7 @@ def _check_coordinate_consistency(*arrays: xr.DataArray, dims_to_check: Tuple[st
                     f"Coordinate values for dimension '{dim}' mismatch in input array {i}.")
 
 
-def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None) -> xr.DataArray:
+def first_derivative(da: xr.DataArray, dim: str, delta: float | None = None) -> xr.DataArray:
     """
     Metric-aware first derivative along `dim`.
 
@@ -124,13 +124,6 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
             # If coord is degrees, deriv_coord is d/d[deg]. Convert to d/d[rad].
             # (d/d[deg]) * (d[deg]/d[rad]) = (d/d[deg]) * (180/pi)
             return deriv_coord * xr.full_like(deriv_coord, fill_value=180.0 / np.pi)
-        else:
-            # Assumes coord is already radians, deriv_coord is d/d[rad]. Return directly.
-            return deriv_coord
-    else:
-        if not _coord_is_meter(coord):
-            # Cartesian metric coordinate in meters: deriv_coord is d/d[meter]. Return directly.
-            return deriv_coord
 
     return deriv_coord
 
@@ -167,8 +160,8 @@ def horizontal_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     # Check consistency with 'v'
     _check_coordinate_consistency(u, v, dims_to_check=(y_dim, x_dim))
 
-    generic_du = differentiate_metric(u, x_dim)
-    generic_dv = differentiate_metric(v, y_dim)
+    generic_du = first_derivative(u, x_dim)
+    generic_dv = first_derivative(v, y_dim)
 
     if is_geographic_grid(x_coord, y_coord):
         # Spherical Divergence Formula:
@@ -178,7 +171,7 @@ def horizontal_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
         cos_phi = xr.where(np.abs(phi_rad) > np.pi / 2 - epsilon, epsilon, np.cos(phi_rad))
 
         v_cos_phi = v * cos_phi
-        dv_cos_phi = differentiate_metric(v_cos_phi, y_dim)
+        dv_cos_phi = first_derivative(v_cos_phi, y_dim)
 
         div = (generic_du + dv_cos_phi) / (earth_radius * cos_phi)
 
@@ -229,8 +222,8 @@ def relative_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     # Check consistency with 'v'
     _check_coordinate_consistency(u, v, dims_to_check=(y_dim, x_dim))
 
-    generic_du = differentiate_metric(u, y_dim)
-    generic_dv = differentiate_metric(v, x_dim)
+    generic_du = first_derivative(u, y_dim)
+    generic_dv = first_derivative(v, x_dim)
 
     if is_geographic_grid(x_coord, y_coord):
         # Spherical Relative Vorticity Formula:
@@ -240,7 +233,7 @@ def relative_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
         cos_phi = xr.where(np.abs(phi_rad) > np.pi / 2 - epsilon, epsilon, np.cos(phi_rad))
 
         u_cos_phi = u * cos_phi
-        du_cos_phi = differentiate_metric(u_cos_phi, y_dim)
+        du_cos_phi = first_derivative(u_cos_phi, y_dim)
 
         vort = (generic_dv - du_cos_phi) / (earth_radius * cos_phi)
 
@@ -299,20 +292,20 @@ def horizontal_gradient(scalar: xr.DataArray, delta: float | None = None) -> (
         cos_phi = xr.where(np.abs(phi_rad) > np.pi / 2 - epsilon, epsilon, np.cos(phi_rad))
 
         # differentiate_metric returns d/d(lambda_rad) and d/d(phi_rad)
-        dA_dlambda = differentiate_metric(scalar, x_dim)
-        dA_dphi = differentiate_metric(scalar, y_dim)
+        da_d_lambda = first_derivative(scalar, x_dim)
+        da_d_phi = first_derivative(scalar, y_dim)
 
         # Construct derivatives per meter
-        dA_dx = dA_dlambda / (earth_radius * cos_phi)
-        dA_dy = dA_dphi / earth_radius
+        da_dx = da_d_lambda / (earth_radius * cos_phi)
+        da_dy = da_d_phi / earth_radius
     else:
         # Cartesian Advection:
         # differentiate_metric returns d/dx and d/dy if coords are metric,
         # or uses delta if coords are missing.
-        dA_dx = differentiate_metric(scalar, x_dim, delta=delta)
-        dA_dy = differentiate_metric(scalar, y_dim, delta=delta)
+        da_dx = first_derivative(scalar, x_dim, delta=delta)
+        da_dy = first_derivative(scalar, y_dim, delta=delta)
 
-    return dA_dx, dA_dy
+    return da_dx, da_dy
 
 
 def horizontal_advection(scalar: xr.DataArray, u: xr.DataArray, v: xr.DataArray,
@@ -351,10 +344,10 @@ def horizontal_advection(scalar: xr.DataArray, u: xr.DataArray, v: xr.DataArray,
     # Check consistency with 'u' and 'v'
     _check_coordinate_consistency(scalar, u, v, dims_to_check=(y_dim, x_dim))
 
-    dA_dx, dA_dy = horizontal_gradient(scalar, delta=delta)
+    da_dx, da_dy = horizontal_gradient(scalar, delta=delta)
 
     # Calculate advection: u * dA/dx + v * dA/dy
-    adv = u * dA_dx + v * dA_dy
+    adv = u * da_dx + v * da_dy
 
     # Try to construct a meaningful name and attributes
     adv.name = f"{scalar.name or 'scalar'}_advection"
@@ -739,10 +732,10 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray,
 def compute_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """Horizontal divergence."""
     y_dim, x_dim = get_spatial_dims(u)
-    return differentiate_metric(u, x_dim) + differentiate_metric(v, y_dim)
+    return first_derivative(u, x_dim) + first_derivative(v, y_dim)
 
 
 def compute_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """Vertical vorticity."""
     y_dim, x_dim = get_spatial_dims(u)
-    return differentiate_metric(v, x_dim) - differentiate_metric(u, y_dim)
+    return first_derivative(v, x_dim) - first_derivative(u, y_dim)
