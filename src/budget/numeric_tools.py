@@ -45,62 +45,6 @@ def domain_mean(da: xr.DataArray) -> xr.DataArray:
 # --------------------------------------------------------------------------------------------------
 # --- metric-aware horizontal derivatives in physical meters ---
 # --------------------------------------------------------------------------------------------------
-def differentiate_metric_old(da: xr.DataArray, dim: str, delta: float | None = None) -> (
-        xr.DataArray):
-    """
-    Metric-aware first derivative **in meters** along `dim`.
-
-    - If `delta` is given (meters), assumes constant spacing along `dim`.
-    - If `dim` is longitude/latitude (per `_is_lon` / `_is_lat`), applies the spherical metric:
-        d/dx = (π/180)/(a cos φ) * d/dλ   (for longitude, if coord in degrees)
-        d/dy = (π/180)/a         * d/dφ   (for latitude,  if coord in degrees)
-      where "a" is Earth's radius. If coords are already in radians, omit π/180.
-    - Otherwise (Cartesian dims, incl. `z`), uses `.differentiate(dim)` and converts km→m if needed.
-    """
-    if dim not in da.dims:
-        raise ValueError(f"differentiate_metric: dim '{dim}' not in {tuple(da.dims)}")
-
-    # Fetch the coordinate
-    coord = da.coords.get(dim, None)
-
-    if coord is None:
-        if delta is not None:
-            # index-based derivative (spacing=1) scaled by constant delta [m]
-            delta = xr.full_like(da, fill_value=float(delta))
-            return da.differentiate(coord=dim, edge_order=2) / delta
-        else:
-            raise ValueError(
-                f"differentiate_metric: No coordinate found for dim '{dim}' "
-                f"and no 'delta' provided; cannot determine metric spacing.")
-
-    # Longitude
-    if _is_geographic(coord, "lon"):
-        # Need latitude for cos(phi)
-        lat = da.coords['lat']
-        phi = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
-        cos_phi = xr.ufuncs.cos(phi)
-        cos_phi = xr.where(cos_phi < epsilon, epsilon, cos_phi)
-
-        # convert from coord-units to per-meter
-        d_lam = (np.pi / 180.0) if _coord_is_degrees(coord) else 1.0
-        factor = d_lam / (earth_radius * cos_phi)  # rad/m
-
-        return factor * da.differentiate(dim, edge_order=2)
-
-    # Latitude
-    if _is_geographic(coord, "lat"):
-        d_phi = (np.pi / 180.0) if _coord_is_degrees(coord) else 1.0
-        factor = d_phi / earth_radius  # rad/m
-        return factor * da.differentiate(dim, edge_order=2)
-
-    # Cartesian (incl. 'z'): convert km→m if the coord says 'km'
-    units = str(getattr(coord, "units", "")).lower()
-    if "km" in units and "m" not in units:
-        return 1e-3 * da.differentiate(dim, edge_order=2)
-
-    return da.differentiate(dim, edge_order=2)
-
-
 def _check_coordinate_consistency(*arrays: xr.DataArray, dims_to_check: Tuple[str, str]):
     """Verify that all input arrays share the same specified dimensions and coordinates."""
     if not arrays:
