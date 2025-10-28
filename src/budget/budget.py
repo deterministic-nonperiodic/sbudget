@@ -3,11 +3,12 @@ from typing import Union, Callable, Any
 import numpy as np
 import xarray as xr
 
-from .cf_coords import get_spatial_dims, infer_resolution, _is_geographic, _coord_is_degrees
+from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
 from .constants import cp, Omega
 from .numeric_tools import domain_mean, stack_vector, rotate_vector, isotropize
 from .numeric_tools import horizontal_advection, horizontal_gradient
 from .numeric_tools import horizontal_divergence, relative_vorticity
+from .numeric_tools import horizontal_wavenumber_magnitude
 from .numeric_tools import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
 from .thermodynamics import potential_temperature, exner_function, density
 
@@ -93,21 +94,33 @@ def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = 
 
 
 @budget_metadata
-def divergent_spectra(divergence: xr.DataArray, norm: str | None = None,
-                      name="dke") -> xr.DataArray:
+def divergent_kinetic_energy_spectra(divergence: xr.DataArray, dx: float, dy: float,
+                                     norm: str | None = None, name="dke") -> xr.DataArray:
     """Divergent kinetic energy per unit mass spectrum: k² DKE = ½ |∂|²."""
-    div_spec = 0.5 * scalar_spectrum(divergence, norm)
+    dke = scalar_spectrum(divergence, norm=norm)
 
-    return div_spec.rename(name)
+    # Scale by k²
+    nx, ny = 2 * (dke['kx'].size - 1), dke['ky'].size
+    kh = horizontal_wavenumber_magnitude(nx, ny, 2.0 * np.pi * dx, 2.0 * np.pi * dy)
+
+    dke = 0.5 * dke / (kh ** 2)
+
+    return dke.rename(name)
 
 
 @budget_metadata
-def rotational_spectra(vorticity: xr.DataArray, norm: str | None = None,
-                       name="rke") -> xr.DataArray:
-    """Rotational kinetic energy per unit mass spectrum: k² DKE = ½ |Φ̂|²"""
-    vor_spec = 0.5 * scalar_spectrum(vorticity, norm)
+def rotational_kinetic_energy_spectra(vorticity: xr.DataArray, dx: float, dy: float,
+                                      norm: str | None = None, name="rke") -> xr.DataArray:
+    """Rotational kinetic energy per unit mass spectrum: k² DKE = ½ |∂|²."""
+    rke = scalar_spectrum(vorticity, norm=norm)
 
-    return vor_spec.rename(name)
+    # Scale by k²
+    nx, ny = 2 * (rke['kx'].size - 1), rke['ky'].size
+    kh = horizontal_wavenumber_magnitude(nx, ny, 2.0 * np.pi * dx, 2.0 * np.pi * dy)
+
+    rke = 0.5 * rke / (kh ** 2)
+
+    return rke.rename(name)
 
 
 @budget_metadata
@@ -380,7 +393,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     # dx, dy infer if not set
     if cfg.compute.dx is None or cfg.compute.dy is None:
-        dx, dy = infer_resolution(ds)
+        dx, dy = infer_grid_resolution(ds)
         print(f"Estimated resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
     else:
         dx, dy = cfg.compute.dx, cfg.compute.dy
@@ -422,14 +435,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     hke_1d = isotropize(hke_2d, dx, dy, cumulative=False)  # non-cumulative HKE spectra
 
     # wavenumber kappa² = k² + l² [m**-2]
-    scale_sqr = (2.0 * np.pi / hke_1d.wavenumber) ** 2
-
     # RKE and DKE spectra
-    rke_2d = rotational_spectra(vorticity, norm=cfg.compute.norm)
-    rke_1d = (scale_sqr * isotropize(rke_2d, dx, dy, cumulative=False)).rename('rke')
+    rke_2d = rotational_kinetic_energy_spectra(vorticity, dx, dy, norm=cfg.compute.norm)
+    rke_1d = isotropize(rke_2d, dx, dy, cumulative=False)
 
-    dke_2d = divergent_spectra(divergence, norm=cfg.compute.norm)
-    dke_1d = (scale_sqr * isotropize(dke_2d, dx, dy, cumulative=False)).rename('dke')
+    dke_2d = divergent_kinetic_energy_spectra(divergence, dx, dy, norm=cfg.compute.norm)
+    dke_1d = isotropize(dke_2d, dx, dy, cumulative=False)
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
     transfer_mode = getattr(cfg.compute, "transfer_form", "flux")  # "invariant" | "flux"

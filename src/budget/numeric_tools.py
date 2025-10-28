@@ -4,7 +4,8 @@ import numpy as np
 import xarray as xr
 from xarray import set_options
 
-from .cf_coords import _coord_is_degrees, _is_geographic, get_spatial_dims, is_geographic_grid
+from .cf_coords import _coord_is_degrees, _coord_is_meter
+from .cf_coords import _is_geographic, get_spatial_dims, is_geographic_grid
 from .constants import earth_radius, epsilon
 
 set_options(keep_attrs=True)
@@ -124,7 +125,11 @@ def differentiate_metric(da: xr.DataArray, dim: str, delta: float | None = None)
             # (d/d[deg]) * (d[deg]/d[rad]) = (d/d[deg]) * (180/pi)
             return deriv_coord * xr.full_like(deriv_coord, fill_value=180.0 / np.pi)
         else:
-            # If coord is already radians, deriv_coord is d/d[rad]. Return directly.
+            # Assumes coord is already radians, deriv_coord is d/d[rad]. Return directly.
+            return deriv_coord
+    else:
+        if not _coord_is_meter(coord):
+            # Cartesian metric coordinate in meters: deriv_coord is d/d[meter]. Return directly.
             return deriv_coord
 
     return deriv_coord

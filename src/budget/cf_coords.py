@@ -1,6 +1,8 @@
+import re
 from typing import Tuple, Union, Dict, Any, List
 
 import numpy as np
+import pint
 import xarray as xr
 from pyproj import Geod
 
@@ -12,7 +14,7 @@ __all__: List[str] = [
     "_is_z",
     "is_geographic_grid",
     "get_spatial_dims",
-    "infer_resolution",
+    "infer_grid_resolution",
 ]
 
 # -----------------------------
@@ -71,6 +73,124 @@ def _cf_guess(ds: xr.Dataset, target: str) -> str | None:
         if std in rule["standard_names"] or any(u in units for u in rule["units"]):
             return name
     return None
+
+
+# --------------------------
+# Unit and coordinate checks
+# --------------------------
+expected_units = {
+    "u": "m/s",
+    "v": "m/s",
+    "w": "m/s",
+    "divergence": "1/s",
+    "vorticity": "1/s",
+    "temperature": "K",
+    "pressure": "Pa"
+}
+
+# from Metpy
+# Create a pint UnitRegistry object
+UNITS_REG = pint.UnitRegistry()
+
+# from Metpy
+cmd = re.compile(r"(?<=[A-Za-z)])(?![A-Za-z)])(?<![0-9\-][eE])(?<![0-9\-])(?=[0-9\-])")
+
+
+def _parse_units(unit_str):
+    if isinstance(unit_str, (pint.Quantity, pint.Unit)):
+        return unit_str
+    else:
+        return UNITS_REG(cmd.sub('**', unit_str))
+
+
+def equivalent_units(unit_1, unit_2):
+    ratio = (_parse_units(unit_1) / _parse_units(unit_2)).to_base_units()
+    return ratio.dimensionless and np.isclose(ratio.magnitude, 1.0)
+
+
+def compatible_units(unit_1, unit_2):
+    return _parse_units(unit_1).is_compatible_with(_parse_units(unit_2))
+
+
+def get_conversion_components(from_units: str, to_units: str) -> Tuple[float, float]:
+    """
+    Calculates the multiplicative factor (M) and offset (O) for a linear unit conversion
+    using Pint, such that Y = X * M + O.
+
+    This handles offset units like Celsius/Kelvin.
+    """
+    # This implementation requires a Pint UnitRegistry instance 'u' to be accessible (e.g., u = UnitRegistry()).
+
+    # 1. Calculate Offset (O): Convert 0 from source to destination (0 * M + O = O)
+    q0 = pint.Quantity(0.0, _parse_units(from_units))
+    y0 = q0.to(_parse_units(to_units)).magnitude
+    offset = y0
+
+    # 2. Calculate Multiplier (M): Convert 1 from source to destination (1 * M + O), then subtract offset
+    q1 = pint.Quantity(1.0, _parse_units(from_units))
+    y1 = q1.to(_parse_units(to_units)).magnitude
+    multiplier = y1 - offset
+
+    # Returns (M, O)
+    return multiplier, offset
+
+
+def check_convert_units(ds: Union[xr.Dataset, xr.DataArray]) -> Union[xr.Dataset, xr.DataArray]:
+    """
+    Checks and converts the units of variables within an Xarray Dataset or DataArray
+    to match predefined expected units, while respecting Dask chunking.
+
+    Assumes the existence of:
+    - `expected_units` (dict[str, str]): Mapping of variable name to target unit string.
+    - `expected_range` (dict[str, Tuple[float, float]]): Admitted value ranges.
+    - `equivalent_units`, `compatible_units`, `_parse_units`, and `get_conversion_factor` (from pint or similar).
+
+    :param ds: The input Xarray Dataset or DataArray.
+    :return: The Xarray object with converted units and values.
+    """
+
+    # 1. Handle DataArray input
+    is_array = isinstance(ds, xr.DataArray)
+    if is_array:
+        ds = ds.to_dataset(name=ds.name or '_data_array_var', promote_attrs=True)
+
+    # --- Process variables ---
+    for varname in ds.data_vars:
+
+        if varname not in expected_units:
+            continue
+
+        var_units = ds[varname].attrs.get("units")
+        expected_unit = expected_units[str(varname)]
+
+        # --- Handle missing units (Unit inference based on value range) ---
+        if var_units is None:
+            print(f"Warning: Units not found for variable {varname}. Assumed '{expected_unit}'.")
+            continue
+
+        # --- Handle existing units needing Dask-compatible conversion ---
+        if not equivalent_units(var_units, expected_unit):
+            if compatible_units(var_units, expected_unit):
+                # Calculate scalar conversion factor (must be computed using the unit library only)
+                multiplier, offset = get_conversion_components(var_units, expected_unit)
+
+                # Apply conversion formula Y = X * M + O lazily.
+                # This preserves Dask chunking for both multiplicative and offset conversions.
+                ds[varname] = ds[varname] * multiplier + offset
+
+                # Update the units attribute of the variable
+                ds[varname].attrs["units"] = expected_unit
+            else:
+                # Units are incompatible
+                raise ValueError(f"Cannot convert {varname} due to incompatible units: "
+                                 f"'{var_units}' to '{expected_unit}'!")
+
+    # Return original type
+    if is_array:
+        # Convert back to DataArray. Use to_array() / squeeze / drop_vars for a clean return.
+        return ds.to_array().squeeze('variable', drop=True).drop_vars('variable')
+    else:
+        return ds
 
 
 # ----------------------
@@ -238,13 +358,13 @@ def get_spatial_dims(obj: Union[xr.Dataset, xr.DataArray]) -> Tuple[str, str]:
 # ----------------------
 # Resolution inference
 # ----------------------
-def _is_meter_like(c: xr.DataArray) -> bool:
+def _coord_is_meter(c: xr.DataArray) -> bool:
     """Checks if the coordinate units are meter-like."""
     u = _normalize_unit(_units_str(c))
     return (u in _METER_UNITS) or any(tok in u for tok in ("metre", "meter"))
 
 
-def infer_resolution(ds: xr.Dataset) -> tuple[float, float]:
+def infer_grid_resolution(ds: xr.Dataset) -> tuple[float, float]:
     """
     Infer horizontal grid spacing (dx, dy) in meters using robust metadata checks.
 
@@ -277,7 +397,7 @@ def infer_resolution(ds: xr.Dataset) -> tuple[float, float]:
         return dx, dy
 
     # Projected / Cartesian axes in meters
-    if _is_meter_like(ycoord) and _is_meter_like(xcoord):
+    if _coord_is_meter(ycoord) and _coord_is_meter(xcoord):
         # Calculate the median difference along the axes
         dy = float(ycoord.diff(y).median())
         dx = float(xcoord.diff(x).median())
