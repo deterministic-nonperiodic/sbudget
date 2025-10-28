@@ -19,7 +19,8 @@ dependencies = [
     "zarr>=2.17",
     "h5netcdf",
     "netcdf4>=1.6",
-    "pyproj"
+    "pyproj",
+    "pint"
 ]
 
 [project.scripts]
