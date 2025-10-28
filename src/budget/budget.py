@@ -5,8 +5,9 @@ import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_resolution, _is_geographic, _coord_is_degrees
 from .constants import cp, Omega
-from .numeric_tools import compute_divergence, compute_vorticity, isotropize
-from .numeric_tools import differentiate_metric, domain_mean, stack_vector, rotate_vector
+from .numeric_tools import domain_mean, stack_vector, rotate_vector, isotropize
+from .numeric_tools import horizontal_advection, horizontal_gradient
+from .numeric_tools import horizontal_divergence, relative_vorticity
 from .numeric_tools import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
 from .thermodynamics import potential_temperature, exner_function, density
 
@@ -19,6 +20,10 @@ _BUDGET_UNITS = "watt / kilogram"
 _BUDGET_META = {
     "hke": ("horizontal_kinetic_energy_spectrum",
             "spectrum of horizontal kinetic energy per unit mass", "m**2 / s**2"),
+    "rke": ("rotational_kinetic_energy_spectrum",
+            "spectrum of rotational kinetic energy per unit mass", "m**2 / s**2"),
+    "dke": ("divergent_kinetic_energy_spectrum",
+            "spectrum of divergent kinetic energy per unit mass", "m**2 / s**2"),
     "cad": ("conversion_ape_dke",
             "conversion from available potential energy to kinetic energy", _BUDGET_UNITS),
     "pi_nke": ("nonlinear_hke_transfer",
@@ -88,6 +93,24 @@ def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = 
 
 
 @budget_metadata
+def divergent_spectra(divergence: xr.DataArray, norm: str | None = None,
+                      name="dke") -> xr.DataArray:
+    """Divergent kinetic energy per unit mass spectrum: k² DKE = ½ |∂|²."""
+    div_spec = 0.5 * scalar_spectrum(divergence, norm)
+
+    return div_spec.rename(name)
+
+
+@budget_metadata
+def rotational_spectra(vorticity: xr.DataArray, norm: str | None = None,
+                       name="rke") -> xr.DataArray:
+    """Rotational kinetic energy per unit mass spectrum: k² DKE = ½ |Φ̂|²"""
+    vor_spec = 0.5 * scalar_spectrum(vorticity, norm)
+
+    return vor_spec.rename(name)
+
+
+@budget_metadata
 def nonlinear_hke_transfer_flux(
         u: xr.DataArray,
         v: xr.DataArray,
@@ -103,35 +126,27 @@ def nonlinear_hke_transfer_flux(
     where U = (u, v),
           A = (u ∂x u + v ∂y u + ½ div·u + ½ w ∂z u,
                u ∂x v + v ∂y v + ½ div·v + ½ w ∂z v)
-
-    All horizontal derivatives use `differentiate_metric` (metric-aware on lon/lat).
-    Vertical derivatives use `.differentiate("z")`.
     """
-    y_dim, x_dim = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
-
     # Horizontal & vertical derivatives
-    dxu = differentiate_metric(u, x_dim)
-    dxv = differentiate_metric(v, x_dim)
-    dyu = differentiate_metric(u, y_dim)
-    dyv = differentiate_metric(v, y_dim)
     dzu = u.differentiate("z", edge_order=2)
     dzv = v.differentiate("z", edge_order=2)
 
     # Divergence (compute if absent)
     if divergence is None:
-        divergence = dxu + dyv
+        divergence = horizontal_divergence(u, v)
 
     # Stack vectors
     wind = stack_vector(u, v, name="wind")  # (comp=2, z, y, x, …)
     wind_shear = stack_vector(dzu, dzv, name="shear")
 
     # Advection-like vector A and transport vector wU
-    adv_u = (u * dxu + v * dyu) + 0.5 * (divergence * u)
-    adv_v = (u * dxv + v * dyv) + 0.5 * (divergence * v)
-    advection = stack_vector(adv_u, adv_v, name="advection") + 0.5 * w * wind_shear
+    adv_u = horizontal_advection(u, u, v) + 0.5 * divergence * u
+    adv_v = horizontal_advection(v, u, v) + 0.5 * divergence * v
+
+    advection = - stack_vector(adv_u, adv_v, name="advection") + 0.5 * w * wind_shear
 
     # Spectral vector inner products (sum over components)
-    t_adv = - vector_cross_spectrum(wind, advection, norm=norm)  # -⟨U, A⟩
+    t_adv = vector_cross_spectrum(wind, advection, norm=norm)  # -⟨U, A⟩
     t_shear = vector_cross_spectrum(wind_shear, w * wind, norm=norm)  # ⟨∂z U, w U⟩
 
     pi_nke = t_adv + t_shear
@@ -150,13 +165,11 @@ def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.Dat
     - Use physical-space gradients and shears
     - Convert to spectral space via component-wise cross spectra and sum
     """
-    y_dim, x_dim = get_spatial_dims(u)
 
     # Physical-space kinetic energy and its horizontal gradient (vector)
     hke_phys = 0.5 * (u ** 2 + v ** 2)
-    grad_hke = stack_vector(differentiate_metric(hke_phys, x_dim),
-                            differentiate_metric(hke_phys, y_dim),
-                            name="grad_hke")
+
+    grad_hke = stack_vector(*horizontal_gradient(hke_phys), name="grad_hke")
 
     # Wind vector and vertical shear vector
     wind = stack_vector(u, v, name="wind")
@@ -166,8 +179,8 @@ def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.Dat
 
     # Divergence and vorticity. Compute if any is absent for consistency.
     if divergence is None or vorticity is None:
-        divergence = compute_divergence(u, v)
-        vorticity = compute_vorticity(u, v)
+        divergence = horizontal_divergence(u, v)
+        vorticity = relative_vorticity(u, v)
 
     # Rotational form advection vector
     advection = grad_hke + vorticity * rotate_vector(wind)
@@ -224,23 +237,17 @@ def nonlinear_vke_transfer(
         T = -⟨w, Aw⟩ + ⟨∂z w, w^2⟩
     where U = (u, v),
           A = (u ∂x w + v ∂y w + ½ div·w + ½ w ∂z w) / 2
-
-    All horizontal derivatives use `differentiate_metric` (metric-aware on lon/lat).
-    Vertical derivatives use `.differentiate("z")`.
     """
-    y_dim, x_dim = get_spatial_dims(u)  # e.g., ("y","x") or ("lat","lon")
 
     # Horizontal & vertical derivatives
-    dxw = differentiate_metric(w, x_dim)
-    dyw = differentiate_metric(w, y_dim)
     dzw = w.differentiate("z", edge_order=2)
 
     # Divergence (compute if absent)
     if divergence is None:
-        divergence = compute_divergence(u, v)
+        divergence = horizontal_divergence(u, v)
 
     # Advection-like vector A and transport vector wU
-    advection_w = (u * dxw + v * dyw) + 0.5 * (divergence * w) + 0.5 * (w * dzw)
+    advection_w = horizontal_advection(w, u, v) + 0.5 * (divergence * w) + 0.5 * (w * dzw)
 
     # Spectral vector inner products (sum over components)
     t_adv = - scalar_cross_spectrum(w, advection_w, norm=norm)  # -⟨w, Aw⟩
@@ -296,7 +303,7 @@ def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                    divergence: xr.DataArray, norm: str | None, name="div_hke") -> xr.DataArray:
     """Horizontal divergence contribution to the HKE budget."""
     if divergence is None:
-        divergence = compute_divergence(u, v)
+        divergence = horizontal_divergence(u, v)
 
     wind = stack_vector(u, v, name="wind")
     divergence_3d = divergence + w.differentiate("z", edge_order=2)
@@ -395,6 +402,14 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         # Assuming density function takes pressure and temperature inputs
         rho = density(pressure, temperature)
 
+    divergence = ds.get("divergence", None)
+    vorticity = ds.get("vorticity", None)
+
+    # Divergence and vorticity. Compute if any is absent for consistency.
+    if divergence is None or vorticity is None:
+        divergence = horizontal_divergence(u, v)
+        vorticity = relative_vorticity(u, v)
+
     # ----------------------------------------------------------------------------------------------
     # Spectral energy budget terms
     # ----------------------------------------------------------------------------------------------
@@ -402,21 +417,26 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     cumulative = getattr(cfg.compute, "cumulative", True)
     norm = getattr(cfg.compute, "norm", None)
 
-    # --- spectra: HKE 2D and isotropic 1D ---
-    hke_2d = kinetic_energy_spectra(u, v, norm=cfg.compute.norm)
+    # --- spectra: 2D HKE, RKE, and DKE and isotropic 1D ---
+    hke_2d = kinetic_energy_spectra(u, v, norm=cfg.compute.norm, name="hke")
     hke_1d = isotropize(hke_2d, dx, dy, cumulative=False)  # non-cumulative HKE spectra
 
-    # ----- Calculate nonlinear spectral transfer → π(HKE) -----
-    divergence = ds.get("divergence", None)
-    vorticity = ds.get("vorticity", None)
+    # wavenumber kappa² = k² + l² [m**-2]
+    scale_sqr = (2.0 * np.pi / hke_1d.wavenumber) ** 2
 
-    # in compute_budget:
-    transfer_mode = getattr(cfg.compute, "transfer_form", "invariant")  # "invariant" | "flux"
+    # RKE and DKE spectra
+    rke_2d = rotational_spectra(vorticity, norm=cfg.compute.norm)
+    rke_1d = (scale_sqr * isotropize(rke_2d, dx, dy, cumulative=False)).rename('rke')
+
+    dke_2d = divergent_spectra(divergence, norm=cfg.compute.norm)
+    dke_1d = (scale_sqr * isotropize(dke_2d, dx, dy, cumulative=False)).rename('dke')
+
+    # ----- Calculate nonlinear spectral transfer → π(HKE) -----
+    transfer_mode = getattr(cfg.compute, "transfer_form", "flux")  # "invariant" | "flux"
 
     # --- NONLINEAR SPECTRAL TRANSFER (pi_nke) ---
     if transfer_mode == "invariant":
-        pi_nke_2d = nonlinear_hke_transfer_invariant(u, v, w,
-                                                     divergence, vorticity,
+        pi_nke_2d = nonlinear_hke_transfer_invariant(u, v, w, divergence, vorticity,
                                                      norm=norm, name="pi_nke")
     else:
         pi_nke_2d = nonlinear_hke_transfer_flux(u, v, w, divergence,
@@ -462,7 +482,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     div_hke = isotropize(div_hke_2d, dx, dy, cumulative=cumulative)
 
     # --- ASSEMBLE ---
-    fluxes = [hke_1d, pi_nke, pi_lke, vfd_dke, j_hke, vf_hke, vf_pres, vfd_pres, cad, div_hke]
+    fluxes = [hke_1d, rke_1d, dke_1d,
+              pi_nke, pi_lke, vfd_dke, j_hke, vf_hke,
+              vf_pres, vfd_pres, cad, div_hke]
 
     # Filter out None and assemble into Dataset
     fluxes = xr.Dataset({da.name: da for da in fluxes if da is not None})
