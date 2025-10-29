@@ -101,15 +101,10 @@ UNITS_REG = pint.UnitRegistry()
 cmd = re.compile(r"(?<=[A-Za-z)])(?![A-Za-z)])(?<![0-9\-][eE])(?<![0-9\-])(?=[0-9\-])")
 
 
-def _normalize_unit(units: Union[str, None]) -> str:
-    """Normalize CF-ish units for robust checks."""
-    units = (units or "").strip()
-    return units.replace("°", "degree")
-
-
 def _get_units_str(c: xr.DataArray) -> str:
     """Extracts and normalizes the units string from a DataArray."""
-    return _normalize_unit(c.attrs.get("units", ""))
+    units = c.attrs.get("units", "").strip()
+    return units
 
 
 def _parse_units(unit_str):
