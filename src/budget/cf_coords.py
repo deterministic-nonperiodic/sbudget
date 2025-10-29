@@ -14,6 +14,7 @@ __all__: List[str] = [
     "_is_z",
     "_coord_is_meter",
     "convert_units",
+    "check_convert_units",
     "is_geographic_grid",
     "get_spatial_dims",
     "infer_grid_resolution",
@@ -103,7 +104,7 @@ cmd = re.compile(r"(?<=[A-Za-z)])(?![A-Za-z)])(?<![0-9\-][eE])(?<![0-9\-])(?=[0-
 def _normalize_unit(units: Union[str, None]) -> str:
     """Normalize CF-ish units for robust checks."""
     units = (units or "").strip().lower()
-    return units.replace("°", "degree").replace("-", "_")
+    return units.replace("°", "degree")
 
 
 def _get_units_str(c: xr.DataArray) -> str:
@@ -388,12 +389,12 @@ def infer_grid_resolution(ds: xr.Dataset) -> tuple[float, float]:
     - Else if dims are projected (('y','x')) and units are meters, return the
       *median* spacing along each axis.
     """
-    y, x = get_spatial_dims(ds)  # ('lat','lon') or ('y','x')
-    if (y not in ds.coords) or (x not in ds.coords):
-        raise ValueError(f"infer_resolution: coords '{y}' and/or '{x}' not found.")
+    y_dim, x_dim = get_spatial_dims(ds)  # ('lat','lon') or ('y','x')
+    if (y_dim not in ds.coords) or (x_dim not in ds.coords):
+        raise ValueError(f"infer_resolution: coords '{y_dim}' and/or '{x_dim}' not found.")
 
-    ycoord = ds[y]
-    xcoord = ds[x]
+    ycoord = ds[y_dim]
+    xcoord = ds[x_dim]
 
     # Geographic lat/lon
     if is_geographic_grid(xcoord, ycoord):
@@ -414,10 +415,10 @@ def infer_grid_resolution(ds: xr.Dataset) -> tuple[float, float]:
     # Projected / Cartesian axes in meters
     if _coord_is_meter(ycoord) and _coord_is_meter(xcoord):
         # Calculate the median difference along the axes
-        dy = float(ycoord.diff(y).median())
-        dx = float(xcoord.diff(x).median())
+        dy = float(ycoord.diff(y_dim).median())
+        dx = float(xcoord.diff(x_dim).median())
         return dx, dy
 
     raise ValueError(
         "infer_resolution: could not infer spacing. "
-        f"Dims=({y},{x}), units=({_get_units_str(ycoord)}, {_get_units_str(xcoord)})")
+        f"Dims=({y_dim},{x_dim}), units=({_get_units_str(ycoord)}, {_get_units_str(xcoord)})")

@@ -8,7 +8,7 @@ from pint import Quantity
 from pyproj import Geod
 
 from .budget import get_spatial_dims
-from .cf_coords import is_geographic_grid
+from .cf_coords import is_geographic_grid, check_convert_units
 from .constants import earth_radius
 from .io_utils import ensure_optimal_chunking
 
@@ -107,6 +107,7 @@ def infer_boundary_conditions(x_coord, **kwargs):
             spacing = np.median(np.diff(x_coord))
             # Calculate the total span of the coordinate axis
             span = x_coord[-1] - x_coord[0] + spacing
+
             is_global_x = np.isclose(span, 360.0, atol=spacing)
 
         elif x_coord.ndim == 2:
@@ -115,6 +116,7 @@ def infer_boundary_conditions(x_coord, **kwargs):
             # Check if the longitude span is close to 360 for the middle latitude row
             middle_row_idx = x_coord.shape[0] // 2
             span = x_coord[middle_row_idx, -1] - x_coord[middle_row_idx, 0] + spacing
+
             is_global_x = np.isclose(span, 360.0, atol=spacing)
 
         if is_global_x:
@@ -405,20 +407,11 @@ def get_max_radial_distance(
 
     # Apply the 2 * l_max constraint
     if length_scales is not None:
-
         # Calculate the maximum required radial distance
         max_scale_limit = 2 * max(length_scales)
 
-        # Ensure the limit is in meters if length_scales were provided as Quantity (e.g., in max_r_m_default)
-        if isinstance(max_r_m_default, Quantity):
-            # Assuming length_scales itself is a NumPy array of meter values.
-            max_scale_limit_m = max_scale_limit
-        else:
-            # Assume length_scales elements are already in meters
-            max_scale_limit_m = max_scale_limit
-
         # Enforce that max_r_m does not exceed 2 * l_max
-        max_r_m = min(max_r_m, max_scale_limit_m)
+        max_r_m = min(max_r_m, max_scale_limit)
 
     return max_r_m
 
@@ -449,6 +442,7 @@ def scale_increments(
     # Note: _get_spacing is a helper function assumed to be available
     dx = max(_get_spacing(x_coord, y_center, use_geode=use_geode, axis='x'), 1e-6)
     dy = max(_get_spacing(y_coord, x_center, use_geode=use_geode, axis='y'), 1e-6)
+
     r_step = max(dx, dy)  # Scale resolution is set by the maximum spacing
 
     x_min, x_max = float(x_coord.min()), float(x_coord.max())
@@ -920,6 +914,9 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
     # Ensure velocity components are float32 for memory efficiency
     wind = wind[velocity_vars].astype({v: "float32" for v in velocity_vars})
+
+    # Convert units to m/s if necessary
+    wind = check_convert_units(wind)
 
     # Check if the dataset has the required variables
     verbose = kwargs.get("verbose", False)
