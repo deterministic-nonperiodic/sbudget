@@ -459,6 +459,19 @@ def horizontal_wavenumber_magnitude(nx: int, ny: int, dx: float, dy: float) -> n
     return kh_grid
 
 
+def truncate(spectrum, truncation_scale=None):
+    """Truncate a 1-D isotropic spectrum at the given truncation scale."""
+
+    if truncation_scale is None:
+        return spectrum
+
+    if np.isscalar(truncation_scale):
+        truncation_scale = float(truncation_scale)
+        return spectrum.sel({"wavenumber": slice(2.0 * np.pi / truncation_scale)})
+
+    raise ValueError("Unknown type for truncation_scale. Expecting a float.")
+
+
 def scalar_spectrum(field: xr.DataArray, norm: str | None = None) -> xr.DataArray:
     """Return 2-D power spectrum |F(k)|^2 over the last two spatial axes.
 
