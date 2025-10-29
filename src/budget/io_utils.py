@@ -1,6 +1,6 @@
 import math
 import shutil
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 from typing import Tuple, Optional, Dict
 
@@ -11,7 +11,7 @@ from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter, convert_units
 
 _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git',
                  'institution': 'Leibniz Institute for Atmospheric Physics (IAP)',
-                 'history': date.today().strftime('Created on %c'),
+                 'history': datetime.today().strftime('Created on %c'),
                  'references': '', 'Conventions': 'CF-1.6'}
 
 
