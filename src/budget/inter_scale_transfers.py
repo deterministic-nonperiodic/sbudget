@@ -8,7 +8,7 @@ from pint import Quantity
 from pyproj import Geod
 
 from .budget import get_spatial_dims
-from .cf_coords import is_geographic_grid
+from .cf_coords import is_geographic_grid, _is_global_longitude
 from .constants import earth_radius
 from .io_utils import ensure_optimal_chunking
 
@@ -74,7 +74,7 @@ def fits_in_memory(ds: xr.Dataset,
     return dataset_size < max_memory
 
 
-def infer_boundary_conditions(x_coord, **kwargs):
+def infer_boundary_conditions(x_coord: xr.DataArray, **kwargs) -> tuple[str, str]:
     """
     Infers boundary conditions for x and y coordinates based on their range.
 
@@ -82,45 +82,18 @@ def infer_boundary_conditions(x_coord, **kwargs):
     domain (e.g., 0 to 360 or -180 to 180), making it periodic.
 
     Args:
-        x_coord (np.ndarray): The x-coordinate array (longitude). Can be 1D or 2D.
+        x_coord (xr.DataArray): The x-coordinate array (longitude). Can be 1D or 2D.
         **kwargs: Optional keyword arguments to override inference.
-            x_coord_boundary (str): Manually set x-boundary ('periodic', 'fill', 'reflect',
-            'nearest').
-            y_coord_boundary (str): Manually set y-boundary ('reflect', etc.).
+            x_coord_boundary (str): ('periodic', 'fill', 'reflect', 'nearest').
+            y_coord_boundary (str): ('periodic', 'fill', 'reflect', 'nearest').
 
     Returns:
         tuple[str, str]: A tuple containing the inferred x and y boundary conditions.
     """
+
     # Check if the user has already specified the boundary conditions
-    if "x_coord_boundary" in kwargs:
-        x_boundary = kwargs["x_coord_boundary"]
-    else:
-        # Default to non-periodic and infer below
-        x_boundary = "reflect"
-        is_global_x = False
-
-        # --- Inference Logic ---
-        # This logic checks the *span* of the coordinates, so it works for
-        # both 0-to-360 and -180-to-180 degree conventions.
-        if x_coord.ndim == 1:
-            # For 1D coordinates, calculate tolerance from grid spacing
-            spacing = np.median(np.diff(x_coord))
-            # Calculate the total span of the coordinate axis
-            span = x_coord[-1] - x_coord[0] + spacing
-
-            is_global_x = np.isclose(span, 360.0, atol=spacing)
-
-        elif x_coord.ndim == 2:
-            # For 2D coordinates (e.g., curvilinear grids), check along an axis
-            spacing = np.median(np.diff(x_coord, axis=1))
-            # Check if the longitude span is close to 360 for the middle latitude row
-            middle_row_idx = x_coord.shape[0] // 2
-            span = x_coord[middle_row_idx, -1] - x_coord[middle_row_idx, 0] + spacing
-
-            is_global_x = np.isclose(span, 360.0, atol=spacing)
-
-        if is_global_x:
-            x_boundary = "periodic"
+    x_boundary = kwargs.get("x_coord_boundary",
+                            "periodic" if _is_global_longitude(x_coord) else "reflect")
 
     # For y_boundary, default to "fill" as it is the most common case.
     y_boundary = kwargs.get("y_coord_boundary", "reflect")
@@ -272,74 +245,61 @@ def roll_with_boundary_handling(
         y_dim: str,
         x_boundary_type: str = "periodic",
         y_boundary_type: str = "periodic",
-        fill_value: Any = np.nan
+        fill_value: Any = np.nan,
 ) -> xr.Dataset:
     """
-    Rolls a Dataset along spatial dimensions with optional boundary fill, reflection, or nearest extrapolation.
+    Roll a Dataset along spatial dimensions with selectable boundary handling.
 
     Parameters
     ----------
     data : xr.Dataset
         Dataset to roll.
-    n_x : int
-        Shift along x_dim (positive = right).
-    n_y : int
-        Shift along y_dim (positive = down).
+    n_x, n_y : int
+        Shifts along x_dim (right) and y_dim (down). Positive = forward.
     x_dim, y_dim : str
         Names of the spatial dimensions.
-    x_boundary_type, y_boundary_type : {'periodic', 'fill', 'reflect', 'nearest'}
-        Boundary condition type per axis.
+    x_boundary_type, y_boundary_type : {'periodic', 'constant', 'reflect', 'edge'}
+        Boundary mode for each axis. See xarray.Dataset.pad documentation for all available modes.
     fill_value : Any
         Value to use when boundary_type == 'fill'.
-    lazy : bool
-        If True, preserve dask arrays and avoid immediate computation.
 
     Returns
     -------
     xr.Dataset
     """
+    valid_pad_modes = {"constant", "edge", "linear_ramp", "maximum", "mean",
+                       "median", "minimum", "reflect", "symmetric", "wrap"}
 
     def process_dimension(ds: xr.Dataset, dim: str, shift: int, boundary: str) -> xr.Dataset:
-        if shift == 0 or boundary == "periodic":
+        """Process rolling along a single dimension with specified boundary handling."""
+
+        dim_size = int(ds.sizes[dim])
+        if dim_size == 0 or shift == 0:
+            return ds
+
+        # Fast path for periodic wrapping. Same as native xarray "wrap" mode
+        if boundary in ("periodic", "wrap"):
+            # Circular shift; negative to match original direction
             return ds.roll({dim: -shift}, roll_coords=False)
 
-        dim_size = ds.sizes[dim]
-        pad_width = abs(shift) + 1  # +1 to ensure we cover the full range
+        # --- Prepare padding parameters for non-periodic modes ---
+        if boundary not in valid_pad_modes:
+            raise ValueError(f"Unsupported boundary type: {boundary!r}")
 
-        if boundary == "fill":
-            # Normalize shift to within the dimension length
-            if dim_size == 0 or shift == 0:
-                return ds
-            k = int(shift) % dim_size  # number of positions to shift (0..dim_size-1)
+        pad_kwargs = dict(mode=boundary)
+        if boundary == "constant":
+            pad_kwargs["constant_values"] = fill_value
 
-            # Use the same effective direction as your original: roll({dim: -shift})
-            shifted = ds.shift({dim: -k})
+        # --- Non-periodic modes: pad → roll → slice ---
+        pad_width = abs(shift) + 1
 
-            # Edge slice newly exposed by the shift
-            if shift > 0:
-                edge = slice(dim_size - k, dim_size)  # right edge
-            else:
-                edge = slice(0, k)  # left edge
+        # Pad both sides by k, roll by -k, then crop back to original length
+        padded = ds.pad({dim: (pad_width, pad_width)}, **pad_kwargs)
+        rolled = padded.roll({dim: -shift}, roll_coords=False)
 
-            # 1D mask along the shifting dim: True everywhere, False on the new edge
-            edge_mask = xr.DataArray(
-                np.ones(dim_size, dtype=bool),
-                coords={dim: ds[dim]},
-                dims=[dim],
-            )
-            edge_mask.loc[{dim: edge}] = False
+        return rolled.isel({dim: slice(pad_width, pad_width + dim_size)})
 
-            # Fill only the introduced edge; preserve pre-existing NaNs
-            return shifted.where(edge_mask, other=fill_value)
-
-        elif boundary in ("reflect", "nearest"):
-            mode = boundary if boundary == "reflect" else "edge"
-            padded = ds.pad({dim: (pad_width, pad_width)}, mode=mode)
-            rolled = padded.roll({dim: -shift}, roll_coords=False)
-            return rolled.isel({dim: slice(pad_width, pad_width + dim_size)})
-        else:
-            raise ValueError(f"Unsupported boundary type: {boundary}")
-
+    # Process x and y dimensions
     ds_rolled = process_dimension(data, x_dim, n_x, x_boundary_type)
     ds_rolled = process_dimension(ds_rolled, y_dim, n_y, y_boundary_type)
 
@@ -942,7 +902,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         )
 
     # Determine boundary conditions
-    x_boundary, y_boundary = infer_boundary_conditions(x_coord.values, **kwargs)
+    x_boundary, y_boundary = infer_boundary_conditions(x_coord, **kwargs)
 
     if verbose:
         print(f"Inferred boundary conditions -> x: {x_boundary}, y: {y_boundary}")

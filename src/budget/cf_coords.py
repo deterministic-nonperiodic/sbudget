@@ -331,6 +331,47 @@ def is_geographic_grid(coord_x: xr.DataArray, coord_y: xr.DataArray) -> bool:
     return np.logical_and(is_x_lon, is_y_lat)
 
 
+def _is_global_longitude(x_coord: xr.DataArray) -> bool:
+    """
+    Determine if a longitude coordinate covers (nearly) the full globe.
+
+    Strategy (robust to wrap-around and irregular spacing):
+    - Normalize longitudes to [0, 360).
+    - Sort along the x-direction and compute circular gaps between consecutive points,
+      including the wrap gap (last→first + 360).
+    - If the largest gap is no bigger than a small tolerance (~a few grid spacings),
+      then coverage is effectively global.
+
+    Ignores NaNs and duplicate endpoints (e.g., both 0 and 360 present).
+    """
+
+    def _normalize_deg(x):
+        """Map to [0, 360) in degrees; ignore NaNs."""
+        return np.asarray(x, dtype=np.float32) % 360.0
+
+    lon = x_coord.values
+    lon = _normalize_deg(lon[np.isfinite(lon)])
+
+    # Sort unique longitudes (avoid duplicate endpoints like 0 and 360)
+    lon = np.unique(np.sort(lon))
+    if lon.size < 2:
+        return False
+
+    # Estimate a representative spacing (median nearest-neighbor gap on the circle)
+    diffs = np.diff(lon)
+    wrap_gap = (lon[0] + 360.0) - lon[-1]
+    all_gaps = np.concatenate([diffs, [wrap_gap]])
+    # If there are large holes, the largest gap will reflect that.
+    max_gap = float(np.max(all_gaps))
+
+    # Tolerance: allow a few grid spacings worth of slack (handles uneven grids)
+    # Use the median gap as a spacing proxy; fall back to 360/N if needed.
+    spacing = float(np.median(all_gaps)) if all_gaps.size else 360.0 / lon.size
+
+    # “Global” if there is no big uncovered arc: i.e., largest gap ≲ tol=1.5 * spacing
+    return max_gap <= 1.5 * spacing
+
+
 # ----------------------
 # Spatial dim resolution
 # ----------------------
