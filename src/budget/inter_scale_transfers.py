@@ -219,7 +219,7 @@ def delta_u_cubed_geographic(
         angle_grid: xr.DataArray
 ) -> xr.DataArray:
     """
-    Compute (δu ⋅ r̂) ⋅ |δu|² using angle and distance from geographic scale increments.
+    Compute (δu ⋅ r̂) |δu|² using angle and distance from geographic scale increments.
     """
     ds_increment = ds_shifted - ds
     delta_u = ds_increment["u"]
@@ -692,8 +692,7 @@ def process_single_r_for_field_chunk_optimized(
         name="weighted_sum_integrand"
     )
 
-    # Loop over all angles, recalculating the shift graph N_angles times,
-    # but avoiding the N_unique_shifts memory footprint.
+    # Loop over all angles
     for phi, nx_shift, ny_shift, weight in angle_params:
         # Roll the data (DASK GRAPH RECONSTRUCTION)
         rolled_ds = roll_with_boundary_handling(field_chunk_ds,
@@ -712,7 +711,7 @@ def process_single_r_for_field_chunk_optimized(
     # Final result is average over all angles (weighted sum / total weight)
     integrand = weighted_sum / total_weight.clip(min=1e-12)
 
-    # Handle final coordinate assignment (unchanged)
+    # Handle final coordinate assignment
     if 'r' in integrand.coords:
         integrand = integrand.drop_vars('r')
 
@@ -952,11 +951,11 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     )
 
     energy_transfer_rate.attrs.update({
-        'units': "W/kg",
+        'units': "W / kg",
         'standard_name': "specific_kinetic_energy_transfer",
         'long_name': "Specific transfer rate of kinetic energy across scales",
         'description': "Computed using third-order structure functions and mollifier kernels. "
-                       "Positive means energy transfer from larger to smaller scales"
+                       "Positive means forward energy transfer towards smaller scales"
     })
 
     # reassign coordinates from input data
