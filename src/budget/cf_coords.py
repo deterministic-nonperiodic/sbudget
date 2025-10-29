@@ -103,7 +103,7 @@ cmd = re.compile(r"(?<=[A-Za-z)])(?![A-Za-z)])(?<![0-9\-][eE])(?<![0-9\-])(?=[0-
 
 def _normalize_unit(units: Union[str, None]) -> str:
     """Normalize CF-ish units for robust checks."""
-    units = (units or "").strip().lower()
+    units = (units or "").strip()
     return units.replace("°", "degree")
 
 

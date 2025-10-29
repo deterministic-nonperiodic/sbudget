@@ -7,7 +7,8 @@ from typing import Tuple, Optional, Dict
 import numpy as np
 import xarray as xr
 
-from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter, convert_units
+from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter
+from .cf_coords import convert_units, check_convert_units
 
 _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git',
                  'institution': 'Leibniz Institute for Atmospheric Physics (IAP)',
@@ -257,6 +258,9 @@ def open_dataset(cfg) -> xr.Dataset:
         if cname in ds.coords and cname in ds.dims:
             # Make sure the coord is indexed by its own dim
             ds = ds.set_coords(cname)
+
+    # Ensure units consistency
+    ds = check_convert_units(ds)
 
     # Interpolate to consistent vertical coordinates and convert to meters if needed
     ds = ensure_vertical_consistent(ds, target_name='z')

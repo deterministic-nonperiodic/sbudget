@@ -8,7 +8,7 @@ from pint import Quantity
 from pyproj import Geod
 
 from .budget import get_spatial_dims
-from .cf_coords import is_geographic_grid, check_convert_units
+from .cf_coords import is_geographic_grid
 from .constants import earth_radius
 from .io_utils import ensure_optimal_chunking
 
@@ -914,9 +914,6 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
     # Ensure velocity components are float32 for memory efficiency
     wind = wind[velocity_vars].astype({v: "float32" for v in velocity_vars})
-
-    # Convert units to m/s if necessary
-    wind = check_convert_units(wind)
 
     # Check if the dataset has the required variables
     verbose = kwargs.get("verbose", False)
