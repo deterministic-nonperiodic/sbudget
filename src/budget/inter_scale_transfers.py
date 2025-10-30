@@ -805,7 +805,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
                                        target_chunk_ratio=0.001,
                                        # Safer 50% threshold for Dask compute budget
                                        memory_threshold_ratio=0.25,
-                                       # no derivatives required here
+                                       # No derivatives required here. Allow min z-chunk size = 1
                                        deriv_edge_order=0)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
