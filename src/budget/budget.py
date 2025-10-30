@@ -394,8 +394,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
                                      # Target chunk size as 5% of total output size
                                      target_chunk_ratio=0.5,
-                                     # Safer 50% threshold for Dask compute budget
-                                     memory_threshold_ratio=0.5,
+                                     # Use up to 80% of available memory
+                                     memory_threshold_ratio=0.8,
                                      deriv_edge_order=2, rechunk_spatial=rechunk_spatial)
 
     # After open_dataset(), variable names are normalized to logical names.
