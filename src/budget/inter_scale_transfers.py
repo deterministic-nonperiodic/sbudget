@@ -725,7 +725,7 @@ def increment_integrand(
     integrand = xr.map_blocks(block_fn, field, template=template)
 
     # This prepares the array for efficient integration/reduction in the next step.
-    integrand = integrand.chunk({"r": 1})
+    integrand = integrand.chunk(r=1)
 
     return integrand
 
@@ -800,7 +800,9 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         scale_size = increments.r.size * scale_size
 
         wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
-                                       output_scale_mult=scale_size)
+                                       output_scale_mult=scale_size,
+                                       # no derivatives required here
+                                       deriv_edge_order=0)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
     nan_mask = xr.concat(
@@ -818,6 +820,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         verbose=verbose,
         transform_type="delta_u_cubed"
     ).where(~nan_mask)
+
+    print(integrand)
 
     # Apply normalized mollifier kernel
     energy_transfer_rate = scale_space_integral(

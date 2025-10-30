@@ -403,12 +403,6 @@ def open_dataset(cfg) -> xr.Dataset:
         ds = ds.sel(z=levels, method='nearest')
         print("Calculating transfers on selected levels: ", ds.z.values)
 
-    # Apply consistent rechunking:
-    rechunk_spatial = getattr(cfg.compute, "rechunk_spatial", False)
-
-    ds = ensure_optimal_chunking(ds, spatial_dims=(y_name, x_name), vertical_dim="z",
-                                 rechunk_spatial=rechunk_spatial)
-
     return ds
 
 

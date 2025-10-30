@@ -58,6 +58,7 @@ def _cmd_compute(args) -> None:
     ds = open_dataset(cfg)
 
     if mode == "spectral_budget":
+
         out = compute_budget(ds, cfg)
 
     elif mode == "scale_transfer":
@@ -72,10 +73,8 @@ def _cmd_compute(args) -> None:
         out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
 
     else:
-        raise ValueError(
-            f"Unknown compute.mode='{cfg.compute.mode}'. "
-            "Use 'spectral_budget' or 'scale_transfer'."
-        )
+        raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
+                         f"Use 'spectral_budget' or 'scale_transfer'.")
 
     # Write output to disk
     write_dataset(out, cfg)
