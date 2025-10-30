@@ -801,6 +801,10 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
         wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
                                        output_scale_mult=scale_size,
+                                       # Target chunk size as 0.1% of total output size
+                                       target_chunk_ratio=0.001,
+                                       # Safer 50% threshold for Dask compute budget
+                                       memory_threshold_ratio=0.25,
                                        # no derivatives required here
                                        deriv_edge_order=0)
 
