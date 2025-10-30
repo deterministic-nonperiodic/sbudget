@@ -20,7 +20,8 @@ dependencies = [
     "h5netcdf",
     "netcdf4>=1.6",
     "pyproj",
-    "pint"
+    "pint",
+    "psutil"
 ]
 
 [project.scripts]

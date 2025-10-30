@@ -1,8 +1,8 @@
+import warnings
 from typing import Any, Optional, Union, List
 
 import dask.array as da
 import numpy as np
-import psutil
 import xarray as xr
 from pint import Quantity
 from pyproj import Geod
@@ -14,64 +14,6 @@ from .io_utils import ensure_optimal_chunking
 
 # Constants
 GEODE = Geod(ellps="WGS84")
-
-
-def estimate_dataset_bytes(ds: xr.Dataset) -> int:
-    """
-    Estimate working-set size (bytes) for a dataset.
-
-    - For Dask-backed vars: use the largest chunk along each dimension.
-    - For NumPy-backed vars: use the full array size.
-    """
-    total = 0
-    for var in ds.data_vars.values():
-        item_size = np.dtype(var.dtype).itemsize
-        chunks = getattr(getattr(var, "data", None), "chunks", None)
-        if chunks is not None:
-            # dask-backed → product of max chunk sizes per dim
-            max_elems = 1
-            for dim_chunks in chunks:
-                max_elems *= max(dim_chunks)
-            var_bytes = max_elems * item_size
-        else:
-            # eager numpy-backed → whole array
-            var_bytes = int(var.size) * item_size
-        total += var_bytes
-    return int(total)
-
-
-def fits_in_memory(ds: xr.Dataset,
-                   memory_threshold_ratio: float = 0.6,
-                   expansion_factor: int = 1) -> bool:
-    """
-    Check if the dataset (possibly expanded along length_scale) fits in memory.
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Dataset to evaluate.
-    memory_threshold_ratio : float, optional
-        Fraction of currently available system memory that can be used.
-        Default is 0.6 (i.e. 60%).
-
-    Returns
-    -------
-    bool
-        True if the estimated dataset size is below the threshold.
-    """
-    ds = ds if isinstance(ds, xr.Dataset) else ds.to_dataset()
-
-    # Base size estimate
-    dataset_size = estimate_dataset_bytes(ds) * max(1, int(expansion_factor))
-
-    available_memory = psutil.virtual_memory().available
-    max_memory = memory_threshold_ratio * available_memory
-
-    print(f"  Estimated dataset size: {dataset_size / 1024 ** 2:.1f} MB")
-    print(f"  Allowed memory (threshold {memory_threshold_ratio:.0%}):"
-          f" {max_memory / 1024 ** 2:.1f} MB")
-
-    return dataset_size < max_memory
 
 
 def infer_boundary_conditions(x_coord: xr.DataArray, **kwargs) -> tuple[str, str]:
@@ -563,7 +505,7 @@ def scale_space_integral(
         length_scales: Optional[np.ndarray] = None,
         weighting: str = "2D",
         verbose: bool = False,
-        scale_chunk_size: Optional[int] = -1
+        scale_chunk_size: Optional[int] = 1
 ) -> xr.DataArray:
     """
     Computes the scale-space integral (convolution) of the integrand.
@@ -598,7 +540,7 @@ def scale_space_integral(
 
     if not length_scales.size:
         if verbose: print(f"Warning: No valid length scales to use in integration."
-                          f"Using {r_coord.max()}")
+                          f"Using {r_coord.max().values:8.2f} m")
 
         length_scales = np.atleast_1d(r_coord.max().values)
 
@@ -632,7 +574,7 @@ def scale_space_integral(
 
     if hasattr(integral.data, "chunks"):
         # Explicitly chunk the 'scale' dimension if a chunk size is provided
-        integral = integral.chunk({"scale": scale_chunk_size})
+        integral = integral.chunk(scale=scale_chunk_size)
 
     if verbose:
         print(f"Finished calculating scale-space integral '{name}'. Shape: {integral.shape}")
@@ -789,76 +731,6 @@ def increment_integrand(
     return integrand
 
 
-def ensure_nonspatial_chunking(
-        ds: xr.Dataset,
-        x_name: str,
-        y_name: str,
-        expansion_factor: int = 1,
-        memory_threshold_ratio: float = 0.5,
-        verbose: bool = False,
-):
-    """
-    Ensure that a dataset is chunked along non-spatial dimensions if needed
-    to keep memory use under control.
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Input dataset (may already be chunked).
-    x_name, y_name : str
-        Names of the spatial dimensions (kept unchunked).
-    expansion_factor : int, optional
-        Factor by which the dataset will be expanded (e.g. len(r)).
-        Used in fits_in_memory check.
-    memory_threshold_ratio : float, optional
-        Fraction of available memory allowed before rechunking.
-    verbose : bool, optional
-        If True, log what rechunking was applied.
-
-    Returns
-    -------
-    ds_chunked : xr.Dataset
-        Dataset with non-spatial rechunking applied if necessary.
-    """
-    if fits_in_memory(ds, memory_threshold_ratio=memory_threshold_ratio,
-                      expansion_factor=expansion_factor):
-
-        if verbose:
-            print("Dataset fits in memory. No rechunking required.")
-            print("==============================================================")
-
-        return ds
-
-    # Plan rechunking: only add "auto" for non-spatial dims not yet chunked
-    non_spatial_dims = {}
-    for d in ds.dims:
-        if d in (x_name, y_name):
-            continue
-        if not hasattr(ds[list(ds.data_vars)[0]].data, "chunks"):
-            # NumPy-backed → no chunks at all
-            non_spatial_dims[d] = "auto"
-        elif d not in ds.chunks:
-            # Dask-backed but not chunked along this dim
-            non_spatial_dims[d] = "auto"
-
-    if non_spatial_dims:
-        ds = ds.chunk(non_spatial_dims)
-
-        if verbose:
-            print("Rechunked non-spatial dimensions due to memory constraints:")
-            for dim in non_spatial_dims:
-                if dim in ds.chunks:
-                    chunks = ds.chunks[dim]
-                    n_chunks = len(chunks)
-                    sizes = ", ".join(str(c) for c in chunks[:3])
-                    if n_chunks > 3:
-                        sizes += ", …"
-                    print(f"  - {dim}: {n_chunks} chunks (sizes: {sizes})")
-            print("==============================================================")
-
-    return ds
-
-
 def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Dataset:
     """ Computes the inter-scale kinetic energy transfer rate using third-order structure functions.
     Parameters
@@ -882,23 +754,32 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     y_name = kwargs.get("y_coord_name", None)
     length_scales = kwargs.get("scales", None)
     ls_chunk_size = kwargs.get("ls_chunk_size", -1)
+    allow_rechunking = kwargs.get("allow_rechunking", True)
 
-    try:
-        # Attempt to retrieve coordinates by name
-        if x_name is None and y_name is None:
-            # Infer coordinates using helper (assumes CF compliance)
-            y_name, x_name = get_spatial_dims(wind)
-
-        if x_name in wind and y_name in wind:
-            x_coord = wind[x_name]
-            y_coord = wind[y_name]
-        else:
-            raise KeyError(f"Specified coordinate names {x_name}, {y_name} not found in dataset.")
-    except Exception:
-        raise ValueError(
-            "Could not infer spatial coordinates. For non-geographic data, "
-            "please specify 'x_coord_name' and 'y_coord_name' explicitly in kwargs."
+    # Process length scales input
+    if length_scales is None:
+        warnings.warn(
+            "scale_transfer: 'compute.scales' not provided or invalid. "
+            "Using automatic wavelength grid based on maximum horizontal resolution "
+            "up to the domain size. NOTE: this may create large arrays and increase memory usage.",
+            UserWarning,
+            stacklevel=2,
         )
+    elif isinstance(length_scales, (list, tuple, np.ndarray)) or np.isscalar(length_scales):
+        length_scales = np.atleast_1d(length_scales).astype(np.float32)
+    else:
+        raise ValueError("'scales' must be an iterable, or scalar of length scales in meters.")
+
+    # Attempt to retrieve coordinates by name
+    if x_name is None and y_name is None:
+        # Infer coordinates using helper (assumes CF compliance)
+        y_name, x_name = get_spatial_dims(wind)
+
+    if x_name in wind and y_name in wind:
+        x_coord = wind[x_name]
+        y_coord = wind[y_name]
+    else:
+        raise KeyError(f"Specified coordinate names {x_name}, {y_name} not found in dataset.")
 
     # Determine boundary conditions
     x_boundary, y_boundary = infer_boundary_conditions(x_coord, **kwargs)
@@ -919,9 +800,13 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         min_valid_shifts=kwargs.get("min_valid_shifts", 10)
     )
 
-    # Ensure the increments fit in memory or compute in chunks along non-spatial dimensions
-    chunk_size = 1  # MB target chunk size for spatial dims. Keep small to limit memory use.
-    wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name), target_chunk_mb=chunk_size)
+    # Ensure the result fits in memory or compute in chunks along non-spatial dimensions
+    if allow_rechunking:
+        scale_size = 1 if length_scales is None else len(length_scales)
+        scale_size = increments.r.size * scale_size
+
+        wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
+                                       output_scale_mult=scale_size)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
     nan_mask = xr.concat(
@@ -983,8 +868,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         # Avoid triggering a full compute if Dask-backed (expensive convolutions)
         arr = energy_transfer_rate.energy_transfer.data
         if hasattr(arr, "chunks"):
-            print("Finished computing energy transfer rate (lazy graph built). "
-                  "Skipping domain total to avoid full computation.")
+            print("Finished computing energy transfer rate.")
         else:
             domain_total = float(energy_transfer_rate.energy_transfer.sum())
             print(f"Finished computing energy transfer rate. "

@@ -1,8 +1,6 @@
 import argparse
-import warnings
 from pathlib import Path
 
-import numpy as np
 import xarray as xr
 
 from .budget import compute_budget
@@ -63,25 +61,15 @@ def _cmd_compute(args) -> None:
         out = compute_budget(ds, cfg)
 
     elif mode == "scale_transfer":
-        # Validate scales
-        scales = getattr(cfg.compute, "scales", None)
-        if not (isinstance(scales, (list, tuple))):
-            warnings.warn(
-                "scale_transfer: 'compute.scales' not provided. "
-                "Proceeding with automatic wavelength grid using a step based on the "
-                "maximum horizontal resolution up to the domain size. "
-                "NOTE: this can create very large arrays and increase memory usage.",
-                UserWarning,
-                stacklevel=2,
-            )
 
-        control_dict = {
-            "verbose": True,
-            "scales": np.asarray(scales, dtype=np.float32),
+        kwargs = {
+            "scales": getattr(cfg.compute, "scales", None),
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
+            "allow_rechunking": cfg.compute.dask_allow_rechunk,
+            "verbose": True
         }
 
-        out = inter_scale_kinetic_energy_transfer(ds, **control_dict)
+        out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
 
     else:
         raise ValueError(
