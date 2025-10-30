@@ -1,4 +1,3 @@
-import warnings
 from typing import Any, Optional, Union, List
 
 import dask.array as da
@@ -758,17 +757,12 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
     # Process length scales input
     if length_scales is None:
-        warnings.warn(
-            "scale_transfer: 'compute.scales' not provided or invalid. "
-            "Using automatic wavelength grid based on maximum horizontal resolution "
-            "up to the domain size. NOTE: this may create large arrays and increase memory usage.",
-            UserWarning,
-            stacklevel=2,
-        )
+        pass
     elif isinstance(length_scales, (list, tuple, np.ndarray)) or np.isscalar(length_scales):
         length_scales = np.atleast_1d(length_scales).astype(np.float32)
     else:
-        raise ValueError("'scales' must be an iterable, or scalar of length scales in meters.")
+        raise ValueError("scale_transfer: 'compute.scales' not provided or invalid."
+                         "'scales' must be an iterable, or scalar of length scales in meters.")
 
     # Attempt to retrieve coordinates by name
     if x_name is None and y_name is None:
