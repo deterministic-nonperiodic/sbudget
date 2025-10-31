@@ -281,32 +281,27 @@ def _is_z(cname: str, coords: Union[xr.DataArray, Any]) -> bool:
 
 
 def _is_geographic(coord: xr.DataArray, coord_type: str) -> bool:
-    """
-    Performs CF-ish checks for a single coordinate (Lat or Lon) using a lookup dictionary.
-    """
-    lookup = _CF_COORDS_LOOKUP[coord_type]
+    """CF-compliant heuristic to identify latitude/longitude coordinates correctly."""
+    lookup = _CF_COORDS_LOOKUP.get(coord_type, {})
 
-    # 1. Attributes and Names
-    name = str(coord.name).lower() if coord.name else ""
-    attrs: Dict[str, Any] = coord.attrs
-    units = _get_units_str(coord)
+    name = (coord.name or "").lower()
+    attrs = coord.attrs
+    units = str(attrs.get("units", "")).lower()
+    standard_name = str(attrs.get("standard_name", "")).lower()
+    axis = str(attrs.get("axis", "")).upper()
 
-    standard_name = (attrs.get("standard_name", "") or "").strip().lower()
-    axis = (attrs.get("axis", "") or "").strip().upper()
+    name_ok = any(name == n or name.endswith(n) for n in lookup.get("names", ()))
+    units_ok = any(hint in units for hint in lookup.get("units_hints", ()))
+    std_ok = (standard_name == lookup.get("standard_name"))
+    axis_ok = (axis == lookup.get("axis"))
 
-    # Name Check: Check if any of the target names are in the coordinate name
-    name_ok = any(n in name for n in lookup["names"])
+    # Ensure direction-specific hints are not cross-matched (avoid lon==lat true)
+    if coord_type == "lon" and ("north" in units or "degree_north" in units):
+        units_ok = False
+    if coord_type == "lat" and ("east" in units or "degree_east" in units):
+        units_ok = False
 
-    # Unit Check: Must contain 'degree' AND one of the directional/generic unit hints
-    units_ok = ("degree" in units and any(u in units for u in lookup["units_hints"]))
-
-    # Standard Name Check
-    std_ok = (standard_name == lookup["standard_name"])
-
-    # Axis Check: Must match target axis AND contain a degree/directional unit hint
-    axis_ok = (axis == lookup["axis"] and any(u in units for u in lookup["units_hints"]))
-
-    return name_ok or units_ok or std_ok or axis_ok
+    return name_ok or std_ok or (units_ok and axis_ok)
 
 
 def is_geographic_grid(coord_x: xr.DataArray, coord_y: xr.DataArray) -> bool:

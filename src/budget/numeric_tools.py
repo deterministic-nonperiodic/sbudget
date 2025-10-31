@@ -22,7 +22,7 @@ def domain_mean(da: xr.DataArray) -> xr.DataArray:
     regardless of dimensionality (1D or 2D). Falls back to a plain mean if a
     latitude coordinate cannot be identified.
     """
-    # 1. Get the names of the spatial dimensions to reduce over
+    # Get the names of the spatial dimensions to reduce over
     y_dim, x_dim = get_spatial_dims(da)
 
     # Get the coordinate associated with the y-dimension name
@@ -75,235 +75,180 @@ def _check_coordinate_consistency(*arrays: xr.DataArray, dims_to_check: Tuple[st
 
 def first_derivative(da: xr.DataArray, dim: str, delta: float | None = None) -> xr.DataArray:
     """
-    Metric-aware first derivative along `dim`.
+    Metric-aware first derivative along `dim` in spherical or Cartesian coordinates.
 
-    - If `delta` is given (meters), calculates d/dx = (dA/d[index]) / delta.
-    - If `dim` is longitude/latitude, calculates d/d[coord_rad] (derivative per radian).
-    - Otherwise (Cartesian dims), calculates d/d[coord] (derivative per coordinate unit).
+    Returns
+    -------
+    xr.DataArray
+        The partial derivative d(da)/ds where `s` is distance in **meters**
+        along the axis `dim`.
 
-    Returns the derivative scaled appropriately for direct use in formulas like spherical
-    divergence, where metric factors 1/(R*cos(phi)) are applied externally.
+    Rules
+    -----
+    - If `delta` is given (meters) and the coordinate is missing, compute
+      index-based derivative and divide by `delta` to obtain per-meter.
+    - If `dim` is longitude or latitude, convert to per-radian and then
+      divide by the corresponding spherical metric so the result is per-meter:
+        * lon:  (1 / (R * cos(phi))) * d(da)/d(lambda)
+        * lat:  (1 / R)               * d(da)/d(phi)
+      where `lambda` and `phi` are in radians.
+    - Otherwise (Cartesian), we assume the coordinate is metric (meters) and
+      return the standard coordinate derivative (already per meter). If this
+      is not true in a given dataset, pass an explicit `delta` instead.
     """
     if dim not in da.dims:
-        raise ValueError(f"differentiate_metric: dim '{dim}' not in {tuple(da.dims)}")
+        raise ValueError(f"first_derivative: dim '{dim}' not in {tuple(da.dims)}")
 
     coord = da.coords.get(dim, None)
 
-    # --- Index-based derivative with explicit spacing (delta) ---
+    # --- Index-based derivative with explicit spacing (meters) ---
     if coord is None:
-        if delta is not None:
-            # Differentiate along the *index* (da.differentiate(dim)) -> d/d[index]
-            # Divide by the spacing in meters (delta) to get d/d[meter].
-            derivative_over_index = da.differentiate(dim, edge_order=2)
-            # Use xr.full_like for robust broadcasting and Dask support
-            # Need to slice delta_da to match the size of derivative_over_index
-            indexer = {d: slice(None) for d in da.dims}
-            if da.sizes[dim] > 1:  # Avoid slicing if dim size is 1 or less
-                indexer[dim] = slice(None, -1)  # Match size after differentiation
-
-            # Ensure delta_da has coordinates aligned with derivative_over_index
-            template_da = da.isel(indexer)
-            delta_da = xr.full_like(template_da, fill_value=float(delta))
-
-            # Align explicitly before division if shapes might mismatch due to slicing edge cases
-            deriv_aligned, delta_aligned = xr.align(derivative_over_index, delta_da, join="inner")
-
-            return deriv_aligned / delta_aligned
-        else:
+        if delta is None:
             raise ValueError(
-                f"differentiate_metric: No coordinate found for dim '{dim}' "
-                f"and no 'delta' provided; cannot determine metric spacing.")
+                f"first_derivative: No coordinate for dim '{dim}' and no 'delta' provided; "
+                f"cannot compute meters-based derivative.")
+        # d/d[index] divided by physical spacing (meters)
+        deriv_index = da.differentiate(dim, edge_order=2)
 
-    # Calculate derivative along coordinate: d/d[coord]
+        return deriv_index / xr.full_like(deriv_index, fill_value=float(delta))
+
+    # --- Coordinate-based derivative: start with d/d[coord] ---
     deriv_coord = da.differentiate(dim, edge_order=2)
 
-    # --- Geographic Coordinate (Longitude or Latitude) ---
-    # Convert d/d[coord] to d/d[coord_rad] if necessary
-    if _is_geographic(coord, "lon") or _is_geographic(coord, "lat"):
-        if _coord_is_degrees(coord):
-            # If coord is degrees, deriv_coord is d/d[deg]. Convert to d/d[rad].
-            # (d/d[deg]) * (d[deg]/d[rad]) = (d/d[deg]) * (180/pi)
-            return deriv_coord * xr.full_like(deriv_coord, fill_value=180.0 / np.pi)
+    # Geographic longitude/latitude handling
+    is_lon = _is_geographic(coord, "lon")
+    is_lat = _is_geographic(coord, "lat")
 
+    if is_lon or is_lat:
+        # Convert coordinate to radians if provided in degrees
+        if _coord_is_degrees(coord):
+            # d/d[deg] * (deg per rad) = d/d[rad]
+            deriv_rad = deriv_coord * xr.full_like(deriv_coord, fill_value=180.0 / np.pi)
+        else:
+            deriv_rad = deriv_coord
+
+        if is_lon:
+            # per-meter: (1 / (R * cos(phi))) * d/d(lambda)
+            # We need latitude to compute cos(phi). Infer y-dim from data array.
+            y_dim, x_dim = get_spatial_dims(da)
+            # If dim is longitude, the latitude coordinate is the other spatial dim
+            lat_coord = da.coords[y_dim]
+            phi = np.deg2rad(lat_coord) if _coord_is_degrees(lat_coord) else lat_coord
+            cos_phi = xr.where(np.abs(phi) > (np.pi / 2 - epsilon), epsilon, np.cos(phi))
+            return deriv_rad / (earth_radius * cos_phi)
+
+        # latitude case: (1 / R) * d/d(phi)
+        return deriv_rad / xr.full_like(deriv_rad, fill_value=earth_radius)
+
+    # Non-geographic: assume coordinate is metric (meters)
     return deriv_coord
 
 
 def horizontal_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """
-    Calculate the horizontal divergence of a vector field (u, v).
+    Horizontal divergence of vector field (u, v), returned in s^-1.
 
-    Handles both geographic (latitude/longitude) and Cartesian coordinates.
-    Infers coordinates and dimensions from input DataArrays.
-
-    Parameters
-    ----------
-    u : xr.DataArray
-        Zonal (Eastward) component of the vector field.
-    v : xr.DataArray
-        Meridional (Northward) component of the vector field.
-
-    Returns
-    -------
-    xr.DataArray
-        Horizontal divergence (units: s^-1).
+    On the sphere (lon/lat):
+        div = (1/(R cos(phi))) * ∂_λ u + (1/(R cos(phi))) * ∂_φ (v cos(phi))
+            = du/dx + (1/cos(phi)) * d(v cos(phi))/dy
+      because `first_derivative(u, x_dim)` returns du/dx = (1/(R cos(phi))) ∂_λ u
+      and `first_derivative(v cos φ, y_dim)` returns (1/R) ∂_φ (v cos φ).
     """
-    # Infer spatial dimensions and coordinates from 'u'
-    try:
-        y_dim, x_dim = get_spatial_dims(u)
-        x_coord = u.coords[x_dim]
-        y_coord = u.coords[y_dim]
-    except ValueError as e:
-        raise ValueError(f"Could not determine spatial dimensions from input 'u': {e}") from e
-    except KeyError as e:
-        raise KeyError(f"Missing spatial coordinate {e} in input 'u'.") from e
+    y_dim, x_dim = get_spatial_dims(u)
+    x_coord = u.coords[x_dim]
+    y_coord = u.coords[y_dim]
 
-    # Check consistency with 'v'
     _check_coordinate_consistency(u, v, dims_to_check=(y_dim, x_dim))
 
-    generic_du = first_derivative(u, x_dim)
-    generic_dv = first_derivative(v, y_dim)
+    du_dx = first_derivative(u, x_dim)  # per meter
 
     if is_geographic_grid(x_coord, y_coord):
-        # Spherical Divergence Formula:
-        # div = (1 / (R * cos(phi))) * [ d(u)/d(lambda) + d(v * cos(phi))/d(phi) ]
         lat = y_coord
-        phi_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
-        cos_phi = xr.where(np.abs(phi_rad) > np.pi / 2 - epsilon, epsilon, np.cos(phi_rad))
+        phi = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
+        cos_phi = xr.where(np.abs(phi) > (np.pi / 2 - epsilon), epsilon, np.cos(phi))
 
-        v_cos_phi = v * cos_phi
-        dv_cos_phi = first_derivative(v_cos_phi, y_dim)
-
-        div = (generic_du + dv_cos_phi) / (earth_radius * cos_phi)
-
+        d_v_cos_dy = first_derivative(v * cos_phi, y_dim)  # = (1/R) ∂_φ (v cos φ)
+        dv_dy = (d_v_cos_dy / cos_phi)
     else:
-        # Cartesian Divergence: div = du/dx + dv/dy
-        div = generic_du + generic_dv
+        # Cartesian fallback
+        dv_dy = first_derivative(v, y_dim)
 
+    # Horizontal divergence div = du/dx + dv/dy (both per meter)
+    div = du_dx + dv_dy
+
+    # Construct name and attributes
     div.name = "divergence"
-
-    # Add CF standard attributes
     div.attrs.update({
-        'units': 's-1',
-        'standard_name': 'divergence_of_wind',
-        'long_name': 'Horizontal divergence of wind'
+        "units": "s-1",
+        "standard_name": "divergence_of_wind",
+        "long_name": "Horizontal divergence of wind",
     })
     return div
 
 
 def relative_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """
-    Calculate the relative vorticity (vertical component) of a vector field (u, v).
+    Vertical component of relative vorticity, returned in s^-1.
 
-    Handles both geographic (latitude/longitude) and Cartesian coordinates.
-    Infers coordinates and dimensions from input DataArrays.
-
-    Parameters
-    ----------
-    u : xr.DataArray
-        Zonal (Eastward) component of the vector field.
-    v : xr.DataArray
-        Meridional (Northward) component of the vector field.
-
-    Returns
-    -------
-    xr.DataArray
-        Relative vorticity (units: s^-1).
+    On the sphere:
+        ζ = (1/(R cos φ)) ∂_λ v  - (1/(R cos φ)) ∂_φ (u cos φ)
+          = dv/dx              - (1/cos φ) * d(u cos φ)/dy
+      because `first_derivative(v, x_dim)` returns dv/dx = (1/(R cos φ)) ∂_λ v
+      and `first_derivative(u cos φ, y_dim)` returns (1/R) ∂_φ (u cos φ).
     """
-    # Infer spatial dimensions and coordinates from 'u'
-    try:
-        y_dim, x_dim = get_spatial_dims(u)
-        x_coord = u.coords[x_dim]
-        y_coord = u.coords[y_dim]
-    except ValueError as e:
-        raise ValueError(f"Could not determine spatial dimensions from input 'u': {e}") from e
-    except KeyError as e:
-        raise KeyError(f"Missing spatial coordinate {e} in input 'u'.") from e
+    y_dim, x_dim = get_spatial_dims(u)
+    x_coord = u.coords[x_dim]
+    y_coord = u.coords[y_dim]
 
-    # Check consistency with 'v'
     _check_coordinate_consistency(u, v, dims_to_check=(y_dim, x_dim))
 
-    generic_du = first_derivative(u, y_dim)
-    generic_dv = first_derivative(v, x_dim)
+    dv_dx = first_derivative(v, x_dim)  # per meter
 
     if is_geographic_grid(x_coord, y_coord):
-        # Spherical Relative Vorticity Formula:
-        # vort = (1 / (R * cos(phi))) * [ d(v)/d(lambda) - d(u * cos(phi))/d(phi) ]
         lat = y_coord
-        phi_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
-        cos_phi = xr.where(np.abs(phi_rad) > np.pi / 2 - epsilon, epsilon, np.cos(phi_rad))
+        phi = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
+        cos_phi = xr.where(np.abs(phi) > (np.pi / 2 - epsilon), epsilon, np.cos(phi))
 
-        u_cos_phi = u * cos_phi
-        du_cos_phi = first_derivative(u_cos_phi, y_dim)
-
-        vort = (generic_dv - du_cos_phi) / (earth_radius * cos_phi)
-
+        d_u_cos_dy = first_derivative(u * cos_phi, y_dim)  # = (1/R) ∂_φ (u cos φ)
+        du_dy = (d_u_cos_dy / cos_phi)
     else:
-        # Cartesian Relative Vorticity: vort = dv/dx - du/dy
-        vort = generic_dv - generic_du
+        # Cartesian fallback
+        du_dy = first_derivative(u, y_dim)
 
+    # Relative vorticity ζ = dv/dx - du/dy (both per meter)
+    vort = dv_dx - du_dy
+
+    # Construct name and attributes
     vort.name = "relative_vorticity"
-    # Add standard attributes
     vort.attrs.update({
-        'units': 's-1',
-        'standard_name': 'relative_vorticity',
-        'long_name': 'Relative vorticity'
+        "units": "s-1",
+        "standard_name": "relative_vorticity",
+        "long_name": "Relative vorticity",
     })
     return vort
 
 
-def horizontal_gradient(scalar: xr.DataArray, delta: float | None = None) -> (
-        Tuple[xr.DataArray, xr.DataArray]):
+def horizontal_gradient(scalar: xr.DataArray, delta: float | None = None) -> Tuple[
+    xr.DataArray, xr.DataArray]:
     """
-    Calculate the horizontal gradient of a scalar field A.
+    Horizontal gradient of a scalar field, returned as (dA/dx, dA/dy) in **per meter**.
 
-    Handles both geographic (latitude/longitude) and Cartesian coordinates correctly.
-    Infers coordinates and dimensions from input DataArrays.
+    With `first_derivative` providing per-meter derivatives, we simply call it
+    along each horizontal axis. For geographic coordinates, the internal metric
+    handling is already applied inside `first_derivative`.
 
     Parameters
     ----------
     scalar : xr.DataArray
-        The scalar field being advected (e.g., temperature, kinetic energy).
+        Scalar field.
     delta : float, optional
-        Constant grid spacing in meters, used only if coordinates are missing
-        from A for index-based differentiation via differentiate_metric.
-
-    Returns
-    -------
-    Tuple[xr.DataArray, xr.DataArray]
-        Horizontal advection of A (units: A_units * s^-1).
+        Constant spacing in meters for index-based differentiation when the
+        corresponding coordinate is missing.
     """
-    # Infer spatial dimensions and coordinates from 'A'
-    try:
-        y_dim, x_dim = get_spatial_dims(scalar)
-        x_coord = scalar.coords.get(x_dim)  # Use get to allow None for delta case
-        y_coord = scalar.coords.get(y_dim)
-    except ValueError as e:
-        raise ValueError(f"Could not determine spatial dimensions from input 'A': {e}") from e
+    y_dim, x_dim = get_spatial_dims(scalar)
 
-    # Check geographic status only if coordinates exist
-    is_geo = False
-    if x_coord is not None and y_coord is not None:
-        is_geo = is_geographic_grid(x_coord, y_coord)
-
-    # Calculate derivatives (dA/dx and dA/dy in meters)
-    if is_geo:
-        lat = y_coord
-        phi_rad = np.deg2rad(lat) if _coord_is_degrees(lat) else lat
-        cos_phi = xr.where(np.abs(phi_rad) > np.pi / 2 - epsilon, epsilon, np.cos(phi_rad))
-
-        # differentiate_metric returns d/d(lambda_rad) and d/d(phi_rad)
-        da_d_lambda = first_derivative(scalar, x_dim)
-        da_d_phi = first_derivative(scalar, y_dim)
-
-        # Construct derivatives per meter
-        da_dx = da_d_lambda / (earth_radius * cos_phi)
-        da_dy = da_d_phi / earth_radius
-    else:
-        # Cartesian Advection:
-        # differentiate_metric returns d/dx and d/dy if coords are metric,
-        # or uses delta if coords are missing.
-        da_dx = first_derivative(scalar, x_dim, delta=delta)
-        da_dy = first_derivative(scalar, y_dim, delta=delta)
+    da_dx = first_derivative(scalar, x_dim, delta=delta)  # per meter
+    da_dy = first_derivative(scalar, y_dim, delta=delta)  # per meter
 
     return da_dx, da_dy
 
@@ -336,10 +281,8 @@ def horizontal_advection(scalar: xr.DataArray, u: xr.DataArray, v: xr.DataArray,
         Horizontal advection of A (units: A_units * s^-1).
     """
     # Infer spatial dimensions and coordinates from 'A'
-    try:
-        y_dim, x_dim = get_spatial_dims(scalar)
-    except ValueError as e:
-        raise ValueError(f"Could not determine spatial dimensions from input 'A': {e}") from e
+
+    y_dim, x_dim = get_spatial_dims(scalar)
 
     # Check consistency with 'u' and 'v'
     _check_coordinate_consistency(scalar, u, v, dims_to_check=(y_dim, x_dim))
@@ -740,15 +683,3 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray,
     u_term = scalar_cross_spectrum(vec1.sel(comp="u"), vec2.sel(comp="u"), norm)
     v_term = scalar_cross_spectrum(vec1.sel(comp="v"), vec2.sel(comp="v"), norm)
     return u_term + v_term
-
-
-def compute_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
-    """Horizontal divergence."""
-    y_dim, x_dim = get_spatial_dims(u)
-    return first_derivative(u, x_dim) + first_derivative(v, y_dim)
-
-
-def compute_vorticity(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
-    """Vertical vorticity."""
-    y_dim, x_dim = get_spatial_dims(u)
-    return first_derivative(v, x_dim) - first_derivative(u, y_dim)
