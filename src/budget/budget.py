@@ -6,11 +6,11 @@ import xarray as xr
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
 from .constants import cp, Omega, epsilon
 from .io_utils import ensure_optimal_chunking
-from .numeric_tools import domain_mean, stack_vector, rotate_vector, isotropize
+from .numeric_tools import domain_mean, stack_vector, rotate_vector
 from .numeric_tools import horizontal_advection, horizontal_gradient
 from .numeric_tools import horizontal_divergence, relative_vorticity
-from .numeric_tools import horizontal_wavenumber_magnitude
-from .numeric_tools import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
+from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize
+from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
 from .thermodynamics import potential_temperature, exner_function, density
 
 # --------------------------------------------------------------------------------------------------
@@ -87,23 +87,24 @@ def budget_metadata(func: Callable) -> Callable:
 # Energy budget terms
 # --------------------------------------------------------------------------------------------------
 @budget_metadata
-def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, norm: str | None = None,
-                           name="hke") -> xr.DataArray:
+def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, name="hke") -> xr.DataArray:
     """Horizontal kinetic energy per unit mass spectrum: ½(|Û|² + |V̂|²)."""
-    hke = 0.5 * (scalar_spectrum(u, norm) + scalar_spectrum(v, norm))
+    hke = 0.5 * (scalar_spectrum(u) + scalar_spectrum(v))
 
     return hke.rename(name)
 
 
 @budget_metadata
 def divergent_kinetic_energy_spectra(divergence: xr.DataArray, dx: float, dy: float,
-                                     norm: str | None = None, name="dke") -> xr.DataArray:
+                                     name="dke") -> xr.DataArray:
     """Divergent kinetic energy per unit mass spectrum: DKE = ½ |∂|² / k²."""
-    dke = scalar_spectrum(divergence, norm=norm)
+    dke = scalar_spectrum(divergence)
 
-    # Scale by k²
+    # recover original grid size
     nx, ny = 2 * (dke['kx'].size - 1), dke['ky'].size
-    kh = horizontal_wavenumber_magnitude(nx, ny, 2.0 * np.pi * dx, 2.0 * np.pi * dy)
+
+    # Scale by 2 k²
+    kh = horizontal_wavenumber_magnitude(nx, ny, dx, dy)
 
     dke = 0.5 * dke / kh.clip(min=epsilon) ** 2
 
@@ -112,14 +113,15 @@ def divergent_kinetic_energy_spectra(divergence: xr.DataArray, dx: float, dy: fl
 
 @budget_metadata
 def rotational_kinetic_energy_spectra(vorticity: xr.DataArray, dx: float, dy: float,
-                                      norm: str | None = None, name="rke") -> xr.DataArray:
+                                      name="rke") -> xr.DataArray:
     """Rotational kinetic energy per unit mass spectrum: RKE = ½ |ζ|² / k²."""
-    rke = scalar_spectrum(vorticity, norm=norm)
+    rke = scalar_spectrum(vorticity)
 
-    # Scale by k²
+    # recover original grid size
     nx, ny = 2 * (rke['kx'].size - 1), rke['ky'].size
-    kh = horizontal_wavenumber_magnitude(nx, ny, 2.0 * np.pi * dx, 2.0 * np.pi * dy)
 
+    # Scale by 2 k²
+    kh = horizontal_wavenumber_magnitude(nx, ny, dx, dy)
     rke = 0.5 * rke / kh.clip(min=epsilon) ** 2
 
     return rke.rename(name)
@@ -131,7 +133,6 @@ def nonlinear_hke_transfer_flux(
         v: xr.DataArray,
         w: xr.DataArray,
         divergence: Union[xr.DataArray | None] = None,
-        norm: str | None = None,
         name="pi_nke"
 ) -> xr.DataArray:
     """Nonlinear transfer term for horizontal kinetic energy (HKE), vectorized.
@@ -161,8 +162,8 @@ def nonlinear_hke_transfer_flux(
     advection = - stack_vector(adv_u, adv_v, name="advection") + 0.5 * w * wind_shear
 
     # Spectral vector inner products (sum over components)
-    t_adv = vector_cross_spectrum(wind, advection, norm=norm)  # -⟨U, A⟩
-    t_shear = vector_cross_spectrum(wind_shear, w * wind, norm=norm)  # ⟨∂z U, w U⟩
+    t_adv = vector_cross_spectrum(wind, advection)  # -⟨U, A⟩
+    t_shear = vector_cross_spectrum(wind_shear, w * wind)  # ⟨∂z U, w U⟩
 
     pi_nke = t_adv + t_shear
 
@@ -172,7 +173,7 @@ def nonlinear_hke_transfer_flux(
 @budget_metadata
 def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                                      divergence: xr.DataArray, vorticity: xr.DataArray,
-                                     norm: str | None = None, name="pi_nke") -> xr.DataArray:
+                                     name="pi_nke") -> xr.DataArray:
     """Invariant-form nonlinear KE transfer (Augier & Lindborg 2013, Eq. A2).
 
     Works in the current workflow using xarray stacking and spectral primitives:
@@ -202,8 +203,8 @@ def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.Dat
     advection += (divergence * wind + w * wind_shear) / 2.0
 
     # Nonlinear spectral transfer
-    adv_transfer = - vector_cross_spectrum(wind, advection, norm)
-    vertical_transport = vector_cross_spectrum(wind_shear, w * wind, norm)
+    adv_transfer = - vector_cross_spectrum(wind, advection)
+    vertical_transport = vector_cross_spectrum(wind_shear, w * wind)
 
     pi_nke = adv_transfer + vertical_transport
 
@@ -211,8 +212,7 @@ def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.Dat
 
 
 @budget_metadata
-def coriolis_linear_transfer(u: xr.DataArray, v: xr.DataArray,
-                             norm: str | None = None, name="pi_lke") -> xr.DataArray:
+def coriolis_linear_transfer(u: xr.DataArray, v: xr.DataArray, name="pi_lke") -> xr.DataArray:
     """Coriolis linear transfer term for horizontal kinetic energy (HKE), vectorized."""
 
     lat_dim = get_spatial_dims(u)[0]
@@ -232,7 +232,7 @@ def coriolis_linear_transfer(u: xr.DataArray, v: xr.DataArray,
     wind = stack_vector(u, v, name="wind")
 
     # Linear transfer term: -⟨U, f·(k̂ × U)⟩
-    pi_lke = - vector_cross_spectrum(wind, fc * rotate_vector(wind), norm=norm)
+    pi_lke = - vector_cross_spectrum(wind, fc * rotate_vector(wind))
 
     return pi_lke.rename(name)
 
@@ -243,7 +243,6 @@ def nonlinear_vke_transfer(
         v: xr.DataArray,
         w: xr.DataArray,
         divergence: Union[xr.DataArray | None] = None,
-        norm: str | None = None,
         name="pi_vke"
 ) -> xr.DataArray:
     """Nonlinear transfer term for vertical kinetic energy (VKE), vectorized.
@@ -265,8 +264,8 @@ def nonlinear_vke_transfer(
     advection_w = horizontal_advection(w, u, v) + 0.5 * (divergence * w) + 0.5 * (w * dzw)
 
     # Spectral vector inner products (sum over components)
-    t_adv = - scalar_cross_spectrum(w, advection_w, norm=norm)  # -⟨w, Aw⟩
-    t_shear = scalar_cross_spectrum(dzw, w * w, norm=norm)  # ⟨∂z w, w^2⟩
+    t_adv = - scalar_cross_spectrum(w, advection_w)  # -⟨w, Aw⟩
+    t_shear = scalar_cross_spectrum(dzw, w * w)  # ⟨∂z w, w^2⟩
 
     pi_nke = t_adv + t_shear
 
@@ -275,47 +274,47 @@ def nonlinear_vke_transfer(
 
 @budget_metadata
 def turbulent_hke_flux(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
-                       norm: str | None, name="vf_hke") -> xr.DataArray:
+                       name="vf_hke") -> xr.DataArray:
     """Vertical flux of HKE: -½⟨u, w u⟩ - ½⟨v, w v⟩ in spectral space."""
 
     wind = stack_vector(u, v, name="wind")
 
-    vf_hke = -0.5 * vector_cross_spectrum(wind, w * wind, norm)
+    vf_hke = -0.5 * vector_cross_spectrum(wind, w * wind)
 
     return vf_hke.rename(name)
 
 
 @budget_metadata
-def turbulent_vke_flux(w: xr.DataArray, norm: str | None, name="vf_vke") -> xr.DataArray:
+def turbulent_vke_flux(w: xr.DataArray, name="vf_vke") -> xr.DataArray:
     """Vertical flux of HKE: -½⟨u, w u⟩ - ½⟨v, w v⟩ in spectral space."""
 
-    vf_vke = -0.5 * scalar_cross_spectrum(w, w * w, norm)
+    vf_vke = -0.5 * scalar_cross_spectrum(w, w * w)
     return vf_vke.rename(name)
 
 
 @budget_metadata
 def pressure_flux(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
-                  norm: str | None, name="vf_pres") -> xr.DataArray:
+                  name="vf_pres") -> xr.DataArray:
     """Vertical pressure work flux term: -cp·θ·⟨w, exner⟩."""
-    p_flux = -cp * domain_mean(theta) * scalar_cross_spectrum(w, exner, norm)
+    p_flux = -cp * domain_mean(theta) * scalar_cross_spectrum(w, exner)
 
     return p_flux.rename(name)
 
 
 @budget_metadata
 def conversion_ape_to_dke(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
-                          norm: str | None, name="cad") -> xr.DataArray:
+                          name="cad") -> xr.DataArray:
     """APE to DKE conversion term: cp·θ·⟨w, ∂z exner⟩."""
     dz_exner = exner.differentiate('z', edge_order=2)
 
-    cad = cp * domain_mean(theta) * scalar_cross_spectrum(w, dz_exner, norm)
+    cad = cp * domain_mean(theta) * scalar_cross_spectrum(w, dz_exner)
 
     return cad.rename(name)
 
 
 @budget_metadata
 def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
-                   divergence: xr.DataArray, norm: str | None, name="div_hke") -> xr.DataArray:
+                   divergence: xr.DataArray, name="div_hke") -> xr.DataArray:
     """Horizontal divergence contribution to the HKE budget."""
     if divergence is None:
         divergence = horizontal_divergence(u, v)
@@ -323,7 +322,7 @@ def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
     wind = stack_vector(u, v, name="wind")
     divergence_3d = divergence + w.differentiate("z", edge_order=2)
 
-    div_hke = 0.5 * vector_cross_spectrum(wind, wind * divergence_3d, norm)
+    div_hke = 0.5 * vector_cross_spectrum(wind, wind * divergence_3d)
 
     return div_hke.rename(name)
 
@@ -331,12 +330,12 @@ def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
 @budget_metadata
 def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                               rho: xr.DataArray, vf_hke: xr.DataArray = None,
-                              norm: str | None = None, name="j_hke") -> xr.DataArray:
+                              name="j_hke") -> xr.DataArray:
     """Nonconservative adiabatic contribution to the HKE budget."""
 
     # Vertical flux of HKE (compute if absent)
     if vf_hke is None:
-        vf_hke = turbulent_hke_flux(u, v, w, norm=norm)
+        vf_hke = turbulent_hke_flux(u, v, w)
 
     # Calculate the spatially averaged density at each height (z)
     rho_mean = domain_mean(rho)
@@ -445,18 +444,17 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # ----------------------------------------------------------------------------------------------
     # --- accumulation (optional; defaults True) ---
     cumulative = getattr(cfg.compute, "cumulative", True)
-    norm = getattr(cfg.compute, "norm", None)
 
     # --- spectra: 2D HKE, RKE, and DKE and isotropic 1D ---
-    hke_2d = kinetic_energy_spectra(u, v, norm=cfg.compute.norm, name="hke")
+    hke_2d = kinetic_energy_spectra(u, v, name="hke")
     hke_1d = isotropize(hke_2d, dx, dy, cumulative=False)  # non-cumulative HKE spectra
 
     # wavenumber kappa² = k² + l² [m**-2]
     # RKE and DKE spectra
-    rke_2d = rotational_kinetic_energy_spectra(vorticity, dx, dy, norm=cfg.compute.norm)
+    rke_2d = rotational_kinetic_energy_spectra(vorticity, dx, dy)
     rke_1d = isotropize(rke_2d, dx, dy, cumulative=False)
 
-    dke_2d = divergent_kinetic_energy_spectra(divergence, dx, dy, norm=cfg.compute.norm)
+    dke_2d = divergent_kinetic_energy_spectra(divergence, dx, dy)
     dke_1d = isotropize(dke_2d, dx, dy, cumulative=False)
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
@@ -464,19 +462,17 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     # --- NONLINEAR SPECTRAL TRANSFER (pi_nke) ---
     if transfer_mode == "invariant":
-        pi_nke_2d = nonlinear_hke_transfer_invariant(u, v, w, divergence, vorticity,
-                                                     norm=norm, name="pi_nke")
+        pi_nke_2d = nonlinear_hke_transfer_invariant(u, v, w, divergence, vorticity, name="pi_nke")
     else:
-        pi_nke_2d = nonlinear_hke_transfer_flux(u, v, w, divergence,
-                                                norm=norm, name="pi_nke")
+        pi_nke_2d = nonlinear_hke_transfer_flux(u, v, w, divergence, name="pi_nke")
 
     pi_nke = isotropize(pi_nke_2d, dx, dy, cumulative=cumulative)
 
-    pi_lke_2d = coriolis_linear_transfer(u, v, norm=norm, name="pi_lke")
+    pi_lke_2d = coriolis_linear_transfer(u, v, name="pi_lke")
     pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
 
     # --- VERTICAL HKE FLUX (vf_hke) and its DIVERGENCE (vfd_dke) ---
-    vf_hke_2d = turbulent_hke_flux(u, v, w, norm=norm, name="vf_hke")
+    vf_hke_2d = turbulent_hke_flux(u, v, w, name="vf_hke")
     vf_hke = isotropize(vf_hke_2d, dx, dy, cumulative=cumulative)
 
     # Calculate divergence of the 2D flux, then isotropize
@@ -485,8 +481,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     # --- ADIABATIC NON-CONSERVATIVE (j_hke) ---
     # Note: nonconservative_adiabatic uses vf_hke_2d (or calculates it if not passed)
-    j_hke_2d = nonconservative_adiabatic(u, v, w, rho, vf_hke=vf_hke_2d,
-                                         norm=norm, name="j_hke")
+    j_hke_2d = nonconservative_adiabatic(u, v, w, rho, vf_hke=vf_hke_2d, name="j_hke")
     j_hke = isotropize(j_hke_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE WORK & CONVERSION (vf_pres, vfd_pres, cad) ---
@@ -494,7 +489,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     exner = exner_function(pressure) - exner_function(domain_mean(pressure))
 
     # Pressure Flux (vf_pres)
-    vf_pres_2d = pressure_flux(theta, w, exner, norm=norm, name="vf_pres")
+    vf_pres_2d = pressure_flux(theta, w, exner, name="vf_pres")
     vf_pres = isotropize(vf_pres_2d, dx, dy, cumulative=cumulative)
 
     # Pressure Flux Divergence (vfd_pres)
@@ -502,11 +497,11 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     vfd_pres = isotropize(vfd_pres_2d, dx, dy, cumulative=cumulative)
 
     # Conversion (cad)
-    cad_2d = conversion_ape_to_dke(theta, w, exner, norm=norm, name="cad")
+    cad_2d = conversion_ape_to_dke(theta, w, exner, name="cad")
     cad = isotropize(cad_2d, dx, dy, cumulative=cumulative)
 
     # --- HORIZONTAL KE DIVERGENCE (div_hke) ---
-    div_hke_2d = divergence_hke(u, v, w, divergence, norm=norm, name="div_hke")
+    div_hke_2d = divergence_hke(u, v, w, divergence, name="div_hke")
     div_hke = isotropize(div_hke_2d, dx, dy, cumulative=cumulative)
 
     # --- ASSEMBLE ---

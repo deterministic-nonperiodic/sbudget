@@ -9,15 +9,15 @@ output:
   overwrite: true
 
 compute:
-  mode: spectral            # Type of scale-transfer physical vs spectral ["spectral", "physical"]
+  mode: spectral_budget     # Type of scale-transfer physical vs spectral ["spectral", "physical"]
   scales: null              # Used with mode "physical" wavelengths (m), e.g., [1000, 5000, 10000]
   norm: null                # or 'ortho'
   dx: null                  # only for Cartesian grids; lon/lat inferred
   dy: null
   cumulative: true          # default; set false for raw (non-accumulated) spectra
-  transfer_form: invariant  # invariant, flux. Method for computing nonlinear spectral transfers
+  transfer_form: flux       # invariant, flux. Method for computing nonlinear spectral transfers
   # FFT stability & memory control
-  rechunk_spatial: true     # ensure single spatial chunks (y,x) for FFTs
+  rechunk_spatial: false    # ensure single spatial chunks (y,x) for FFTs, and convolutions
   dask_allow_rechunk: true  # allow apply_ufunc to rechunk as a fallback
   scheduler: threads        # distributed, processes
 
