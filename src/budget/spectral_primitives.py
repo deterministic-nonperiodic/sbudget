@@ -1,10 +1,11 @@
-from typing import Tuple
+from typing import Tuple, Union
 
 import numpy as np
+import numpy.linalg as npl
 import xarray as xr
 from scipy.signal.windows import dpss as _dpss
 
-from .cf_coords import get_spatial_dims, is_geographic_grid, _coord_is_degrees
+from .cf_coords import get_spatial_dims, _coord_is_degrees
 from .constants import epsilon
 from .numeric_tools import domain_mean
 
@@ -29,7 +30,7 @@ SPECTRAL_CFG = {
         "normalize_row_mean": True  # divide by <cos(phi)> so mean-squared window is consistent
     },
     "detrend": {
-        "remove_mean": "global",  # one of {"global","zonal","none"}
+        "type": "linear",  # one of {"constant","linear","none"}
     },
 }
 
@@ -37,18 +38,6 @@ SPECTRAL_CFG = {
 # -----------------------------
 # Utilities (internal)
 # -----------------------------
-def _get_weighted_mean(field: xr.DataArray) -> xr.DataArray:
-    """Remove mean from field according to configured mode."""
-    mode = SPECTRAL_CFG.get("detrend", {}).get("remove_mean", "none")
-    y_dim, x_dim = get_spatial_dims(field)
-    if mode == "global":
-        return domain_mean(field)
-    if mode == "zonal":  # remove zonal means (kx=0)
-        return field.mean(dim=x_dim)
-
-    return xr.zeros_like(field)
-
-
 def _make_taper(n: int, kind_or_spec) -> np.ndarray:
     """Build a 1D window of length ``n``.
 
@@ -126,12 +115,10 @@ def _sqrt_area_weight(field: xr.DataArray) -> xr.DataArray:
 
     s(phi) = sqrt( cos(phi) / <cos(phi)> )  (if enabled)
     """
-    y_dim, x_dim = get_spatial_dims(field)
-    x_coord = field.coords.get(x_dim)
+    y_dim, _ = get_spatial_dims(field)
     y_coord = field.coords.get(y_dim)
 
-    if not (SPECTRAL_CFG.get("area_weighting", {}).get("enabled", True) and
-            x_coord is not None and y_coord is not None and is_geographic_grid(x_coord, y_coord)):
+    if not SPECTRAL_CFG.get("area_weighting", {}).get("enabled", True):
         return xr.DataArray(np.ones((field.sizes[y_dim],), dtype=np.float64),
                             dims=(y_dim,), coords={y_dim: field[y_dim]})
 
@@ -145,37 +132,141 @@ def _sqrt_area_weight(field: xr.DataArray) -> xr.DataArray:
     return s.rename(y_dim)
 
 
+# -----------------------------
+# Utilities (internal)
+# -----------------------------
+def _detrend_2d_wls(arr: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """
+    Core NumPy function for 2D WLS using the square root weight matrix formulation (FAST).
+    Weights are expected to be the area weights (cos(phi)).
+    """
+    assert arr.ndim == 2 and weights.ndim == 2
+    ny, nx = arr.shape
+
+    # Handle NaNs/Masking
+    nan_mask = np.isnan(arr)
+    d_obs_flat = arr[~nan_mask]
+
+    if d_obs_flat.size < 3:
+        return np.zeros((ny, nx), dtype=arr.dtype)
+
+    # Weights and Sqrt(Weights)
+    weights_flat = weights[~nan_mask]
+    sqrt_weights = np.sqrt(weights_flat)  # W^(1/2) diagonal entries
+
+    # Construct Design Matrix (G)
+    idx_y = np.repeat(np.arange(ny), nx)
+    idx_x = np.tile(np.arange(nx), ny)
+    G_full = np.stack([np.ones(ny * nx), idx_y, idx_x]).transpose()
+    G = G_full[~nan_mask.flatten(), :]
+
+    # Transform G and d_obs using W^(1/2) (Element-wise multiplication)
+    # Speedup by avoiding inverting the weight matrix
+    G_star = G * sqrt_weights[:, np.newaxis]
+    d_obs_star = d_obs_flat * sqrt_weights
+
+    # Solve the transformed OLS problem (G_star @ m_est = d_obs_star)
+    m_est, _, _, _ = npl.lstsq(G_star, d_obs_star, rcond=None)
+
+    # 5. Predict the fit (the plane) over the full grid and return
+    linear_fit = G_full @ m_est
+
+    return np.reshape(linear_fit, (ny, nx))
+
+
+def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
+            detrend_type="constant") -> xr.DataArray:
+    """
+    Detrend a DataArray
+
+    Parameters
+    ----------
+    da : xarray.DataArray
+        The data to detrend
+    weights: {xarray.DataArray, None}
+        Weight data before detrending and apply normalization
+
+    detrend_type : {'constant', 'linear'}
+        If ``constant``, a constant offset will be removed from each dim.
+        If ``linear``, a linear least-squares fit will be estimated and removed
+        from the data.
+
+    Returns
+    -------
+    da : xarray.DataArray
+        The detrended data.
+
+    Notes
+    -----
+    This function will act lazily in the presence of dask arrays on the input.
+    """
+    detrend_types = ["constant", "linear", None]
+    if detrend_type not in detrend_types:
+        raise NotImplementedError(f"Unknown  '{detrend_type}'. Expecting one of {detrend_types}")
+
+    if detrend_type is None:
+        return da.copy()
+
+    # Use the raw data for the fit (standard unweighted detrending)
+    data = da.copy()
+
+    # Get data spatial dimensions
+    dims = get_spatial_dims(da)
+
+    if weights is None:
+        # Create a DataArray of ones with the same dimensions and coordinates as the spatial slice
+        da_shape = tuple(da.sizes[dim] for dim in dims)
+        weights = xr.DataArray(np.ones(da_shape), dims=dims,
+                               coords={dim: da.coords[dim] for dim in dims})
+
+    # Calculate the fit (constant or plane)
+    fit_to_remove = 0
+
+    if detrend_type == "constant":
+        # Constant fit is the domain mean of the RAW field (weights are used in domain_mean)
+        # Weighted mean (using domain_mean assumes correct normalization)
+        fit_to_remove = domain_mean(data * weights) / domain_mean(weights)
+
+    elif detrend_type == "linear":
+        # Pass both the data and the (real or one-filled) weights to the WLS ufunc
+        linear_fit = xr.apply_ufunc(
+            _detrend_2d_wls,
+            da, weights,
+            input_core_dims=[dims, dims],
+            output_core_dims=[dims],
+            output_dtypes=[da.dtype],
+            vectorize=True,
+            dask='parallelized',
+            dask_gufunc_kwargs={"allow_rechunk": True}
+        )
+        fit_to_remove = linear_fit
+
+    return da - fit_to_remove
+
+
 def _apply_weighting(field: xr.DataArray) -> tuple[xr.DataArray, float, xr.DataArray]:
     """Apply taper and sqrt(area) weighting, detrend, and return weighted field, taper ms, and (mean)^2."""
 
-    # Get window and sqrt(area) weighting
-    window_1d, taper_ms = _taper_2d(field)
-    window_2d = window_1d * _sqrt_area_weight(field)
+    # -- Get taper and sqrt(area) weighting --
+    window_taper, taper_ms = _taper_2d(field)
+    window_area = _sqrt_area_weight(field)
+    window_total = window_taper * window_area
 
-    # Detrending (Restored for leakage control)
-    mode = SPECTRAL_CFG.get("detrend", {}).get("remove_mean", "none")
+    # -- Get detrending config --
+    detrend_type = SPECTRAL_CFG.get("detrend", {}).get("type", None)
 
-    field_zero = field.copy()
+    # -- Detrend field (f' = f - fit) --
+    detrended_field = detrend(
+        field,
+        weights=window_total ** 2,  # Use area weights for weighted mean calculation
+        detrend_type=detrend_type
+    )
 
-    drop_dims = get_spatial_dims(field)
-    mu_restore = domain_mean(xr.zeros_like(field).drop_vars(drop_dims, errors='ignore'))
+    # -- Calculate energy to restore at DC (mu_restore = domain_mean(field)) --
+    mu_restore = domain_mean(field)
 
-    if mode == "global":
-        ms_total_window = domain_mean(window_2d ** 2)
-        ms_total_window = float(ms_total_window)
-        ms_total_window = xr.where(ms_total_window < epsilon, 1.0, ms_total_window)
-
-        # T^2-weighted mean: mu_w2 = <f * T^2> / <T^2>
-        mu_w2 = domain_mean(field * window_2d ** 2) / ms_total_window
-
-        # Remove the weighted mean
-        field_zero = field - mu_w2
-
-        # Calculate the energy to restore: the square of the area-weighted mean of the ORIGINAL field
-        mu_restore = domain_mean(field)
-
-    # Return detrended, windowed field, taper mean-square, and the mean-square to restore
-    return field_zero * window_2d, taper_ms, mu_restore
+    # -- Apply the final total window (f_w = f' * W_total) --
+    return detrended_field * window_total, taper_ms, mu_restore
 
 
 # -----------------------------------------------------------------------------
@@ -271,9 +362,9 @@ def truncate(spectrum, truncation_scale=None):
     raise ValueError("Unknown type for truncation_scale. Expecting a float.")
 
 
-# -----------------------------
+# --------------------------------------------------------------------------------------------------
 # Spectra (scalar / cross / vector) with pre-FFT weighting (unchanged API)
-# -----------------------------
+# --------------------------------------------------------------------------------------------------
 
 def scalar_spectrum(field: xr.DataArray) -> xr.DataArray:
     """Return 2-D power spectrum |F(k)|^2 over the last two spatial axes.
@@ -324,10 +415,10 @@ def scalar_spectrum(field: xr.DataArray) -> xr.DataArray:
         kx_dc = power['kx'].values[0]
         ky_dc = power['ky'].values[ny // 2]  # Use the middle index for the shifted axis
 
-        # create index mask
+        # create DC index mask
         kdc_mask = (power['kx'] == kx_dc) & (power['ky'] == ky_dc)
 
-        # Add the mean product only where the mask is True.
+        # Add the mean
         power = power + mean_product.where(kdc_mask, other=0.0)
 
     return power
@@ -384,10 +475,10 @@ def scalar_cross_spectrum(field1: xr.DataArray, field2: xr.DataArray) -> xr.Data
         kx_dc = power['kx'].values[0]
         ky_dc = power['ky'].values[ny // 2]  # Use the middle index for the shifted axis
 
-        # create index mask
+        # create DC index mask
         kdc_mask = (power['kx'] == kx_dc) & (power['ky'] == ky_dc)
 
-        # Add the mean product only where the mask is True.
+        # Add the mean
         power = power + mean_product.where(kdc_mask, other=0.0)
 
     return power
