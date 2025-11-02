@@ -21,8 +21,8 @@ SPECTRAL_CFG = {
         #   - NW: time-bandwidth product (>= 0.5)
         #   - Kmax: number of DPSS tapers to generate (we use the first to keep API unchanged)
         #   - periodic=True uses FFT-friendly tapers (SciPy sym=False)
-        "x": "hanning",
-        "y": "hanning",
+        "x": "dpss",
+        "y": "dpss",
     },
     "area_weighting": {
         "enabled": True,  # enable sqrt(area) weighting on lon–lat grids
