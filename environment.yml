@@ -7,7 +7,7 @@ dependencies:
   # Core
   - python=3.12
   - numpy>=1.24
-  - scipy
+  - scipy>=1.8
   - pandas
   - xarray>=2024.5.0
   - bottleneck            # speeds up xarray reductions
