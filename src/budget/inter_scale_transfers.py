@@ -795,16 +795,21 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     )
 
     # Ensure the result fits in memory or compute in chunks along non-spatial dimensions
+    # Spatial dimensions are only rechunked if spatial plane times scales does not fit in memory
     if allow_rechunking:
+        # intermediate array size is increased by the sie of the radial distances (L / 2dx)
         scale_size = 1 if length_scales is None else len(length_scales)
         scale_size = increments.r.size * scale_size
 
         wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
-                                       output_scale_mult=scale_size,
-                                       # Target chunk size as 0.1% of total output size
-                                       target_chunk_ratio=0.001,
+                                       # preferred chunk sizes
+                                       preferred={'z': 1, 'time': 1},
                                        # Safer 50% threshold for Dask compute budget
                                        memory_threshold_ratio=0.25,
+                                       # extra memory for temporary arrays, i.e., padding
+                                       working_set_multiplier=42,
+                                       # extra memory required for kernel radial distance
+                                       output_scale_mult=scale_size,
                                        # No derivatives required here. Allow min z-chunk size = 1
                                        deriv_edge_order=0)
 
@@ -824,8 +829,6 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         verbose=verbose,
         transform_type="delta_u_cubed"
     ).where(~nan_mask)
-
-    print(integrand)
 
     # Apply normalized mollifier kernel
     energy_transfer_rate = scale_space_integral(

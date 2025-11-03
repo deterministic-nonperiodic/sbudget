@@ -284,6 +284,7 @@ def _real_fft2_shifted(a) -> np.ndarray:
 
     # rFFT core: half-plane along x. forward normalization to fulfill Parseval's theorem
     a_sc = np.fft.rfftn(a, axes=(-2, -1), norm="forward")
+
     # center ky only (symmetric)
     a_sc = np.fft.fftshift(a_sc, axes=(-2,))
 

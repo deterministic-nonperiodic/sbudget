@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import xarray as xr
@@ -54,15 +55,20 @@ def _cmd_compute(args) -> None:
     if mode_in in _MODE_ALIASES:
         print(f"[budget] NOTE: mode '{mode_in}' is deprecated; use '{mode}'")
 
+    print(f"[budget] RUNNING MODE: {mode}")
+
+    # store start time for profiling
+    start_time = time.monotonic()
+
     # Open dataset with normalized variable/dimension names
     ds = open_dataset(cfg)
 
     if mode == "spectral_budget":
-
+        print("[budget] Starting spectral budget calculation...")
         out = compute_budget(ds, cfg)
-
+        print("[budget] Spectral budget calculation complete.")
     elif mode == "scale_transfer":
-
+        print("[budget] Starting inter-scale transfer calculation...")
         kwargs = {
             "scales": getattr(cfg.compute, "scales", None),
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
@@ -71,14 +77,22 @@ def _cmd_compute(args) -> None:
         }
 
         out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
-
+        print("[budget] Inter-scale transfer calculation complete.")
     else:
         raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
                          f"Use 'spectral_budget' or 'scale_transfer'.")
 
     # Write output to disk
+    print(f"[budget] Writing output to {cfg.output.path}...")
     write_dataset(out, cfg)
-    print(f"Wrote: {cfg.output.path}")
+    print(f"[budget] Wrote: {cfg.output.path}")
+
+    # --- End Main Computation Block and Profiling ---
+    end_time = time.monotonic()
+    duration = end_time - start_time
+
+    # Print the profiling information
+    print(f"\n[budget] PROFILE: Total time elapsed: {duration:.2f} seconds")
 
 
 def _cmd_inspect(args) -> None:
@@ -149,8 +163,7 @@ def main(argv: list[str] | None = None) -> None:
                    "Overwrite output", "Do not overwrite output")
 
     # compute
-    p_compute.add_argument("--mode", choices=["spectral_budget", "scale_transfer"],
-                           default="spectral_budget")
+    p_compute.add_argument("--mode", choices=["spectral_budget", "scale_transfer"])
     p_compute.add_argument("--scales", type=_csv_or_list,
                            help="Wavelengths in meters, e.g. '1000,5000,10000'")
 
@@ -192,8 +205,7 @@ def main(argv: list[str] | None = None) -> None:
     p_inspect.add_argument("--engine", choices=["h5netcdf", "netcdf4", "scipy"])
     p_inspect.add_argument("--levels", type=_csv_or_list,
                            help="Levels in vertical axis units, e.g. '1000,5000,10000'")
-    p_inspect.add_argument("--mode", choices=["spectral_budget", "scale_transfer"],
-                           default="spectral_budget")
+    p_inspect.add_argument("--mode", choices=["spectral_budget", "scale_transfer"])
 
     p_inspect.set_defaults(func=_cmd_inspect)
 

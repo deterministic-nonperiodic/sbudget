@@ -383,7 +383,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     y_dim, x_dim = get_spatial_dims(ds)
     space_dims = ("z", y_dim, x_dim)
 
-    print(f"Resolved spatial dimensions {space_dims}")
+    print(f"[budget] Resolved spatial dimensions {space_dims}")
 
     # Apply consistent rechunking:
     rechunk_spatial = getattr(cfg.compute, "rechunk_spatial", False)
@@ -391,11 +391,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     if allow_rechunking:
         ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
-                                     # Target chunk size as 5% of total output size
-                                     target_chunk_ratio=0.5,
                                      # Use up to 80% of available memory
                                      memory_threshold_ratio=0.8,
-                                     deriv_edge_order=2, rechunk_spatial=rechunk_spatial)
+                                     # extra memory for temporary arrays, i.e., linear detrending
+                                     working_set_multiplier=1,
+                                     deriv_edge_order=2,
+                                     rechunk_spatial=rechunk_spatial)
 
     # After open_dataset(), variable names are normalized to logical names.
     u = ds["u"]
@@ -410,10 +411,10 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # dx, dy infer if not set
     if cfg.compute.dx is None or cfg.compute.dy is None:
         dx, dy = infer_grid_resolution(ds)
-        print(f"Estimated resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
+        print(f"[budget] Estimated resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
     else:
         dx, dy = cfg.compute.dx, cfg.compute.dy
-        print(f"Specified resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
+        print(f"[budget] Specified resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
 
     # --- Thermodynamics ---
     theta = ds.get("theta")

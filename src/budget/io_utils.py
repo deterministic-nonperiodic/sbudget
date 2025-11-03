@@ -2,7 +2,7 @@ import math
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Optional, Dict, List, Union
+from typing import Tuple, Optional, Dict, List, Union, Iterable
 
 import numpy as np
 import psutil
@@ -49,37 +49,57 @@ def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
 # --------------------------------------------------------------------
 # --- START OF MEMORY ESTIMATION UTILITIES ---
 # --------------------------------------------------------------------
-WORKING_SET_MULTIPLIER = 12  # Heuristic: 5x to 12x the output size in temporary working memory
-TOTAL_SIZE_THRESHOLD = 0.8  # Fixed threshold (80%) for the initial total size check
+TOTAL_SIZE_THRESHOLD = 0.8  # Fixed threshold (80%) for the total size check
 
 
-def estimate_dataset_bytes(ds: xr.Dataset) -> int:
+def estimate_dataset_bytes(ds: xr.Dataset,
+                           exclude_dims: Union[str, Iterable[str], None] = None) -> int:
     """
     Estimate working-set size (bytes) for a dataset.
 
-    - For Dask-backed vars: use the largest chunk along each dimension.
+    - For Dask-backed vars: use the largest chunk along each dimension,
+      excluding dimensions specified by `exclude_dims`.
     - For NumPy-backed vars: use the full array size.
     """
     total = 0
+
+    if isinstance(exclude_dims, str):
+        exclude_dims = [exclude_dims]
+    elif exclude_dims is None:
+        exclude_dims = []
+
+    # Convert to set for fast lookup
+    exclude_set = set(exclude_dims)
+
     for var in ds.data_vars.values():
         item_size = np.dtype(var.dtype).itemsize
-        chunks = getattr(getattr(var, "data", None), "chunks", None)
-        if chunks is not None:
-            # dask-backed → product of max chunk sizes per dim
-            max_elems = 1
-            for dim_chunks in chunks:
-                max_elems *= max(dim_chunks)
-            var_bytes = max_elems * item_size
-        else:
-            # eager numpy-backed → whole array
-            var_bytes = int(var.size) * item_size
-        total += var_bytes
+        chunks = getattr(getattr(var, "data", None), "chunks", [var.sizes[dim] for dim in var.dims])
+
+        # dask-backed → product of max chunk sizes per dim, respecting exclusion
+        max_elems = 1
+
+        for dim_name, dim_chunks in zip(var.dims, chunks):
+
+            if dim_name in exclude_set:
+                # Excluded dimension (e.g., 'time', 'level') is assumed to be iterated over.
+                # The max working memory chunk size for this dim is 1 (for an unchunked dim).
+                max_chunk_size = 1
+            else:
+                # Included dimension: use the largest chunk size, as this determines
+                # the maximum memory held for one computation slice.
+                max_chunk_size = max(np.atleast_1d(dim_chunks))
+
+            max_elems *= max_chunk_size
+
+        total += max_elems * item_size
+
     return int(total)
 
 
 def fits_in_memory(ds: xr.Dataset,
                    expansion_factor: int = 1,
-                   ratio_to_use: float = TOTAL_SIZE_THRESHOLD
+                   ratio_to_use: float = TOTAL_SIZE_THRESHOLD,
+                   exclude_dims: Union[Iterable[str], str, None] = None,
                    ) -> Tuple[bool, int, int]:
     """
     Check if the dataset (possibly expanded along length_scale) fits in memory,
@@ -92,9 +112,10 @@ def fits_in_memory(ds: xr.Dataset,
     ds = ds if isinstance(ds, xr.Dataset) else ds.to_dataset()
 
     # Base size estimate
-    dataset_size = estimate_dataset_bytes(ds) * max(1, int(expansion_factor))
+    expansion_factor = max(1, int(expansion_factor))
+    dataset_size = estimate_dataset_bytes(ds, exclude_dims=exclude_dims) * expansion_factor
 
-    # NOTE: psutil is used here, but mocked above if unavailable.
+    # Estimate available system memory
     available_memory = psutil.virtual_memory().available
 
     # Calculate the memory limit based on the provided ratio
@@ -135,8 +156,8 @@ def ensure_optimal_chunking(
         ds: xr.Dataset,
         spatial_dims: Tuple[str, str] = ("lat", "lon"),
         vertical_dim: str = "z",
-        target_chunk_ratio: float = 0.005,  # Target chunk size as % of total output size
-        memory_threshold_ratio: float = 0.25,  # Safer 25% threshold for Dask compute budget
+        memory_threshold_ratio: float = TOTAL_SIZE_THRESHOLD,
+        working_set_multiplier: int = 1,
         preferred: Optional[Dict[str, int]] = None,
         deriv_edge_order: int = 2,
         verbose: bool = True,
@@ -145,148 +166,122 @@ def ensure_optimal_chunking(
         scale_dim: Optional[str] = None
 ) -> xr.Dataset:
     """
-    Rechunk for fast 2-D FFTs, and ensures chunks are small enough to accommodate
-    a multiplication factor (like a 'scale' dimension) in the final computation.
+    Rechunk for fast 2-D FFTs/spatial shifts, and ensures chunks are small enough to accommodate
+    a multiplication factor due to an intermediate/temporary dimension (like a 'scale') in the final computation.
 
-    Includes dynamic working set estimation to conditionally enable spatial chunking.
+    Prioritizes full spatial chunks, falling back to 'auto' spatial chunking only if
+    the non-spatial working set (T/Z * output_scale_mult * spatial_size) exceeds the memory budget.
     """
     preferred = dict(preferred or {})
     y, x = spatial_dims
+
+    # Input Validation and Budget Calculation
     if y not in ds.dims or x not in ds.dims:
         raise ValueError(f"Spatial dims {spatial_dims} must exist in dataset dims {tuple(ds.dims)}")
 
-    # Required minimum chunk size for vertical dimension
-    min_required_z = deriv_edge_order + 1
+    # Dimensions to exclude from memory estimation (T/Z/Other)
+    exclude_dims = [str(d) for d in ds.dims if d not in spatial_dims]
 
-    # Determine the Dask worker compute memory budget (e.g., 25% of total available)
-    available_memory = psutil.virtual_memory().available
-    max_memory_budget = int(memory_threshold_ratio * available_memory)
-
-    # 1. Initial Memory Check: Is the *entire* output too large? (Uses the less conservative 80% threshold)
-    fits_total, total_output_bytes, max_allowed_total_bytes = fits_in_memory(
-        ds,
-        expansion_factor=output_scale_mult,
-        ratio_to_use=TOTAL_SIZE_THRESHOLD
+    no_spatial_chunking, plane_output_bytes, max_memory_budget = fits_in_memory(
+        ds, exclude_dims=exclude_dims,
+        expansion_factor=output_scale_mult * working_set_multiplier,
+        ratio_to_use=memory_threshold_ratio
     )
 
-    if not fits_total:
-        raise MemoryError(
-            f"The estimated total output size (factored by x{output_scale_mult}) "
-            f"exceeds the allowed system memory ({max_allowed_total_bytes / 1024 ** 2:.1f} MB, "
-            f"using {TOTAL_SIZE_THRESHOLD * 100:.0f}% threshold). Reduce data size."
-        )
+    # Determine Spatial Chunking Plan (Prioritizing high performance)
+    plan: Dict[str, Union[str, int, Tuple[int, ...]]] = {}
 
-    # Calculate item size and spatial plane size for memory checks
-    item_size = max(
-        (int(getattr(v.data, "dtype", np.dtype("float64")).itemsize) for v in
-         ds.data_vars.values()),
-        default=8,
-    )
-    bytes_spatial_plane_in = item_size * ds.sizes[y] * ds.sizes[x]
-    bytes_plane_out = bytes_spatial_plane_in * max(1,
-                                                   output_scale_mult)  # One full (y,x) plane of OUTPUT data
-
-    # 2. CRITICAL SPATIAL CHUNKING CHECK (LAST RESORT)
-    # Check if the peak memory requirement for the ABSOLUTE SMALLEST T/Z CHUNK
-    # on the full spatial plane (lat=-1, lon=-1) exceeds the budget.
-
-    # Smallest T/Z: T=1 (if exists), Z=min_required_z (if exists)
-    min_t_size = 1 if "time" in ds.dims else 1
-    min_z_size = min_required_z if vertical_dim in ds.dims else 1
-
-    # Peak Working Set = (Min T*Z planes) * (Output Plane Size) * (Working Set Multiplier)
-    estimated_peak_min_tz = min_t_size * min_z_size * bytes_plane_out * WORKING_SET_MULTIPLIER
-
-    # This comparison determines if we are forced to spatially tile
-    needs_spatial_chunking = estimated_peak_min_tz > max_memory_budget
-
-    # 3. Determine Spatial Chunking Plan (Prioritizing performance)
-    if rechunk_spatial or needs_spatial_chunking:
-        # Fallback to safer, but slower, spatial tiling
-        spatial_chunks = {y: "auto", x: "auto"}
-        if verbose and needs_spatial_chunking:
-            print(f"[chunking] WARNING: Absolute minimum T/Z working set "
-                  f"({estimated_peak_min_tz / 1024 ** 2:.1f} MB) "
-                  f"exceeds allowed compute budget ({max_memory_budget / 1024 ** 2:.1f} MB). "
-                  f"Enabling spatial chunking as a last resort to prevent OOM errors.")
+    if not rechunk_spatial and no_spatial_chunking:
+        # High performance plan: no spatial chunking (-1 means one chunk along that dim)
+        plan.update({y: -1, x: -1})
     else:
-        # High performance plan: no spatial chunking
-        spatial_chunks = {y: -1, x: -1}
+        # Fallback to safer, slower spatial tiling
+        plan.update({y: "auto", x: "auto"})
+        if verbose:
+            print(f"[chunking] WARNING: Estimated working set for full spatial plane "
+                  f"exceeds allowed compute budget ({max_memory_budget / 1024 ** 2:.1f} MB). "
+                  f"Enabling spatial chunking ('auto') as a last resort.")
 
-    plan: Dict[str, Union[int, Tuple[int, ...]]] = spatial_chunks
-
-    # 4. T and Z Chunking (Maximizing non-spatial chunks to fit the target_chunk_ratio budget)
-    # Calculate the target size (bytes) for a single chunk (5% of total output size)
-    dynamic_target_bytes = int(total_output_bytes * target_chunk_ratio)
-    target_bytes = max(int(64 * 1024 ** 2), dynamic_target_bytes)
-    target_chunk_mb = target_bytes / 1024 ** 2
-
-    # budget_mult is the max number of (time*z) planes we can fit into the target size
-    budget_mult = max(1, target_bytes // max(1, bytes_plane_out))
-
-    t_guess = ds.sizes.get("time", 1)
-    z_guess = ds.sizes.get(vertical_dim, 1)
-
+    # T and Z Chunking (Balancing non-spatial chunks within budget)
     needs_t = "time" in ds.dims
     needs_z = vertical_dim in ds.dims
 
+    t_guess = ds.sizes.get("time", getattr(preferred, "time", 1))
+    z_guess = ds.sizes.get(vertical_dim, getattr(preferred, vertical_dim, 1))
+
+    # Calculate the max number of T*Z planes (units) we can fit into the budget
+    if plane_output_bytes > 0:
+        budget_mult = max(1, max_memory_budget // plane_output_bytes)
+    else:
+        # If the cost is zero (e.g., small arrays), use the total size as the budget limit
+        budget_mult = max(t_guess * z_guess, 1)
+
+    # Balance T and Z chunks (Prioritize balance using near-sqrt split)
     if needs_t and needs_z:
-        # near-sqrt split within budget
+        # Split budget by sqrt to keep aspect ratio near 1
         z_chunk_target = min(z_guess, max(1, int(math.sqrt(budget_mult))))
         t_chunk_target = max(1, budget_mult // max(1, z_chunk_target))
-        t_chunk = min(t_guess, max(1, t_chunk_target))
+        t_chunk_final = min(t_guess, max(1, t_chunk_target))
+        z_chunk_final = z_chunk_target
     elif needs_t:
-        t_chunk = min(t_guess, budget_mult)
-        z_chunk_target = None
+        t_chunk_final = min(t_guess, budget_mult)
+        z_chunk_final = None
     elif needs_z:
-        t_chunk = None
-        z_chunk_target = min(z_guess, budget_mult)
+        t_chunk_final = None
+        z_chunk_final = min(z_guess, budget_mult)
     else:
-        t_chunk = None
-        z_chunk_target = None
+        t_chunk_final = None
+        z_chunk_final = None
 
-    if needs_t:
-        plan["time"] = max(1, int(t_chunk))
+    if needs_t and "time" not in preferred:
+        plan["time"] = max(1, int(t_chunk_final))
 
-    # Build explicit vertical chunks so every chunk >= min_required_z
-    if needs_z:
-        if z_chunk_target is None:
-            if needs_t and "time" in plan:
-                z_chunk_target = max(1, budget_mult // max(1, plan["time"]))
-            else:
-                z_chunk_target = min(z_guess, budget_mult)
+    # Build explicit vertical chunks (incorporating min_required_z)
+    if needs_z and vertical_dim not in preferred:
+        min_required_z = deriv_edge_order + 1
+
+        # Calculate the final target based on the remaining budget if 'time' was chunked
+        if t_chunk_final is not None and t_chunk_final < t_guess:
+            # Re-estimate z budget based on chosen time chunk
+            z_budget = budget_mult // t_chunk_final
+            z_chunk_target = min(z_guess, max(1, z_budget))
+        elif z_chunk_final is not None:
+            z_chunk_target = z_chunk_final
+        else:
+            z_chunk_target = min(z_guess, budget_mult)
 
         z_chunk_target = max(min_required_z, int(z_chunk_target))
 
         z_chunks = _balanced_chunks(z_guess, z_chunk_target, min_required_z)
         plan[vertical_dim] = z_chunks  # explicit tuple of sizes
 
-    # any extra dims from preferred (don’t override spatial/time/z decisions)
+    # Handle remaining dimensions (preferred/scale)
     for d, c in preferred.items():
-        if d not in plan and d in ds.dims:
+        if d in ds.dims:
             plan[d] = max(1, min(int(c), ds.sizes[d]))
 
-    # Add the new scale dimension to the plan, if it's the dimension we need to iterate over
-    if scale_dim is not None and scale_dim not in plan:
-        plan[scale_dim] = 1  # Assuming we want to iterate over the new dimension
+    # Add the new scale dimension (usually iterated over)
+    if scale_dim is not None and scale_dim in ds.dims and scale_dim not in plan:
+        plan[scale_dim] = 1
 
+    # Execute and Log
     out = ds.unify_chunks().chunk(plan)
 
     if verbose:
         # --- Print estimation for debugging ---
-        # Calculate effective chunk sizes for estimation
         z_eff = 1
         if needs_z:
             zv = plan[vertical_dim]
             z_eff = (sum(zv) / len(zv)) if isinstance(zv, (tuple, list)) else int(zv)
         t_eff = int(plan.get("time", 1))
 
-        # Check if spatial dimensions were chunked (if so, estimate average chunk size)
-        if isinstance(plan.get(y), str) and plan[y] == "auto":
+        if plan.get(y) == "auto":
             spatial_msg = "(auto-tiled)"
-            est_out = target_bytes
+            # When spatial is 'auto', the output chunk size is limited by the budget
+            est_out = max_memory_budget / working_set_multiplier
         else:
-            est_out = bytes_plane_out * max(1, t_eff) * max(1, z_eff)
+            # Estimate output based on full plane size * max non-spatial chunks
+            est_out = plane_output_bytes * max(1, t_eff) * max(1, z_eff)
             spatial_msg = "(full plane)"
 
         msg_parts: List[str] = []
@@ -298,13 +293,13 @@ def ensure_optimal_chunking(
             else:
                 msg_parts.append(f"{d}={c}")
 
-        # Add the scale dimension to the message for context
         if output_scale_mult > 1:
-            scale_msg = f"{scale_dim or 'scale'}=x{output_scale_mult} "
+            scale_msg = f"Scale=x{output_scale_mult}"
             msg_parts.append(scale_msg)
 
         print(
-            f"[chunking] Dynamic Target ({target_chunk_ratio:.1%} of total) = {target_chunk_mb:.1f} MB. "
+            f"[chunking] Target Working Set ({memory_threshold_ratio:.1%} of total)"
+            f" = {max_memory_budget / 1024 ** 2:.1f} MB. "
             f"Spatial policy: {spatial_msg}. Plan: {', '.join(msg_parts)} | "
             f"Output Chunk Est: ~{est_out / 1024 ** 2:.1f} MB")
 
