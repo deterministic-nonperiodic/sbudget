@@ -347,7 +347,7 @@ def ensure_optimal_chunking(
         msg_parts: List[str] = []
         for d, c in plan.items():
             if isinstance(c, (tuple, list)):
-                msg_parts.append(f"{d}={list(c)}")
+                msg_parts.append(f"{d}=(min: {min(c)}, max: {max(c)})")
             elif c == -1:
                 msg_parts.append(f"{d}=all")
             else:
