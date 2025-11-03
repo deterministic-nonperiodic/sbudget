@@ -181,7 +181,8 @@ def ensure_optimal_chunking(
         verbose: bool = True,
         rechunk_spatial: bool = False,  # Kept as a manual override
         output_scale_mult: int = 1,
-        scale_dim: Optional[str] = None
+        scale_dim: Optional[str] = None,
+        desired_chunk_size_mb: Optional[float] = None  # Added new parameter
 ) -> xr.Dataset:
     """
     Rechunk the dataset to ensure chunks are small enough to fit the memory budget,
@@ -230,12 +231,43 @@ def ensure_optimal_chunking(
     t_guess = ds.sizes.get("time", 1)
     z_guess = ds.sizes.get(vertical_dim, 1)
 
-    # Calculate the max number of T*Z planes (units) we can fit into the budget
+    # --- Determine Budget Multiplier (Number of T*Z planes per chunk) ---
+
+    # Base budget based on system memory
+    system_budget_mult: int
     if plane_output_bytes > 0:
-        budget_mult = max(1, max_memory_budget // plane_output_bytes)
+        system_budget_mult = max(1, max_memory_budget // plane_output_bytes)
     else:
         # Fallback for very small arrays or safety
-        budget_mult = max(t_guess * z_guess, 1)
+        system_budget_mult = max(t_guess * z_guess, 1)
+
+    final_budget_mult = system_budget_mult
+
+    # Apply user-defined chunk size limit if provided
+    if desired_chunk_size_mb is not None and desired_chunk_size_mb > 0:
+        # Convert the desired chunk *output* size to bytes
+        # We need to divide by the working_set_multiplier and output_scale_mult
+        # to get the number of planes that fit into the desired final output size.
+
+        # Calculate the size of the *output* per plane:
+        output_cost_per_non_spatial_unit = plane_output_bytes / (
+                output_scale_mult * working_set_multiplier)
+
+        if output_cost_per_non_spatial_unit > 0:
+            desired_chunk_size_bytes = desired_chunk_size_mb * 1024 ** 2
+
+            # user_budget_mult is the max number of T*Z planes that fit into the desired output size
+            user_budget_mult = max(1,
+                                   int(desired_chunk_size_bytes // output_cost_per_non_spatial_unit))
+
+            # The final budget is the minimum of the system capacity and the user's preference
+            final_budget_mult = min(system_budget_mult, user_budget_mult)
+
+            if verbose and final_budget_mult < system_budget_mult:
+                print(f"[chunking] INFO: Budget reduced to {final_budget_mult} planes/chunk "
+                      f"due to desired_chunk_size_mb={desired_chunk_size_mb:.1f} MB.")
+
+    budget_mult = final_budget_mult
 
     t_chunk_final: Optional[int] = None
     z_chunk_final: Optional[int] = None
@@ -325,9 +357,15 @@ def ensure_optimal_chunking(
             scale_msg = f"Scale=x{output_scale_mult}"
             msg_parts.append(scale_msg)
 
+        # Log the final budget used
+        if final_budget_mult != system_budget_mult:
+            budget_limit_msg = f" (limited by {desired_chunk_size_mb:.1f} MB)"
+        else:
+            budget_limit_msg = ""
+
         print(
             f"[chunking] Target Working Set ({memory_threshold_ratio:.1%} of total)"
-            f" = {max_memory_budget / 1024 ** 2:.1f} MB. "
+            f" = {max_memory_budget / 1024 ** 2:.1f} MB{budget_limit_msg}. "
             f"Spatial policy: {spatial_msg}. Plan: {', '.join(msg_parts)} | "
             f"Output Chunk Est: ~{est_out / 1024 ** 2:.1f} MB")
 
