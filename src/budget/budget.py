@@ -392,9 +392,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     if allow_rechunking:
         ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
                                      # limit chunk size (MB)
-                                     desired_chunk_size_mb=64,
+                                     desired_chunk_size_mb=128,
                                      # Use up to 80% of available memory
-                                     memory_threshold_ratio=0.25,
+                                     memory_threshold_ratio=0.5,
                                      # extra memory for temporary arrays, i.e., linear detrending
                                      working_set_multiplier=2,
                                      deriv_edge_order=2,
