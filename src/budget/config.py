@@ -31,6 +31,7 @@ class ComputeConfig:
     rechunk_spatial: bool = True  # ensure (y,x) are single chunks before FFTs
     dask_allow_rechunk: bool = True  # allow apply_ufunc to rechunk as fallback
     scheduler: str | None = None
+    chunksizes: float | None = None # approximate chunk size in MiB for non-spatial dimensions
 
 
 @dataclass
@@ -108,26 +109,40 @@ def apply_overrides(cfg, args):
     # compute
     _set_nested(cfg, ["compute", "mode"], _get(args, "mode"))
     scales = _get(args, "scales")
-    if scales: _set_nested(cfg, ["compute", "scales"], _to_float_list(scales))
+    if scales:
+        _set_nested(cfg, ["compute", "scales"], _to_float_list(scales))
 
     levels = _get(args, "levels")
-    if levels: _set_nested(cfg, ["compute", "levels"], _to_float_list(levels))
+    if levels:
+        _set_nested(cfg, ["compute", "levels"], _to_float_list(levels))
 
     if norm is not None or norm_cli == "none":
         _set_nested(cfg, ["compute", "norm"], norm)
+
     dx = _get(args, "dx")
     dy = _get(args, "dy")
-    if dx is not None: _set_nested(cfg, ["compute", "dx"], float(dx))
-    if dy is not None: _set_nested(cfg, ["compute", "dy"], float(dy))
+    if dx is not None:
+        _set_nested(cfg, ["compute", "dx"], float(dx))
+    if dy is not None:
+        _set_nested(cfg, ["compute", "dy"], float(dy))
 
     cum = _get(args, "cumulative")
-    if cum is not None: _set_nested(cfg, ["compute", "cumulative"], bool(cum))
+    if cum is not None:
+        _set_nested(cfg, ["compute", "cumulative"], bool(cum))
     _set_nested(cfg, ["compute", "transfer_form"], _get(args, "transfer_form"))
 
     rs = _get(args, "rechunk_spatial")
-    if rs is not None: _set_nested(cfg, ["compute", "rechunk_spatial"], bool(rs))
+    if rs is not None:
+        _set_nested(cfg, ["compute", "rechunk_spatial"], bool(rs))
+
     dar = _get(args, "dask_allow_rechunk")
-    if dar is not None: _set_nested(cfg, ["compute", "dask_allow_rechunk"], bool(dar))
+    if dar is not None:
+        _set_nested(cfg, ["compute", "dask_allow_rechunk"], bool(dar))
+
+    dar = _get(args, "chunksizes")
+    if dar is not None:
+        _set_nested(cfg, ["compute", "chunksizes"], float(dar))
+
     _set_nested(cfg, ["compute", "scheduler"], _get(args, "scheduler"))
 
     # variables

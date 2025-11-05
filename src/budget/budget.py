@@ -388,11 +388,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # Apply consistent rechunking:
     rechunk_spatial = getattr(cfg.compute, "rechunk_spatial", False)
     allow_rechunking = getattr(cfg.compute, "dask_allow_rechunk", True)
+    chunk_size_mb = getattr(cfg.compute, "chunksizes", 128)
 
     if allow_rechunking:
         ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
                                      # limit chunk size (MB)
-                                     desired_chunk_size_mb=128,
+                                     desired_chunk_size_mb=float(chunk_size_mb),
                                      # Use up to 80% of available memory
                                      memory_threshold_ratio=0.5,
                                      # extra memory for temporary arrays, i.e., linear detrending

@@ -73,6 +73,7 @@ def _cmd_compute(args) -> None:
             "scales": getattr(cfg.compute, "scales", None),
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
             "allow_rechunking": cfg.compute.dask_allow_rechunk,
+            "chunksizes": cfg.compute.chunksizes,
             "verbose": True
         }
 
@@ -174,6 +175,7 @@ def main(argv: list[str] | None = None) -> None:
                            help="FFT normalization ('none' to clear)")
     p_compute.add_argument("--dx", type=float)
     p_compute.add_argument("--dy", type=float)
+
     _add_bool_pair(p_compute, "cumulative", "cumulative",
                    "Enable cumulative spectra", "Disable cumulative spectra")
     p_compute.add_argument("--transfer-form", choices=["invariant", "flux", "conservative"])
@@ -181,6 +183,9 @@ def main(argv: list[str] | None = None) -> None:
                    "Ensure single spatial chunks for FFTs", "Do not rechunk spatial dims")
     _add_bool_pair(p_compute, "dask-allow-rechunk", "dask_allow_rechunk",
                    "Allow apply_ufunc to rechunk", "Disallow automatic rechunking")
+
+    p_compute.add_argument("--chunksizes", type=float, help="")
+
     p_compute.add_argument("--scheduler", choices=["threads", "processes", "distributed"])
 
     # variables (name mapping overrides)

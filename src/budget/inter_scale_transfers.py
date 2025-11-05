@@ -754,6 +754,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     length_scales = kwargs.get("scales", None)
     ls_chunk_size = kwargs.get("ls_chunk_size", -1)
     allow_rechunking = kwargs.get("allow_rechunking", True)
+    chunk_size_mb = kwargs.get("chunksizes", 64)
 
     # Process length scales input
     if length_scales is None:
@@ -803,9 +804,9 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
         wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
                                        # preferred chunk sizes
-                                       preferred={'z': 1, 'time': 1},  # re-adjusted to target
+                                       # preferred={'z': 1, 'time': 1},  # re-adjusted to target
                                        # limit chunk size (MB)
-                                       desired_chunk_size_mb=64,
+                                       desired_chunk_size_mb=float(chunk_size_mb),
                                        # Safer 50% threshold for Dask compute budget
                                        memory_threshold_ratio=0.25,
                                        # extra memory for temporary arrays, i.e., padding
