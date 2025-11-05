@@ -203,7 +203,7 @@ def ensure_optimal_chunking(
     exclude_dims = [str(d) for d in ds.dims if d not in spatial_dims]
 
     # Check if a single full spatial plane (multiplied by working set factor) fits
-    spatial_fits, plane_output_bytes, max_memory_budget = fits_in_memory(
+    spatial_fits, plane_working_set_bytes, max_memory_budget = fits_in_memory(
         ds, exclude_dims=exclude_dims,
         expansion_factor=output_scale_mult * working_set_multiplier,
         ratio_to_use=memory_threshold_ratio
@@ -215,16 +215,38 @@ def ensure_optimal_chunking(
     if not rechunk_spatial and spatial_fits:
         # High performance plan: no spatial chunking (-1 means one chunk along that dim)
         plan.update({y: -1, x: -1})
+        spatial_msg = "(full plane)"
     else:
-        # Fallback to safer, slower spatial tiling
-        plan.update({y: "auto", x: "auto"})
+        # Tiling is required (either explicitly requested or because spatial_fits is False)
+
+        # Calculate the reduction factor needed if spatial chunking is memory-driven
+        needed_reduction = 1.0
+        if plane_working_set_bytes > 0 and not spatial_fits:
+            # How many pieces the working set needs to be broken into (N*N tiles)
+            needed_reduction = plane_working_set_bytes / max_memory_budget
+
+        # Calculate the number of square tiles needed along one axis (N_tiles_per_axis)
+        # We need N_tiles_per_axis^2 >= needed_reduction
+        N_tiles_per_axis = max(1, math.ceil(math.sqrt(needed_reduction)))
+
+        # Calculate the chunk size for explicit tiling
+        C_y = math.ceil(ds.sizes[y] / N_tiles_per_axis)
+        C_x = math.ceil(ds.sizes[x] / N_tiles_per_axis)
+
+        plan.update({y: int(C_y), x: int(C_x)})
+
+        spatial_msg = f"({N_tiles_per_axis}x{N_tiles_per_axis} explicit tiles, size {int(C_y)}x{int(C_x)})"
+
         if verbose and not spatial_fits:
             print(f"[chunking] WARNING: Estimated working set for full spatial plane "
                   f"exceeds allowed compute budget ({max_memory_budget / 1024 ** 2:.1f} MB). "
-                  f"Enabling spatial chunking ('auto') as a last resort.")
+                  f"Applying spatial tiling: {N_tiles_per_axis}x{N_tiles_per_axis} tiles to fit budget.")
+        elif verbose and rechunk_spatial:
+            print(
+                f"[chunking] INFO: Spatial rechunking explicitly requested. Applying tiling: "
+                f"{N_tiles_per_axis}x{N_tiles_per_axis} tiles.")
 
     # 2. T and Z Chunking (Balancing non-spatial chunks within budget)
-
     needs_t = "time" in ds.dims
     needs_z = vertical_dim in ds.dims
 
@@ -232,11 +254,13 @@ def ensure_optimal_chunking(
     z_guess = ds.sizes.get(vertical_dim, 1)
 
     # --- Determine Budget Multiplier (Number of T*Z planes per chunk) ---
-
     # Base budget based on system memory
     system_budget_mult: int
-    if plane_output_bytes > 0:
-        system_budget_mult = max(1, max_memory_budget // plane_output_bytes)
+    # Calculate the size of the OUTPUT of a single T/Z plane (full spatial)
+    output_plane_bytes = plane_working_set_bytes / (output_scale_mult * working_set_multiplier)
+
+    if output_plane_bytes > 0:
+        system_budget_mult = max(1, np.ceil(max_memory_budget // output_plane_bytes))
     else:
         # Fallback for very small arrays or safety
         system_budget_mult = max(t_guess * z_guess, 1)
@@ -245,20 +269,13 @@ def ensure_optimal_chunking(
 
     # Apply user-defined chunk size limit if provided
     if desired_chunk_size_mb is not None and desired_chunk_size_mb > 0:
-        # Convert the desired chunk *output* size to bytes
-        # We need to divide by the working_set_multiplier and output_scale_mult
-        # to get the number of planes that fit into the desired final output size.
 
-        # Calculate the size of the *output* per plane:
-        output_cost_per_non_spatial_unit = plane_output_bytes / (
-                output_scale_mult * working_set_multiplier)
-
-        if output_cost_per_non_spatial_unit > 0:
+        if output_plane_bytes > 0:
             desired_chunk_size_bytes = desired_chunk_size_mb * 1024 ** 2
 
             # user_budget_mult is the max number of T*Z planes that fit into the desired output size
             user_budget_mult = max(1,
-                                   int(desired_chunk_size_bytes // output_cost_per_non_spatial_unit))
+                                   int(desired_chunk_size_bytes // output_plane_bytes))
 
             # The final budget is the minimum of the system capacity and the user's preference
             final_budget_mult = min(system_budget_mult, user_budget_mult)
@@ -325,24 +342,38 @@ def ensure_optimal_chunking(
     if verbose:
         # --- Print estimation for debugging ---
         # Note: These values rely on the calculated 'plan' dict
-        z_eff = 1
+        z_eff = 1.0
         if needs_z and vertical_dim in plan:
             zv = plan[vertical_dim]
             z_eff = (sum(zv) / len(zv)) if isinstance(zv, (tuple, list)) else int(
                 zv)  # type: ignore
         t_eff = int(plan.get("time", 1))
 
-        if plan.get(y) == "auto":
-            spatial_msg = "(auto-tiled)"
-            # When spatial is 'auto', the output chunk size is limited by the budget
-            est_out = max_memory_budget / working_set_multiplier
+        # Check if spatial was tiled (i.e., not -1 for both)
+        is_tiled = not (plan.get(y) == -1 and plan.get(x) == -1)
+
+        if is_tiled:
+            # Estimate output based on the resulting T/Z chunks multiplied by the size of one spatial tile.
+            C_y = plan.get(y, ds.sizes[y])
+            C_x = plan.get(x, ds.sizes[x])
+
+            # Use the first chunk size if it's a tuple for the estimate
+            if isinstance(C_y, (tuple, list)): C_y = C_y[0]
+            if isinstance(C_x, (tuple, list)): C_x = C_x[0]
+
+            # Area of one tile / Area of full plane
+            area_ratio_tiled = (C_y * C_x) / (ds.sizes[y] * ds.sizes[x])
+
+            # Output size of one T/Z plane chunk: (output_plane_bytes * area_ratio_tiled)
+            output_bytes_per_chunk_xy = output_plane_bytes * area_ratio_tiled
+
+            # Total estimated output size: Output_per_T/Z_Chunk * T_count * Z_count
+            est_out = output_bytes_per_chunk_xy * max(1, t_eff) * max(1, z_eff)
+
         else:
-            # Estimate output based on full plane size * max non-spatial chunks
-            # Note: plane_output_bytes already includes the output_scale_mult and working_set_multiplier
-            est_out = plane_output_bytes * max(1, t_eff) * max(1, z_eff)
-            # Revert est_out back to output size (not working set size) for logging clarity
-            est_out /= working_set_multiplier
-            spatial_msg = "(full plane)"
+            # Full spatial plane (non-tiled)
+            # output_plane_bytes is the output size of a full T/Z plane
+            est_out = output_plane_bytes * max(1, t_eff) * max(1, z_eff)
 
         msg_parts: List[str] = []
         for d, c in plan.items():
