@@ -799,7 +799,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Spatial dimensions are only rechunked if spatial plane times scales does not fit in memory
     if allow_rechunking:
         # intermediate array size is increased by the sie of the radial distances (L / 2dx)
-        output_r_factor = 1 if length_scales is None else len(length_scales)
+        scale_size = 1 if length_scales is None else len(length_scales)
+        output_r_factor = max(scale_size, increments['r'].size)
 
         # --- NEW HEURISTIC: Calculate the memory factor based on the inner angle loop ---
         # Estimate N_phi: The number of unique angular shifts (directions) that
