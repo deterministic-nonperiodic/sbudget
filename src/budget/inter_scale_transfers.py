@@ -799,20 +799,36 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Spatial dimensions are only rechunked if spatial plane times scales does not fit in memory
     if allow_rechunking:
         # intermediate array size is increased by the sie of the radial distances (L / 2dx)
-        scale_size = 1 if length_scales is None else len(length_scales)
-        scale_size = increments.r.size * scale_size
+        output_r_factor = 1 if length_scales is None else len(length_scales)
+
+        # --- NEW HEURISTIC: Calculate the memory factor based on the inner angle loop ---
+        # Estimate N_phi: The number of unique angular shifts (directions) that
+        # must be processed concurrently inside the angle loop. We use the mask size for the
+        # largest scale as the worst-case scenario.
+        N_ANGULAR_SHIFTS = int(increments['mask'].sel(r=increments['r'].max()).sum())
+
+        # The number of intermediate arrays created per shift (Input, Rolled, Diff, Cubed, Mask, etc.)
+        N_TEMP_ARRAYS_PER_SHIFT = 5
+
+        # Calculate the working set multiplier: (N_phi * N_temp)
+        ANGLE_LOOP_OVERHEAD_FACTOR = N_ANGULAR_SHIFTS * N_TEMP_ARRAYS_PER_SHIFT
+
+        if verbose:
+            print(f"[chunking] INFO: Dynamic ANGLE_LOOP_OVERHEAD_FACTOR calculated based on "
+                  f"worst-case number of angular shifts={N_ANGULAR_SHIFTS}: "
+                  f"{ANGLE_LOOP_OVERHEAD_FACTOR}")
 
         wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
                                        # preferred chunk sizes
-                                       preferred={'z': 1, 'time': 1},  # re-adjusted to target
+                                       # preferred={'z': 1, 'time': 1},  # re-adjusted to target
                                        # limit chunk size (MB)
                                        desired_chunk_size_mb=float(chunk_size_mb),
                                        # Safer 50% threshold for Dask compute budget
                                        memory_threshold_ratio=0.25,
-                                       # extra memory for temporary arrays, i.e., padding
-                                       working_set_multiplier=42,
+                                       # extra memory for temporary arrays, i.e., padding, shifts
+                                       working_set_multiplier=ANGLE_LOOP_OVERHEAD_FACTOR,
                                        # extra memory required for kernel radial distance
-                                       output_scale_mult=scale_size,
+                                       output_scale_mult=output_r_factor,
                                        # No derivatives required here. Allow min z-chunk size = 1
                                        deriv_edge_order=0)
 
