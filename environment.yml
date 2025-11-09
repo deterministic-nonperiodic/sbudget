@@ -24,12 +24,14 @@ dependencies:
   - h5netcdf>=1.2
   - h5py>=3.10
   - cftime>=1.6
+  - filelock
 
   # Metadata, units, and projections
   - pint>=0.22
   - pyproj>=3.5
   - pyyaml>=6.0
   - psutil>=5.9            # system memory awareness and worker diagnostics
+  - tqdm
 
   # Build/runtime basics
   - pip

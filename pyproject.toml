@@ -32,6 +32,8 @@ dependencies = [
 
     # System and performance utilities
     "psutil>=5.9",
+    "filelock",
+    "tqdm"
 ]
 
 [project.scripts]
