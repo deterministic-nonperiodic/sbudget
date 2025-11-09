@@ -12,17 +12,26 @@ authors = [
     { name = "Bharath Krishnan", email = "krishnan@iap-kborn.de" }]
 requires-python = ">=3.10"
 dependencies = [
-    "xarray>=2024.1.0",
-    "dask[array]",
+    # Core scientific stack
     "numpy>=1.26",
-    "scipy >=1.8",
-    "pyyaml>=6.0",
+    "scipy>=1.10",
+
+    # High-level data structures and parallel computing
+    "xarray>=2024.1.0",
+    "dask[array]>=2024.1.0",
+
+    # IO and serialization
     "zarr>=2.17",
-    "h5netcdf",
     "netcdf4>=1.6",
-    "pyproj",
-    "pint",
-    "psutil"
+    "h5netcdf>=1.2",
+
+    # Config and metadata utilities
+    "pyyaml>=6.0",
+    "pyproj>=3.5",
+    "pint>=0.22",
+
+    # System and performance utilities
+    "psutil>=5.9",
 ]
 
 [project.scripts]
