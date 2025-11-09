@@ -1,15 +1,15 @@
 input:
   path: ./model_output.nc
-  dims: [ z_mc,  lat, lon ] # or [y, x]
+  dims: [ z_mc,  lat, lon ] # [y, x] Names of the horizontal spatial dimensions
   engine: h5netcdf          # optional: h5netcdf | netcdf4 | scipy
 
 output:
   path: ./budget_out.nc
-  store: netcdf             # or zarr
-  overwrite: true
+  store: netcdf             # [netcdf, zarr] format for output files
+  overwrite: true           # overwrite existing output files
 
 compute:
-  mode: spectral_budget     # Type of scale-transfer physical vs spectral ["spectral", "physical"]
+  mode: spectral_budget     # Type of computation ["spectral_budget",  "scale_transfer"]
   scales: null              # Used with mode "physical" wavelengths (m), e.g., [1000, 5000, 10000]
   norm: null                # or 'ortho'
   dx: null                  # only for Cartesian grids; lon/lat inferred
@@ -17,19 +17,21 @@ compute:
   cumulative: true          # default; set false for raw (non-accumulated) spectra
   transfer_form: flux       # invariant, flux. Method for computing nonlinear spectral transfers
   # FFT stability & memory control
-  rechunk_spatial: false    # ensure single spatial chunks (y,x) for FFTs, and convolutions
+  rechunk_spatial: false    # ensure single spatial chunks (y, x) for FFTs, and convolutions
   dask_allow_rechunk: true  # allow apply_ufunc to rechunk as a fallback
+  chunksizes: 500           # constraint on largest chunk size [MB] for a horizontal plane (y, x)
+  cache_mode: hybrid        # ["smart", "disk", "disk_grouped", "hybrid"] for dask persist storage
   scheduler: threads        # distributed, processes
 
 variables:
-  u: u                     # zonal velocity
-  v: v
-  w: w
+  u: u                      # zonal velocity
+  v: v                      # meridional velocity
+  w: w                      # vertical velocity
   # The following variables only apply to mode "spectral"
   theta: theta              # preferred; if missing, derive from pressure & temperature
   pressure: p               # optional if theta present
   temperature: temp         # optional if theta present
   density: rho              # optional; derive from pressure & temperature
   # Optional precomputed diagnostics (used if present)
-  divergence: div
-  vorticity: vor
+  divergence: div           # horizontal divergence of wind
+  vorticity: vor            # vertical component of the relative vorticity of wind

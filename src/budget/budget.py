@@ -4,8 +4,8 @@ import numpy as np
 import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
+from .chunking_tools import ensure_optimal_chunking
 from .constants import cp, Omega, epsilon
-from .io_utils import ensure_optimal_chunking
 from .numeric_tools import domain_mean, stack_vector, rotate_vector
 from .numeric_tools import horizontal_advection, horizontal_gradient
 from .numeric_tools import horizontal_divergence, relative_vorticity
@@ -388,18 +388,18 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # Apply consistent rechunking:
     rechunk_spatial = getattr(cfg.compute, "rechunk_spatial", False)
     allow_rechunking = getattr(cfg.compute, "dask_allow_rechunk", True)
-    chunk_size_mb = getattr(cfg.compute, "chunksizes", 128)
+    chunk_size_mb = getattr(cfg.compute, "chunksizes", 512)
 
     if allow_rechunking:
-        ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
-                                     # limit chunk size (MB)
-                                     desired_chunk_size_mb=float(chunk_size_mb),
-                                     # Use up to 50% of available memory
-                                     memory_threshold_ratio=0.5,
-                                     # extra memory for temporary arrays, i.e., linear detrending
-                                     working_set_multiplier=5,
-                                     deriv_edge_order=2,
-                                     rechunk_spatial=rechunk_spatial)
+        ds, info = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
+                                           # limit chunk size (MB)
+                                           desired_chunk_size_mb=float(chunk_size_mb),
+                                           # Use up to 50% of available memory
+                                           memory_threshold_ratio=0.85,
+                                           # extra memory for temporary arrays, i.e., linear detrending
+                                           working_set_multiplier=10,
+                                           deriv_edge_order=2,
+                                           rechunk_spatial=rechunk_spatial)
 
     # After open_dataset(), variable names are normalized to logical names.
     u = ds["u"]

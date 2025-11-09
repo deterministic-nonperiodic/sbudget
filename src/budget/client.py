@@ -6,6 +6,7 @@ import xarray as xr
 
 from .budget import compute_budget
 from .cf_coords import _cf_guess
+from .chunking_tools import auto_select_cache_mode
 from .config import load_config, apply_overrides
 from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
 from .io_utils import open_dataset, write_dataset
@@ -69,11 +70,19 @@ def _cmd_compute(args) -> None:
         print("[budget] Spectral budget calculation complete.")
     elif mode == "scale_transfer":
         print("[budget] Starting inter-scale transfer calculation...")
+
+        # --- Auto-select cache mode if not explicitly given ---
+        if not getattr(cfg.compute, "cache_mode", None):
+            cfg.compute.cache_mode = auto_select_cache_mode(ds, working_set_multiplier=5)
+        else:
+            print(f"[budget] Using cache mode: {cfg.compute.cache_mode}")
+
         kwargs = {
             "scales": getattr(cfg.compute, "scales", None),
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
             "allow_rechunking": cfg.compute.dask_allow_rechunk,
             "chunksizes": cfg.compute.chunksizes,
+            "cache_mode": cfg.compute.cache_mode,
             "verbose": True
         }
 
@@ -84,9 +93,7 @@ def _cmd_compute(args) -> None:
                          f"Use 'spectral_budget' or 'scale_transfer'.")
 
     # Write output to disk
-    print(f"[budget] Writing output to {cfg.output.path}...")
     write_dataset(out, cfg)
-    print(f"[budget] Wrote: {cfg.output.path}")
 
     # --- End Main Computation Block and Profiling ---
     end_time = time.monotonic()
@@ -149,55 +156,89 @@ def main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ---- compute ----
-    p_compute = sub.add_parser("compute", help="Compute energy budget and write output")
-    p_compute.add_argument("config", type=Path, help="Path to YAML config")
+    p_compute = sub.add_parser(
+        "compute",
+        help="Compute spectral or scale-dependent energy budgets and write results to disk."
+    )
+    p_compute.add_argument("config", type=Path, help="Path to YAML configuration file.")
 
-    # input
-    p_compute.add_argument("--input-path")
-    p_compute.add_argument("--dims", type=_csv_or_list, help="e.g. 'z,lat,lon' or 'z y x'")
-    p_compute.add_argument("--engine", choices=["h5netcdf", "netcdf4", "scipy"])
+    # Input
+    p_compute.add_argument("--input-path", help="Path to input dataset (overrides YAML).")
+    p_compute.add_argument("--dims", type=_csv_or_list,
+                           help="Comma- or space-separated list of dimensions, e.g. 'z,lat,lon'.")
+    p_compute.add_argument("--engine", choices=["h5netcdf", "netcdf4", "scipy"],
+                           help="NetCDF engine to use when reading files.")
 
-    # output
-    p_compute.add_argument("--output-path")
-    p_compute.add_argument("--store", choices=["netcdf", "zarr"])
+    # Output
+    p_compute.add_argument("--output-path", help="Output file path (overrides YAML).")
+    p_compute.add_argument("--store", choices=["netcdf", "zarr"],
+                           help="Output format for results.")
     _add_bool_pair(p_compute, "overwrite", "overwrite",
-                   "Overwrite output", "Do not overwrite output")
+                   "Overwrite existing output file.", "Do not overwrite existing output.")
 
-    # compute
-    p_compute.add_argument("--mode", choices=["spectral_budget", "scale_transfer"])
+    # Compute
+    p_compute.add_argument("--mode", choices=["spectral_budget", "scale_transfer"],
+                           help="Select computation mode: 'spectral_budget' or 'scale_transfer'.")
     p_compute.add_argument("--scales", type=_csv_or_list,
-                           help="Wavelengths in meters, e.g. '1000,5000,10000'")
-
+                           help="Target horizontal wavelengths in meters, e.g. '1000,5000,10000'.")
     p_compute.add_argument("--levels", type=_csv_or_list,
-                           help="Levels in vertical axis units, e.g. '1000,5000,10000'")
+                           help="Vertical levels in dataset units, e.g. '1000,5000,10000'.")
 
     p_compute.add_argument("--norm", choices=["ortho", "none"],
-                           help="FFT normalization ('none' to clear)")
-    p_compute.add_argument("--dx", type=float)
-    p_compute.add_argument("--dy", type=float)
+                           help="FFT normalization (use 'none' to disable normalization).")
+    p_compute.add_argument("--dx", type=float, help="Grid spacing in x-direction (meters).")
+    p_compute.add_argument("--dy", type=float, help="Grid spacing in y-direction (meters).")
 
     _add_bool_pair(p_compute, "cumulative", "cumulative",
-                   "Enable cumulative spectra", "Disable cumulative spectra")
-    p_compute.add_argument("--transfer-form", choices=["invariant", "flux", "conservative"])
+                   "Enable cumulative spectral sums.", "Disable cumulative spectral sums.")
+    p_compute.add_argument("--transfer-form", choices=["invariant", "flux", "conservative"],
+                           help="Formulation of transfer term to compute.")
+
     _add_bool_pair(p_compute, "rechunk-spatial", "rechunk_spatial",
-                   "Ensure single spatial chunks for FFTs", "Do not rechunk spatial dims")
+                   "Force single spatial chunks for FFTs (recommended).",
+                   "Skip spatial rechunking (faster, less stable for FFT).")
+
     _add_bool_pair(p_compute, "dask-allow-rechunk", "dask_allow_rechunk",
-                   "Allow apply_ufunc to rechunk", "Disallow automatic rechunking")
+                   "Allow Dask to rechunk automatically during computation.",
+                   "Prevent automatic rechunking (for strict memory control).")
 
-    p_compute.add_argument("--chunksizes", type=float, help="")
+    # user-exposed argument:
+    p_compute.add_argument(
+        "--chunksizes", type=float,
+        help="Target per-chunk size in MB (approximate). Used for adaptive rechunking."
+    )
 
-    p_compute.add_argument("--scheduler", choices=["threads", "processes", "distributed"])
+    p_compute.add_argument(
+        "--cache-mode",
+        choices=["smart", "disk", "disk_grouped", "hybrid"],
+        default="hybrid",
+        help=(
+            "Caching strategy for intermediate fields. Scope --mode='scale_transfer':\n"
+            "  'smart'        → Keep recent results in memory (fastest, but high RAM use).\n"
+            "  'disk'         → Store each shift as a separate on-disk Zarr file (safe, slower I/O).\n"
+            "  'disk_grouped' → Reuse shared Zarr stores for multiple shifts (efficient for large runs).\n"
+            "  'hybrid'       → Adaptive mode: keep data in memory until nearing the memory limit, "
+            "then spill to grouped on-disk cache automatically (recommended)."
+        ),
+    )
 
-    # variables (name mapping overrides)
-    p_compute.add_argument("--var-u")
-    p_compute.add_argument("--var-v")
-    p_compute.add_argument("--var-w")
-    p_compute.add_argument("--var-theta")
-    p_compute.add_argument("--var-pressure")
-    p_compute.add_argument("--var-density")
-    p_compute.add_argument("--var-temperature")
-    p_compute.add_argument("--var-divergence")
-    p_compute.add_argument("--var-vorticity")
+    p_compute.add_argument(
+        "--scheduler",
+        choices=["threads", "processes", "distributed"],
+        help="Execution backend for Dask computations."
+    )
+
+    # Variable name overrides — added help for clarity
+    var_help = "Override variable name in input dataset (if it differs from config)."
+    p_compute.add_argument("--var-u", help=f"Zonal wind variable. {var_help}")
+    p_compute.add_argument("--var-v", help=f"Meridional wind variable. {var_help}")
+    p_compute.add_argument("--var-w", help=f"Vertical wind variable. {var_help}")
+    p_compute.add_argument("--var-theta", help=f"Potential temperature variable. {var_help}")
+    p_compute.add_argument("--var-pressure", help=f"Pressure variable. {var_help}")
+    p_compute.add_argument("--var-density", help=f"Density variable. {var_help}")
+    p_compute.add_argument("--var-temperature", help=f"Temperature variable. {var_help}")
+    p_compute.add_argument("--var-divergence", help=f"Divergence variable. {var_help}")
+    p_compute.add_argument("--var-vorticity", help=f"Vorticity variable. {var_help}")
 
     p_compute.set_defaults(func=_cmd_compute)
 
@@ -217,9 +258,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     # optional echo of scheduler if present
-    sched = getattr(load_config(args.config), 'compute').scheduler  # your existing loader
-    if sched:
-        print(f"[budget] scheduler={sched}")
+    if hasattr(args, "scheduler") and args.scheduler:
+        print(f"[budget] scheduler={args.scheduler}")
 
     args.func(args)
 
