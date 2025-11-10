@@ -375,7 +375,7 @@ def _persist_grid_shifts(
         persist_shifts: bool | str,
         shift_cache: dict | None = None,
         mem_limit: int = 25,
-        mem_threshold: float = 0.3,
+        mem_threshold: float = 0.1,
         auto_cleanup: bool = True,
         compressor: str | None = "lz4"
 ) -> xr.Dataset:

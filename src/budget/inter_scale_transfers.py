@@ -613,6 +613,74 @@ def _build_scale_integral_template(
     return xr.DataArray(data, dims=base.dims, coords=base.coords, name=name)
 
 
+def validate_length_scales(
+        length_scales: np.ndarray | list | float | str | None,
+        r_coord: xr.DataArray,
+        verbose: bool = True,
+        label: str = "scale-integral"
+) -> np.ndarray:
+    """
+    Validate and sanitize user-provided length scales for integration.
+
+    Ensures scales fall within the range of 'r_coord', coercing out-of-range
+    values to the nearest valid edge (min or max). Scalars and strings are
+    automatically converted to 1D arrays.
+
+    Parameters
+    ----------
+    length_scales : array-like, float, str, or None
+        Candidate physical scales (ℓ values). If None, defaults to r_coord.values.
+        Scalars or strings are automatically converted to 1D numeric arrays.
+    r_coord : xr.DataArray
+        Coordinate array representing available separation distances (r).
+    verbose : bool, optional
+        If True, prints diagnostic information.
+    label : str, optional
+        Prefix used for log messages.
+
+    Returns
+    -------
+    np.ndarray
+        Validated and clipped array of length scales.
+    """
+    if r_coord.size == 0:
+        raise ValueError("`r_coord` is empty — cannot determine valid scale range.")
+
+    # --- Normalize input type ---
+    if length_scales is None:
+        length_scales = r_coord.values
+    else:
+        length_scales = np.atleast_1d(length_scales)
+        try:
+            # Convert from string or numeric
+            length_scales = length_scales.astype(float)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid length_scales: must be numeric, got {length_scales!r}")
+
+    # --- Clip to valid range (clamping, not discarding) ---
+    r_min, r_max = float(r_coord.min().item()), float(r_coord.max().item())
+    # Replace NaNs with default (r_max)
+    valid = np.isfinite(length_scales)
+    if not np.any(valid):
+        if verbose:
+            print(f"[{label}] Warning: No valid numeric scales found; using r_max={r_max:8.2f} m")
+        return np.atleast_1d(r_max)
+    length_scales = np.clip(length_scales[valid], r_min, r_max)
+
+    # --- Ensure non-empty array ---
+    if length_scales.size == 0:
+        length_scales = np.atleast_1d(r_max)
+
+    # --- Optional reporting ---
+    if verbose:
+        min_scale, max_scale = length_scales.min(), length_scales.max()
+        print(f"[{label}] Externally defined length_scales:")
+        print(f"[{label}]   Effective scale limits: {min_scale:8.2f} m - {max_scale:8.2f} m")
+        print("==============================================================")
+
+    return length_scales
+
+
 def scale_space_integral(
         integrand: xr.DataArray,
         name: str,
@@ -672,23 +740,7 @@ def scale_space_integral(
         integrand = integrand.chunk({"r": -1})
 
     # --- Prepare length scales ---
-    if length_scales is None:
-        length_scales = r_coord.values
-    if not isinstance(length_scales, np.ndarray):
-        length_scales = np.asarray(length_scales)
-    length_scales = length_scales[length_scales <= r_coord.max().values]
-
-    if length_scales.size == 0:
-        if verbose:
-            print(f"Warning: No valid length scales found; "
-                  f"falling back to r_max = {r_coord.max().values:8.2f} m")
-        length_scales = np.atleast_1d(r_coord.max().values)
-
-    if verbose:
-        min_scale, max_scale = length_scales.min(), length_scales.max()
-        print("[scale-integral] Externally defined length_scales:")
-        print(f"[scale-integral]   Effective scale limits: {min_scale:8.2f} m - {max_scale:8.2f} m")
-        print("==============================================================")
+    length_scales = validate_length_scales(length_scales, r_coord, verbose=verbose)
 
     # --- Build map_blocks template ---
     template = _build_scale_integral_template(integrand, name, length_scales)
@@ -708,8 +760,7 @@ def scale_space_integral(
     # --- Execute map_blocks ---
     result = xr.map_blocks(_scale_space_integral_block, integrand, template=template)
 
-    if verbose:
-        print(f"[scale-integral] Constructed dask graph for '{name}'.")
+    if verbose: print(f"[scale-integral] Constructed dask graph for '{name}'.")
 
     return result
 
