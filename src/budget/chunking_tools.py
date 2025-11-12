@@ -30,7 +30,6 @@ import numpy as np
 import psutil
 import xarray as xr
 from dask.distributed import get_client
-# Direct import of Dask worker function (now a mandatory dependency)
 from dask.distributed import get_worker
 from filelock import FileLock, BaseFileLock
 from numcodecs import Blosc
@@ -638,8 +637,8 @@ def ensure_optimal_chunking(
         rechunk_spatial: bool = False,
         output_scale_mult: int = 1,
         desired_chunk_size_mb: Optional[float] = None,
-        min_auto_rechunk_mb: float = _SMALL_DATA_THRESHOLD_MB,
-) -> Tuple[xr.Dataset, Dict[str, Any]]:
+        min_auto_rechunk_mb: float = _SMALL_DATA_THRESHOLD_MB
+) -> xr.Dataset:
     """
     Rechunk dataset to balance performance and memory usage.
     Keeps full horizontal planes unless they exceed memory budget.
@@ -653,11 +652,10 @@ def ensure_optimal_chunking(
     if est_output_size < min_auto_rechunk_mb * 1024 ** 2:
         if verbose:
             print(f"[chunking] Estimated output dataset size is small ({_fmt_bytes(ds_total)}); "
-                  f"skipping rechunk. Ensuring spatially contiguous.")
+                  f"ensuring at least spatially contiguous.")
         # ensure spatially contiguous
         plan: Dict[str, Any] = {x_dim: -1, y_dim: -1}
-        ds = ds.chunk(plan)
-        return ds, {"plan": plan, "skipped": True}
+        return ds.chunk(plan)
 
     exclude_dims = [str(d) for d in ds.dims if d not in spatial_dims]
 
@@ -742,5 +740,4 @@ def ensure_optimal_chunking(
               f"Plan: {', '.join(msg_parts)} | "
               f"Est. working set: {_fmt_bytes(total_est)}")
 
-    info = {"plan": plan, "max_memory": max_mem, "plane_bytes": plane_bytes}
-    return out, info
+    return out

@@ -496,12 +496,14 @@ def scale_increments(
     # 11. Verbose Output
     effective_min_r = increments["r"].min().values
     effective_max_r = increments["r"].max().values
+    requested_max_r = "None" if not max_r_m else f"{max_r_m:.2f} m"
+
     if verbose:
         print("================== Scale Increments Summary ==================")
         print(f"  Domain size         : Lx = {lx:8.2f} m, Ly = {ly:8.2f} m")
         print(f"  Grid spacing        : dx = {dx:8.2f} m, dy = {dy:8.2f} m")
         print(f"  Effective min scale : {effective_min_r:8.2f} m (dr = {r_step:8.2f} m)")
-        print(f"  Effective max scale : {effective_max_r:8.2f} m (Requested: {max_r_m:.2f} m)")
+        print(f"  Effective max scale : {effective_max_r:8.2f} m (Requested: {requested_max_r})")
         print("==============================================================")
 
     return increments
@@ -1027,17 +1029,17 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Ensure the result fits in memory or compute in chunks along non-spatial dimensions
     # Spatial dimensions are only rechunked if spatial plane times scales does not fit in memory
     if allow_rechunking:
-        wind, _ = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
-                                          # limit chunk size (MB)
-                                          desired_chunk_size_mb=float(chunk_size_mb),
-                                          # Safer 50% threshold for Dask compute budget
-                                          memory_threshold_ratio=0.8,
-                                          # extra memory for temporary arrays, i.e., padding, shifts
-                                          working_set_multiplier=5,
-                                          # Data size increase by number of scales
-                                          output_scale_mult=increments['r'].size,
-                                          # No derivatives required here. Allow min z-chunk size = 1
-                                          deriv_edge_order=0)
+        wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
+                                       # limit chunk size (MB)
+                                       desired_chunk_size_mb=float(chunk_size_mb),
+                                       # Safer 50% threshold for Dask compute budget
+                                       memory_threshold_ratio=0.8,
+                                       # extra memory for temporary arrays, i.e., padding, shifts
+                                       working_set_multiplier=5,
+                                       # Data size increase by number of scales
+                                       output_scale_mult=increments['r'].size,
+                                       # No derivatives required here. Allow min z-chunk size = 1
+                                       deriv_edge_order=0)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
     nan_mask = xr.concat(
