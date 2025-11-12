@@ -6,7 +6,6 @@ import xarray as xr
 
 from .budget import compute_budget
 from .cf_coords import _cf_guess
-from .chunking_tools import auto_select_cache_mode
 from .config import load_config, apply_overrides
 from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
 from .io_utils import open_dataset, write_dataset
@@ -72,22 +71,15 @@ def _cmd_compute(args) -> None:
         print("[budget] Starting inter-scale transfer calculation...")
 
         # --- Auto-select cache mode if not explicitly given ---
-        if not getattr(cfg.compute, "cache_mode", None):
-            cfg.compute.cache_mode = auto_select_cache_mode(ds, working_set_multiplier=5)
-        else:
-            print(f"[budget] Using cache mode: {cfg.compute.cache_mode}")
-
         kwargs = {
             "scales": getattr(cfg.compute, "scales", None),
             "ls_chunk_size": 1,  # write one scale at a time to limit memory use
             "allow_rechunking": cfg.compute.dask_allow_rechunk,
-            "chunksizes": cfg.compute.chunksizes,
-            "cache_mode": cfg.compute.cache_mode,
+            "chunk_size": cfg.compute.chunk_size,
             "verbose": True
         }
 
         out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
-        print("[budget] Inter-scale transfer calculation complete.")
     else:
         raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
                          f"Use 'spectral_budget' or 'scale_transfer'.")
@@ -101,35 +93,6 @@ def _cmd_compute(args) -> None:
 
     # Print the profiling information
     print(f"\n[budget] PROFILE: Total time elapsed: {duration:.2f} seconds")
-
-
-def _cmd_inspect(args) -> None:
-    cfg = load_config(args.config)
-    cfg = apply_overrides(cfg, args)
-
-    # Open *raw* dataset to validate configured variable names
-    p = cfg.input.path
-    engine = getattr(cfg.input, "engine", None)
-    if str(p).endswith(".zarr"):
-        raw = xr.open_zarr(p, chunks="auto")
-    elif str(p).endswith(".nc"):
-        raw = xr.open_mfdataset(p, chunks="auto", engine=engine)
-    else:
-        raw = xr.open_mfdataset(p, chunks="auto")
-
-    report = _report_var_existence(raw, cfg)
-
-    # Also open the normalized (renamed) view
-    ds = open_dataset(cfg)
-
-    print(20 * "===" + "Input dataset (raw)" + 20 * "===")
-    print(raw)
-    print(20 * "===" + "Variable check" + 20 * "===")
-    print(report)
-    print(20 * "===" + "Dataset (normalized logical names)" + 20 * "===")
-    print(ds)
-    print(20 * "===" + "I/O configuration" + 20 * "===")
-    print(cfg)
 
 
 def _add_bool_pair(p, name, dest, help_true, help_false):
@@ -158,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
     # ---- compute ----
     p_compute = sub.add_parser(
         "compute",
-        help="Compute spectral or scale-dependent energy budgets and write results to disk."
+        help="Compute spectral energy budget or scale-to-scale energy transfers"
     )
     p_compute.add_argument("config", type=Path, help="Path to YAML configuration file.")
 
@@ -204,22 +167,8 @@ def main(argv: list[str] | None = None) -> None:
 
     # user-exposed argument:
     p_compute.add_argument(
-        "--chunksizes", type=float,
+        "--chunk-size", type=float,
         help="Target per-chunk size in MB (approximate). Used for adaptive rechunking."
-    )
-
-    p_compute.add_argument(
-        "--cache-mode",
-        choices=["smart", "disk", "disk_grouped", "hybrid"],
-        default="hybrid",
-        help=(
-            "Caching strategy for intermediate fields. Scope --mode='scale_transfer':\n"
-            "  'smart'        → Keep recent results in memory (fastest, but high RAM use).\n"
-            "  'disk'         → Store each shift as a separate on-disk Zarr file (safe, slower I/O).\n"
-            "  'disk_grouped' → Reuse shared Zarr stores for multiple shifts (efficient for large runs).\n"
-            "  'hybrid'       → Adaptive mode: keep data in memory until nearing the memory limit, "
-            "then spill to grouped on-disk cache automatically (recommended)."
-        ),
     )
 
     p_compute.add_argument(
@@ -229,31 +178,19 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # Variable name overrides — added help for clarity
-    var_help = "Override variable name in input dataset (if it differs from config)."
-    p_compute.add_argument("--var-u", help=f"Zonal wind variable. {var_help}")
-    p_compute.add_argument("--var-v", help=f"Meridional wind variable. {var_help}")
-    p_compute.add_argument("--var-w", help=f"Vertical wind variable. {var_help}")
-    p_compute.add_argument("--var-theta", help=f"Potential temperature variable. {var_help}")
-    p_compute.add_argument("--var-pressure", help=f"Pressure variable. {var_help}")
-    p_compute.add_argument("--var-density", help=f"Density variable. {var_help}")
-    p_compute.add_argument("--var-temperature", help=f"Temperature variable. {var_help}")
-    p_compute.add_argument("--var-divergence", help=f"Divergence variable. {var_help}")
-    p_compute.add_argument("--var-vorticity", help=f"Vorticity variable. {var_help}")
+    var_help = "Override variable name in input dataset."
+    p_compute.add_argument("--var-u", help=f"Zonal wind component. {var_help}")
+    p_compute.add_argument("--var-v", help=f"Meridional wind component. {var_help}")
+    p_compute.add_argument("--var-w", help=f"Vertical wind component. {var_help}")
+    p_compute.add_argument("--var-theta", help=f"Potential temperature. {var_help}")
+    p_compute.add_argument("--var-pressure", help=f"Atmospheric pressure. {var_help}")
+    p_compute.add_argument("--var-density", help=f"Density of air. {var_help}")
+    p_compute.add_argument("--var-temperature", help=f"Temperature of air. {var_help}")
+    p_compute.add_argument("--var-divergence", help=f"horizontal divergence. {var_help}")
+    p_compute.add_argument("--var-vorticity", help=f"Vertical component of "
+                                                   f"relative vorticity. {var_help}")
 
     p_compute.set_defaults(func=_cmd_compute)
-
-    # ---- inspect ----
-    p_inspect = sub.add_parser("inspect", help="Print dataset and config summary")
-    p_inspect.add_argument("config", type=Path, help="Path to YAML config")
-    # same override flags help diagnose
-    p_inspect.add_argument("--input-path")
-    p_inspect.add_argument("--dims", type=_csv_or_list)
-    p_inspect.add_argument("--engine", choices=["h5netcdf", "netcdf4", "scipy"])
-    p_inspect.add_argument("--levels", type=_csv_or_list,
-                           help="Levels in vertical axis units, e.g. '1000,5000,10000'")
-    p_inspect.add_argument("--mode", choices=["spectral_budget", "scale_transfer"])
-
-    p_inspect.set_defaults(func=_cmd_inspect)
 
     args = parser.parse_args(argv)
 

@@ -210,11 +210,11 @@ def write_dataset(ds: xr.Dataset, cfg) -> None:
 
     # --- Trigger computation explicitly and safely ---
     if is_dask_collection(write_op):
-        print(f"[I/O] Executing parallel write with scheduler: {scheduler} ...")
+        print(f"[I/O] Executing parallel Dask graph with scheduler: {scheduler} ...")
         with ProgressBar():
             dask.compute(write_op, scheduler=scheduler)  # Ensures all I/O is done before cleanup
     else:
-        print("[I/O] Direct write completed (non-lazy dataset).")
+        print("[I/O] Calculation completed.")
 
     print(f"[I/O] Wrote output file: {cfg.output.path}")
 

@@ -19,9 +19,8 @@ compute:
   # FFT stability & memory control
   rechunk_spatial: false    # ensure single spatial chunks (y, x) for FFTs, and convolutions
   dask_allow_rechunk: true  # allow apply_ufunc to rechunk as a fallback
-  chunksizes: 500           # constraint on largest chunk size [MB] for a horizontal plane (y, x)
-  cache_mode: hybrid        # ["smart", "disk", "disk_grouped", "hybrid"] for dask persist storage
-  scheduler: threads        # distributed, processes
+  chunk_size: 512           # constraint on largest chunk size [MB] for a horizontal plane (y, x)
+  scheduler: threads        # Dask scheduler [threads, distributed, processes]
 
 variables:
   u: u                      # zonal velocity

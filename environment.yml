@@ -19,7 +19,7 @@ dependencies:
   - distributed>=2024.5.0
 
   # IO and serialization
-  - zarr>=2.17
+  - zarr>=3.0
   - netcdf4>=1.6
   - h5netcdf>=1.2
   - h5py>=3.10

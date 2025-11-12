@@ -88,13 +88,7 @@ pip install -e .
 Quick help
 
 ```bash
-  sbudget --help
-``` 
-
-Inspect configuration file
-
-```bash
-  sbudget inspect examples/config.yaml
+  sbudget compute --help
 ```
 
 Compute budget based on configuration file

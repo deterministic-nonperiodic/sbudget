@@ -31,8 +31,7 @@ class ComputeConfig:
     rechunk_spatial: bool = True  # ensure (y,x) are single chunks before FFTs
     dask_allow_rechunk: bool = True  # allow apply_ufunc to rechunk as fallback
     scheduler: str | None = None
-    chunksizes: float | None = None # approximate chunk size in MiB for non-spatial dimensions
-    cache_mode: str | None = None # ["smart", "disk", "hybrid"] for dask persist storage
+    chunk_size: float | None = None  # approximate chunk size in MiB for non-spatial dimensions
 
 
 @dataclass
@@ -140,13 +139,9 @@ def apply_overrides(cfg, args):
     if dar is not None:
         _set_nested(cfg, ["compute", "dask_allow_rechunk"], bool(dar))
 
-    dar = _get(args, "chunksizes")
+    dar = _get(args, "chunk_size")
     if dar is not None:
-        _set_nested(cfg, ["compute", "chunksizes"], float(dar))
-
-    dar = _get(args, "cache_mode")
-    if dar is not None:
-        _set_nested(cfg, ["compute", "cache_mode"], str(dar))
+        _set_nested(cfg, ["compute", "chunk_size"], float(dar))
 
     _set_nested(cfg, ["compute", "scheduler"], _get(args, "scheduler"))
 
