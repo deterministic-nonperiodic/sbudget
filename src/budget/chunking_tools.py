@@ -538,8 +538,7 @@ def optimal_batch_size(
     Automatically accounts for multi-worker (SLURM/Dask) environments.
     """
     # --- Estimate memory per dataset instance ---
-    per_item_bytes = estimate_dataset_bytes(ds, exclude_dims=exclude_dims,
-                                            mode="total")  # largest_chunk
+    per_item_bytes = estimate_dataset_bytes(ds, exclude_dims=exclude_dims, mode="total")
     per_item_bytes *= working_set_multiplier
 
     per_item_bytes = max(1, per_item_bytes)

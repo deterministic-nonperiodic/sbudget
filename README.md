@@ -97,15 +97,6 @@ Compute budget based on configuration file
   sbudget compute examples/config.yaml
 ```
 
-Inspect input file(s)
-
-```bash
-  sbudget inspect examples/config.yaml \
-  --input-path ./data/model_output.nc \
-  --dims z,lat,lon \
-  --engine h5netcdf
-```
-
 Write to a different file or store type (NetCDF/Zarr)
 
 ```bash
