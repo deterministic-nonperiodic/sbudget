@@ -978,7 +978,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     x_name = kwargs.get("x_coord_name", None)
     y_name = kwargs.get("y_coord_name", None)
     length_scales = kwargs.get("scales", None)
-    ls_chunk_size = kwargs.get("ls_chunk_size", -1)
+    ls_chunk_size = kwargs.get("ls_chunk_size", 1)
     allow_rechunking = kwargs.get("allow_rechunking", True)
     chunk_size_mb = float(kwargs.get("chunk_size", DEFAULT_CHUNK_SIZE_MB))
 
@@ -1092,6 +1092,6 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     energy_transfer_rate = energy_transfer_rate.transpose(..., "scale")
 
     # --- enforce one-scale-at-a-time tasks for reductions/writes ---
-    energy_transfer_rate = energy_transfer_rate.chunk(scale=1)
+    energy_transfer_rate = energy_transfer_rate.chunk(scale=ls_chunk_size)
 
     return energy_transfer_rate

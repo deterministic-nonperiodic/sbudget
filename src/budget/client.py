@@ -66,7 +66,7 @@ def _cmd_compute(args) -> None:
     if mode == "spectral_budget":
         print("[budget] Starting spectral budget calculation...")
         out = compute_budget(ds, cfg)
-        print("[budget] Spectral budget calculation complete.")
+        print("[budget] Constructed dask graph for spectral budget calculation")
     elif mode == "scale_transfer":
         print("[budget] Starting inter-scale transfer calculation...")
 
@@ -84,7 +84,7 @@ def _cmd_compute(args) -> None:
         raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
                          f"Use 'spectral_budget' or 'scale_transfer'.")
 
-    # Write output to disk
+    # Write output to disk. Up to here, computations are lazy
     write_dataset(out, cfg)
 
     # --- End Main Computation Block and Profiling ---

@@ -414,10 +414,10 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # dx, dy infer if not set
     if cfg.compute.dx is None or cfg.compute.dy is None:
         dx, dy = infer_grid_resolution(ds)
-        print(f"[budget] Estimated resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
+        print(f"[budget] Estimated grid resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
     else:
         dx, dy = cfg.compute.dx, cfg.compute.dy
-        print(f"[budget] Specified resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
+        print(f"[budget] Specified grid resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
 
     # --- Thermodynamics ---
     theta = ds.get("theta")
