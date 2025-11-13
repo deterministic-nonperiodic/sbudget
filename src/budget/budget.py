@@ -391,15 +391,15 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     chunk_size_mb = getattr(cfg.compute, "chunksizes", 512)
 
     if allow_rechunking:
-        ds, _ = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
-                                        # limit chunk size (MB)
-                                        desired_chunk_size_mb=float(chunk_size_mb),
-                                        # Use up to 50% of available memory
-                                        memory_threshold_ratio=0.85,
-                                        # extra memory for temporary arrays, i.e., linear detrending
-                                        working_set_multiplier=10,
-                                        deriv_edge_order=2,
-                                        rechunk_spatial=rechunk_spatial)
+        ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
+                                     # limit chunk size (MB)
+                                     desired_chunk_size_mb=float(chunk_size_mb),
+                                     # Use up to 50% of available memory
+                                     memory_threshold_ratio=0.85,
+                                     # extra memory for temporary arrays, i.e., linear detrending
+                                     working_set_multiplier=10,
+                                     deriv_edge_order=2,
+                                     rechunk_spatial=rechunk_spatial)
 
     # After open_dataset(), variable names are normalized to logical names.
     u = ds["u"]
