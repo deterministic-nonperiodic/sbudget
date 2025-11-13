@@ -14,7 +14,6 @@ import atexit
 import gc
 import hashlib
 import json
-import math
 import os
 import resource
 import shutil
@@ -43,6 +42,7 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
 # ---------------------------------------------------------------
 _MEMORY_RESERVE_RATIO = 0.85
 _SMALL_DATA_THRESHOLD_MB = 512.0  # skip chunking for small datasets
+DEFAULT_CHUNK_SIZE_MB = 2048  # MB
 
 # ---------------------------------------------------------------------
 # Global cleanup registry (ensures all temp dirs removed on exit)
@@ -538,7 +538,8 @@ def optimal_batch_size(
     Automatically accounts for multi-worker (SLURM/Dask) environments.
     """
     # --- Estimate memory per dataset instance ---
-    per_item_bytes = estimate_dataset_bytes(ds, exclude_dims=exclude_dims, mode="largest_chunk")
+    per_item_bytes = estimate_dataset_bytes(ds, exclude_dims=exclude_dims,
+                                            mode="total")  # largest_chunk
     per_item_bytes *= working_set_multiplier
 
     per_item_bytes = max(1, per_item_bytes)
@@ -571,56 +572,40 @@ def _balanced_chunks(n: int, target: int, min_size: int) -> Tuple[int, ...]:
     Split length n into m nearly-equal chunks, all >= min_size,
     with average near `target`. Returns a tuple of chunk sizes.
     """
+
     if n <= 0:
         return ()
-    # Choose number of chunks m so that each chunk >= min_size and near target
-    # Start with m = ceil(n / target), but cap so that floor(n/m) >= min_size
-    m = max(1, math.ceil(n / max(1, target)))
+
+    if target <= 0:
+        raise ValueError(f"'target' must be positive, got {target}")
+
+    if min_size <= 0:
+        raise ValueError(f"'min_size' must be positive, got {min_size}")
+
+    # --- Determine number of chunks m ---
+    # m must be *int* after ceiling
+    m = max(1, int(np.ceil(n / max(1, target))))
+
+    # shrink m if too many chunks cause < min_size pieces
     while m > 1 and (n // m) < min_size:
         m -= 1
-    # Now spread n across m chunks as evenly as possible (sizes differ by <= 1)
+
+    # --- Compute base distribution ---
     base = n // m
     rem = n % m
+
+    # create chunks (all integers)
     chunks = (base + 1,) * rem + (base,) * (m - rem)
-    # Safety: ensure all >= min_size
+
+    # --- Safety: ensure no chunk < min_size ---
     if any(c < min_size for c in chunks):
+        # recompute m based on min_size constraint only
         m = max(1, n // min_size)
         base = n // m
         rem = n % m
         chunks = (base + 1,) * rem + (base,) * (m - rem)
-    return chunks
 
-
-def choose_z_chunk_size(n_z: int, deriv_edge_order: int, sys_mult: int | None = None) -> int:
-    """
-    Choose a balanced z-chunk size based on dataset size, derivative stencil, and system multiplier.
-    Ensures we don't end up with trivially small (1-level) chunks unless absolutely necessary.
-    """
-    if n_z <= 4:
-        return n_z  # tiny vertical domain, keep as-is
-
-    # Estimate reasonable number of vertical chunks
-    if sys_mult is None or sys_mult < 1:
-        sys_mult = 1
-
-    target_chunks = min(10, max(2, int(round(math.log2(sys_mult ** 0.25 * n_z / 8)))))
-
-    base_chunk = max(1, n_z // target_chunks)
-
-    # Align with derivative stencil width
-    align = max(1, deriv_edge_order)
-    if base_chunk % align != 0:
-        base_chunk -= base_chunk % align
-
-    # Avoid extreme imbalance
-    while base_chunk > 1 and n_z % base_chunk != 0 and (n_z // base_chunk) < 4:
-        base_chunk -= 1
-
-    # Ensure we don't produce single-level chunks if unnecessary
-    if base_chunk < n_z // 8:
-        base_chunk = max(2, n_z // 8)
-
-    return max(2, min(base_chunk, n_z))
+    return tuple(chunks)
 
 
 # ---------------------------------------------------------------
@@ -631,7 +616,6 @@ def ensure_optimal_chunking(
         spatial_dims: Tuple[str, str] = ("lat", "lon"),
         vertical_dim: str = "z",
         memory_threshold_ratio: float = _MEMORY_RESERVE_RATIO,
-        working_set_multiplier: int = 1,
         deriv_edge_order: int = 2,
         verbose: bool = True,
         rechunk_spatial: bool = False,
@@ -646,12 +630,12 @@ def ensure_optimal_chunking(
     y_dim, x_dim = spatial_dims
 
     # ---- Small dataset shortcut ----
-    ds_total = estimate_dataset_bytes(ds, mode="total") * working_set_multiplier
-    est_output_size = output_scale_mult * working_set_multiplier * ds_total
+    est_output_size = estimate_dataset_bytes(ds, mode="total") * output_scale_mult
 
     if est_output_size < min_auto_rechunk_mb * 1024 ** 2:
         if verbose:
-            print(f"[chunking] Estimated output dataset size is small ({_fmt_bytes(ds_total)}); "
+            print(f"[chunking] Estimated output dataset "
+                  f"size is small ({_fmt_bytes(est_output_size)}); "
                   f"ensuring at least spatially contiguous.")
         # ensure spatially contiguous
         plan: Dict[str, Any] = {x_dim: -1, y_dim: -1}
@@ -659,9 +643,9 @@ def ensure_optimal_chunking(
 
     exclude_dims = [str(d) for d in ds.dims if d not in spatial_dims]
 
-    spatial_fits, plane_bytes, max_mem = fits_in_memory(
+    spatial_fits, bytes_per_plane, max_mem = fits_in_memory(
         ds, exclude_dims=exclude_dims,
-        expansion_factor=output_scale_mult * working_set_multiplier,
+        expansion_factor=output_scale_mult,
         ratio_to_use=memory_threshold_ratio,
     )
 
@@ -671,9 +655,9 @@ def ensure_optimal_chunking(
     if not rechunk_spatial and spatial_fits:
         plan.update({y_dim: -1, x_dim: -1})
     else:
-        reduction = max(1.0, plane_bytes / max(1, max_mem))
-        n_tiles = max(1, math.ceil(math.sqrt(reduction)))
-        cy, cx = math.ceil(ds.sizes[y_dim] / n_tiles), math.ceil(ds.sizes[x_dim] / n_tiles)
+        reduction = max(1.0, bytes_per_plane / max(1, max_mem))
+        n_tiles = max(1, np.ceil(np.sqrt(reduction)))
+        cy, cx = np.ceil(ds.sizes[y_dim] / n_tiles), np.ceil(ds.sizes[x_dim] / n_tiles)
         plan.update({y_dim: cy, x_dim: cx})
         if verbose:
             print(f"[chunking] Applying spatial tiling: ({n_tiles}×{n_tiles}) → {cy}×{cx}")
@@ -684,8 +668,7 @@ def ensure_optimal_chunking(
     t_guess, z_guess = ds.sizes.get("time", 1), ds.sizes.get(vertical_dim, 1)
 
     # Estimate the size of one horizontal plane
-    bytes_per_plane = plane_bytes / (output_scale_mult * working_set_multiplier)
-    target_bytes = (desired_chunk_size_mb or 128.0) * 1024 ** 2
+    target_bytes = (desired_chunk_size_mb or DEFAULT_CHUNK_SIZE_MB) * 1024 ** 2
 
     # Compute how many planes fit into the target
     n_planes_per_chunk = max(1, int(target_bytes // max(1, int(bytes_per_plane))))
@@ -695,13 +678,17 @@ def ensure_optimal_chunking(
               f"→ {n_planes_per_chunk} planes per chunk")
 
     # ---- Choose chunking strategy ----
+    z_target = int(np.ceil(np.sqrt(n_planes_per_chunk)))  # split planes into time and z
+    min_z_chunk = int(deriv_edge_order + 1)
+
     if needs_t and needs_z:
         # Split budget roughly between z and time
-        z_chunk = choose_z_chunk_size(z_guess, deriv_edge_order + 1, sys_mult=n_planes_per_chunk)
-        t_chunk = max(1, min(t_guess, n_planes_per_chunk // max(1, z_chunk)))
+        z_chunk = _balanced_chunks(z_guess, z_target, min_z_chunk)
+        t_chunk = max(1, min(t_guess, n_planes_per_chunk // max(1, min(z_chunk))))
+
         plan.update({"time": t_chunk, vertical_dim: z_chunk})
     elif needs_z:
-        z_chunk = choose_z_chunk_size(z_guess, deriv_edge_order + 1, sys_mult=n_planes_per_chunk)
+        z_chunk = _balanced_chunks(z_guess, n_planes_per_chunk, min_z_chunk)
         plan[vertical_dim] = z_chunk
     elif needs_t:
         plan["time"] = min(t_guess, n_planes_per_chunk)
@@ -713,7 +700,7 @@ def ensure_optimal_chunking(
         dim_size = ds.sizes[dim]
         if isinstance(chunks, int):
             if dim not in spatial_dims:
-                n_chunks = max(1, math.ceil(dim_size / chunks))
+                n_chunks = max(1, np.ceil(dim_size / chunks))
                 plan[dim] = _balanced_chunks(dim_size, dim_size // n_chunks, min_size=1)
             else:
                 plan[dim] = min(chunks, dim_size)
@@ -738,6 +725,6 @@ def ensure_optimal_chunking(
     if verbose:
         print(f"[chunking] Target: {_fmt_bytes(target_bytes)} | "
               f"Plan: {', '.join(msg_parts)} | "
-              f"Est. working set: {_fmt_bytes(total_est)}")
+              f"Est. output working set: {_fmt_bytes(total_est)}")
 
     return out

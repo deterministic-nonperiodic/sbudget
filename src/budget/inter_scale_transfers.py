@@ -12,13 +12,11 @@ from scipy.integrate import trapezoid
 from .budget import get_spatial_dims
 from .cf_coords import is_geographic_grid, _is_global_longitude
 from .chunking_tools import CacheManager, ensure_optimal_chunking, optimal_batch_size
+from .chunking_tools import DEFAULT_CHUNK_SIZE_MB
 from .constants import earth_radius, epsilon
 
 # Constants
 _GEODE = Geod(ellps="WGS84")
-
-# Set dask parameters
-DEFAULT_CHUNK_SIZE_MB = 512  # MB
 
 
 def infer_boundary_conditions(x_coord: xr.DataArray, **kwargs) -> tuple[str, str]:
@@ -944,7 +942,7 @@ def increment_integrand(
         ]
 
         # Force full realization before concat (avoids lazy reopen issues)
-        batch_result = xr.concat(batch_blocks, dim="r")  # .compute()
+        batch_result = xr.concat(batch_blocks, dim="r")
 
         # ---- Cleanup local cache & memory ----
         gc.collect()
@@ -1029,13 +1027,11 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Ensure the result fits in memory or compute in chunks along non-spatial dimensions
     # Spatial dimensions are only rechunked if spatial plane times scales does not fit in memory
     if allow_rechunking:
-        wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name),
-                                       # limit chunk size (MB)
+        wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name), vertical_dim="z",
+                                       # largest chunk limit chunk size (MB)
                                        desired_chunk_size_mb=float(chunk_size_mb),
                                        # Safer 50% threshold for Dask compute budget
                                        memory_threshold_ratio=0.8,
-                                       # extra memory for temporary arrays, i.e., padding, shifts
-                                       working_set_multiplier=5,
                                        # Data size increase by number of scales
                                        output_scale_mult=increments['r'].size,
                                        # No derivatives required here. Allow min z-chunk size = 1
