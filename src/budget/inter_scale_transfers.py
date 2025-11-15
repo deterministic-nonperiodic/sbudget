@@ -1,4 +1,4 @@
-import gc
+import uuid
 from typing import Any, Optional, Union, List
 
 import dask
@@ -37,8 +37,12 @@ def infer_boundary_conditions(x_coord: xr.DataArray, **kwargs) -> tuple[str, str
     """
 
     # Check if the user has already specified the boundary conditions
-    x_boundary = kwargs.get("x_coord_boundary",
-                            "periodic" if _is_global_longitude(x_coord) else "reflect")
+    x_boundary = kwargs.get("x_coord_boundary", "reflect")
+
+    if x_boundary != "periodic" and _is_global_longitude(x_coord):
+        print(f"[boundary_condition] Global domain detected; "
+              f"overriding user defined {x_boundary} with {'periodic'}")
+        x_boundary = "periodic"
 
     # For y_boundary, default to "fill" as it is the most common case.
     y_boundary = kwargs.get("y_coord_boundary", "reflect")
@@ -772,18 +776,17 @@ def scale_space_integral(
 
 def process_single_r_for_field_chunk(
         field_chunk_ds: xr.Dataset,
-        r_scalar_val: float,
-        scale_mask_for_r: xr.DataArray,
-        scale_angle_grid: xr.DataArray,
-        nx_shift_coords: xr.DataArray,
-        ny_shift_coords: xr.DataArray,
-        angle_weight_grid: xr.DataArray,
-        x_dim: str,
-        y_dim: str,
-        x_boundary_type: str,
-        y_boundary_type: str,
+        angles: np.ndarray = 0,
+        nx_values: np.ndarray = 0,
+        ny_values: np.ndarray = 0,
+        normalized_weights: np.ndarray = 1,
+        x_dim: str = 'x',
+        y_dim: str = 'y',
+        x_boundary_type: str = 'periodic',
+        y_boundary_type: str = 'periodic',
         transform_type: str = "delta_u_cubed",
-        auto_cleanup: bool = True
+        cache_manager: CacheManager = None,
+        block_id: str = None
 ) -> xr.DataArray:
     """
     Memory-optimized and optionally shift-persistent integrand calculation.
@@ -794,58 +797,31 @@ def process_single_r_for_field_chunk(
     if transform_type != "delta_u_cubed":
         raise ValueError(f"Transform_type '{transform_type}' not implemented.")
 
-    # Initialize cache manager for large copies of the input field spilled to DISK.
-    cache = CacheManager(mem_threshold=0.2,  # in-memory if >10% RAM available
-                         auto_cleanup=auto_cleanup,
-                         verbose=False)
-
-    # --- Identify valid shift-angle pairs ---
-    valid_mask = scale_mask_for_r.data.astype(bool)
-    if not np.any(valid_mask):
-        raise ValueError(f"No valid angular shifts found for r = {r_scalar_val:.2f} m")
-
-    # --- Extract shift indices and weights ---
-    angles = scale_angle_grid.data[valid_mask]
-    weights = angle_weight_grid.data[valid_mask].astype(np.float32)
-
-    # Reverted to original, correct 1D indexing for nx/ny coordinates
-    ny_idx, nx_idx = np.where(valid_mask)
-
-    nx_values = nx_shift_coords.data[nx_idx].astype(int)
-    ny_values = ny_shift_coords.data[ny_idx].astype(int)
-
-    # Normalize weights
-    weights *= 2.0 * np.pi / np.sum(weights)
-    total_weight = np.sum(weights)
-
-    # --- Initialize accumulation ---
-    weighted_sum = xr.zeros_like(field_chunk_ds["u"], dtype=np.float32)
+    # Ensure block_id is a tuple of ints
+    if block_id is None:
+        block_id = ""
 
     # --- Shift-loop computation ---
-    for phi, nx, ny, weight in zip(angles, nx_values, ny_values, weights):
+    weighted_shifts: List[xr.DataArray] = []
+
+    for phi, nx, ny, weight in zip(angles, nx_values, ny_values, normalized_weights):
         # Apply shift to base dataset
         rolled_ds = roll_with_boundary_handling(field_chunk_ds,
                                                 nx, ny, x_dim, y_dim,
                                                 x_boundary_type, y_boundary_type)
         # Adaptive persistence (RAM / DISK spill)
-        rolled_ds = cache.persist(rolled_ds, (nx, ny))
+        if cache_manager is not None:
+            cache_key = (int(nx), int(ny), block_id)
+            rolled_ds = cache_manager.persist(rolled_ds, key=cache_key)
 
         # Compute contribution for this shift
-        res = delta_u_cubed_geographic(field_chunk_ds, rolled_ds, phi)
-        weighted_sum = weighted_sum + res * weight
+        delta_u_cubed = delta_u_cubed_geographic(field_chunk_ds, rolled_ds, phi)
+        weighted_shifts.append(delta_u_cubed * weight)
 
-    # --- Weighted average ---
-    integrand = weighted_sum / np.clip(total_weight, epsilon, None)
+    integrand = sum(weighted_shifts).rename(transform_type)
 
-    # --- Expand dims for map_blocks consistency ---
-    if 'r' in integrand.coords:
-        integrand = integrand.drop_vars('r')
-
-    integrand = integrand.rename(transform_type)
-    # MUST use [0.0] here to match the template's 'r' coordinate.
-    integrand = integrand.expand_dims({'r': [0.0]}).transpose("r", ...)
-
-    return integrand
+    # Expand to later assign the 'r' coordinate.
+    return integrand.expand_dims(r=1)
 
 
 def build_increment_integrand_template(field: xr.Dataset, transform_type: str) -> xr.DataArray:
@@ -855,17 +831,9 @@ def build_increment_integrand_template(field: xr.Dataset, transform_type: str) -
     """
     # Use the first variable in the dataset as a shape reference
     first_var_name = list(field.data_vars)[0]
-    base = xr.zeros_like(field[first_var_name])
-
     # The output of the block function has size 1 along 'r'
-    # The coordinate is defined as [0.0] to serve as a placeholder for the template.
-    template = base.expand_dims(r=[0.0])
-    template.name = transform_type
-
-    # Ensure the chunking matches the r=1 output of the block function
-    template = template.chunk({"r": 1})
-
-    return template
+    base = field[first_var_name].expand_dims(r=1)
+    return base.rename(transform_type)
 
 
 def increment_integrand(
@@ -897,59 +865,67 @@ def increment_integrand(
     xr.DataArray
         Lazy Dask-backed integrand concatenated along scale dimension 'r'.
     """
-    r_vals = np.asarray(increments["r"].values)
-    n_scales = r_vals.size
-
     x_boundary_type = increments.attrs.get("x_boundary_type", "periodic")
     y_boundary_type = increments.attrs.get("y_boundary_type", "reflect")
 
-    # ---- Auto-tune batch size if not provided ----
-    batch_size, n_batches = optimal_batch_size(field, n_scales, safety_factor=0.8)
+    # Initialize cache manager for large copies of the input field spilled to DISK.
+    cache_manager = CacheManager(
+        mem_threshold=0.25,
+        auto_cleanup=auto_cleanup,
+        verbose=True
+    )
+
+    # ---------------------------------------------
+    #  Precompute per-r parameters (3 x space size)
+    # ---------------------------------------------
+    angle_parameters = {}
+    for r in increments.r.values:
+        mask = increments.mask.sel(r=r).data.astype(bool)
+        if not np.any(mask):
+            raise ValueError(f"No valid angular shifts found for r = {r:.2f} m")
+
+        ny_idx, nx_idx = np.where(mask)
+        weights = increments.angle_weight.data[mask].astype(np.float32)
+        weights /= np.clip(np.sum(weights), epsilon, None)
+
+        angle_parameters[r] = dict(
+            angles=increments.angle_grid.data[mask],
+            nx_values=increments.nx.data[nx_idx].astype(int),
+            ny_values=increments.ny.data[ny_idx].astype(int),
+            normalized_weights=weights
+        )
+
+    # ---- Define block function once (important!) ----
+    def block_fn(field_chunk: xr.Dataset, r_value: float) -> xr.DataArray:
+        # Extract block indices from xarray's block_info
+        # Unique key per block + shift
+        block_id = uuid.uuid4().hex
+
+        return process_single_r_for_field_chunk(
+            field_chunk,
+            x_dim=x_dim, y_dim=y_dim,
+            x_boundary_type=x_boundary_type,
+            y_boundary_type=y_boundary_type,
+            transform_type=transform_type,
+            block_id=block_id,
+            cache_manager=cache_manager,
+            **angle_parameters[r_value])
 
     # Build reusable template once
     template = build_increment_integrand_template(field, transform_type)
 
-    # ---- Define block function once (important!) ----
-    def block_fn(field_chunk: xr.Dataset, r_val: float) -> xr.DataArray:
-        return process_single_r_for_field_chunk(
-            field_chunk_ds=field_chunk,
-            r_scalar_val=float(r_val),
-            scale_mask_for_r=increments["mask"].sel(r=r_val),
-            scale_angle_grid=increments["angle_grid"],
-            nx_shift_coords=increments["nx"],
-            ny_shift_coords=increments["ny"],
-            angle_weight_grid=increments["angle_weight"],
-            x_dim=x_dim,
-            y_dim=y_dim,
-            x_boundary_type=x_boundary_type,
-            y_boundary_type=y_boundary_type,
-            transform_type=transform_type,
-            auto_cleanup=auto_cleanup,  # handled below
-        )
+    # ---- Build tasks for each radial distance ----
+    blocks = [
+        xr.map_blocks(block_fn,
+                      field, kwargs=dict(r_value=r_value),
+                      template=template)
+        for r_value in increments["r"].values
+    ]
 
-    # ---- Iterate over batches ----
-    all_batches = []
+    # ---- Merge all blocks lazily (using the batch size as r chunk size) ----
+    batch_size = optimal_batch_size(field, increments["r"].size)
 
-    for batch in range(n_batches):
-        r_batch = r_vals[batch * batch_size:(batch + 1) * batch_size]
-
-        # Build tasks for this batch
-        batch_blocks = [
-            xr.map_blocks(block_fn, field,
-                          kwargs={'r_val': r},
-                          template=template).assign_coords(r=[r])
-            for r in r_batch
-        ]
-
-        # Force full realization before concat (avoids lazy reopen issues)
-        batch_result = xr.concat(batch_blocks, dim="r")
-
-        # ---- Cleanup local cache & memory ----
-        gc.collect()
-        all_batches.append(batch_result)
-
-    # ---- Merge all batches lazily ----
-    integrand = xr.concat(all_batches, dim="r").chunk(r=min(batch_size, n_scales))
+    integrand = xr.concat(blocks, dim=increments["r"]).chunk(r=batch_size)
 
     return integrand
 
@@ -1030,12 +1006,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         wind = ensure_optimal_chunking(wind, spatial_dims=(y_name, x_name), vertical_dim="z",
                                        # largest chunk limit chunk size (MB)
                                        desired_chunk_size_mb=float(chunk_size_mb),
-                                       # Safer 50% threshold for Dask compute budget
-                                       memory_threshold_ratio=0.8,
                                        # Data size increase by number of scales
-                                       output_scale_mult=increments['r'].size,
-                                       # No derivatives required here. Allow min z-chunk size = 1
-                                       deriv_edge_order=0)
+                                       output_scale_mult=increments['r'].size)
 
     # Compute third-order structure functions. Mask missing values in velocity components.
     nan_mask = xr.concat(

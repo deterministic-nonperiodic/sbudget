@@ -20,18 +20,24 @@ import shutil
 import tempfile
 import threading
 import uuid
+import warnings
 from pathlib import Path
 from threading import Lock
 from typing import *
-from typing import Dict, Optional
+from typing import Optional
 
 import numpy as np
 import psutil
 import xarray as xr
-from dask.distributed import get_client
-from dask.distributed import get_worker
+from dask.distributed import get_client, get_worker
 from filelock import FileLock, BaseFileLock
 from numcodecs import Blosc
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message="Consolidated metadata is currently not part in the Zarr format 3 specification.*",
+)
 
 # --- Increase open file limit ---
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -44,6 +50,22 @@ _MEMORY_RESERVE_RATIO = 0.85
 _SMALL_DATA_THRESHOLD_MB = 512.0  # skip chunking for small datasets
 DEFAULT_CHUNK_SIZE_MB = 2048  # MB
 
+
+# ==========================================================
+# Helper utilities
+# ==========================================================
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024:
+            return f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} PB"
+
+
+# ---------------------------------------------------------------------
+# Global cleanup registry (ensures all temp dirs removed on exit)
+# ---------------------------------------------------------------------
 # ---------------------------------------------------------------------
 # Global cleanup registry (ensures all temp dirs removed on exit)
 # ---------------------------------------------------------------------
@@ -98,7 +120,7 @@ class CacheManager:
         self.auto_cleanup = auto_cleanup
         self.mem_threshold = mem_threshold
         self.max_total_bytes = max_total_gb * 1024 ** 3
-        self.compressor = Blosc(cname=compressor, clevel=1, shuffle=Blosc.SHUFFLE)
+        self.compressor = Blosc(cname=compressor, clevel=1, shuffle=1)
 
         self._tracked_dirs: set[str] = set()
 
@@ -323,7 +345,7 @@ class CacheManager:
                 if self.verbose:
                     print(f"[cache] WARNING: failed to remove {victim}: {e}")
 
-    def _write_to_disk_zarr(self, ds: xr.Dataset, key: tuple[int, int]) -> xr.Dataset:
+    def _write_to_disk_zarr(self, ds: xr.Dataset, key: tuple[int, int, str]) -> xr.Dataset:
         """
         Efficiently write a Dataset to disk as a Zarr store.
 
@@ -334,8 +356,8 @@ class CacheManager:
 
         # --- Active session directory ---
         cache_dir = self._get_active_cache_dir()
-        nx, ny = key
-        z_path = os.path.join(cache_dir, f"shift_{nx:+04d}_{ny:+04d}.zarr")
+        nx, ny, hs = key
+        z_path = os.path.join(cache_dir, f"shift_{nx:+04d}_{ny:+04d}_{hs}.zarr")
 
         # --- Try to reuse existing cache ---
         if os.path.exists(z_path):
@@ -385,7 +407,7 @@ class CacheManager:
     # ==========================================================
     # Unified hybrid persistence API
     # ==========================================================
-    def persist(self, ds: xr.Dataset, key: tuple[int, int]) -> xr.Dataset | None:
+    def persist(self, ds: xr.Dataset, key: tuple[int, int, str]) -> xr.Dataset | None:
 
         # Check available memory
         avail_ratio = self._available_memory_ratio()
@@ -406,76 +428,77 @@ class CacheManager:
 # ---------------------------------------------------------------
 # 2. Memory estimation utilities
 # ---------------------------------------------------------------
-def _fmt_bytes(n_bytes: float) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    while n_bytes >= 1024 and i < len(units) - 1:
-        n_bytes /= 1024
-        i += 1
-    return f"{n_bytes:.2f} {units[i]}"
-
-
 def estimate_dataset_bytes(
-        ds: xr.Dataset,
+        obj: Union[xr.Dataset, xr.Dataset],
         exclude_dims: Iterable[str] | str | None = None,
         mode: str = "largest_chunk",
 ) -> int:
     """
-    Estimate memory footprint (bytes) for a dataset.
+    Estimate memory footprint (in bytes) for an xarray Dataset or DataArray.
 
     Parameters
     ----------
-    ds : xr.Dataset
-        The dataset to inspect.
+    obj : xr.Dataset or xr.DataArray
+        The object to analyze.
     exclude_dims : iterable of str or str, optional
-        Dimensions to exclude when computing chunk sizes (e.g., 'time').
+        Dimensions to exclude when computing chunk sizes (e.g. 'time').
     mode : {'largest_chunk', 'total'}
-        - 'largest_chunk': estimate memory for the largest single chunk
-          across variables (default, for working-set estimation).
-        - 'total': sum of all variable sizes across all chunks.
+        - 'largest_chunk': size of the largest single chunk.
+        - 'total': sum of all chunks.
 
     Returns
     -------
     int
-        Estimated memory footprint in bytes (metadata-only, no computation).
+        Estimated memory footprint in bytes.
     """
+    # Normalize exclude_dims
     if isinstance(exclude_dims, str):
         exclude_dims = [exclude_dims]
     exclude_dims = set(exclude_dims or [])
 
-    total = 0
-
-    for v in ds.data_vars.values():
+    def estimate_for_var(v: xr.DataArray) -> int:
+        """Estimate byte size for a single DataArray."""
         item_size = np.dtype(v.dtype).itemsize
-        chunks = getattr(v, "chunksizes", None)
+        chunks = getattr(v.data, "chunks", None)
 
-        if chunks:
-            # List of chunk sizes per dimension
-            dim_chunks = [chunks.get(d, (v.sizes[d],)) for d in v.dims]
+        # Produce dim_chunks: list of tuples, each tuple = chunk sizes along that dim
+        if chunks is not None:
+            # Dask-backed
+            dim_chunks = list(chunks)
         else:
-            # Non-dask (fully in-memory) arrays
+            # In-memory array: one chunk equal to the full dimension size
             dim_chunks = [(v.sizes[d],) for d in v.dims]
 
         if mode == "largest_chunk":
-            # Estimate memory of largest chunk per variable
             elems = 1
             for d, ch in zip(v.dims, dim_chunks):
-                elems *= 1 if d in exclude_dims else max(ch)
-            total += elems * item_size
+                if d in exclude_dims:
+                    elems *= 1
+                else:
+                    elems *= max(ch)
+            return elems * item_size
 
         elif mode == "total":
-            # Estimate total dataset memory (sum of all chunks)
             elems = 1
             for d, ch in zip(v.dims, dim_chunks):
                 if d in exclude_dims:
                     continue
                 elems *= sum(ch)
-            total += elems * item_size
+            return elems * item_size
 
         else:
-            raise ValueError("mode must be either 'largest_chunk' or 'total'")
+            raise ValueError("mode must be 'largest_chunk' or 'total'.")
 
-    return int(total)
+    # --- Handle Dataset by recursion ---
+    if isinstance(obj, xr.Dataset):
+        return int(sum(estimate_for_var(v) for v in obj.data_vars.values()))
+
+    # --- Handle DataArray directly ---
+    elif isinstance(obj, xr.DataArray):
+        return int(estimate_for_var(obj))
+
+    else:
+        raise TypeError("Input must be an xarray Dataset or DataArray.")
 
 
 def fits_in_memory(
@@ -523,14 +546,11 @@ def get_worker_memory_budget(reserve_ratio: float = _MEMORY_RESERVE_RATIO) -> tu
 
 
 def optimal_batch_size(
-        ds: xr.Dataset,
+        obj: Union[xr.Dataset, xr.Dataset],
         items_total: int,
         exclude_dims: Iterable[str] | str | None = None,
-        working_set_multiplier: int = 1,
         reserve_ratio: float = _MEMORY_RESERVE_RATIO,
-        safety_factor: float = 0.5,
-        verbose: bool = True,
-) -> tuple[int, int]:
+        verbose: bool = True) -> int:
     """
     Estimate a safe batch size for processing multiple scales or loop items
     based on available memory and dataset footprint.
@@ -538,18 +558,20 @@ def optimal_batch_size(
     Automatically accounts for multi-worker (SLURM/Dask) environments.
     """
     # --- Estimate memory per dataset instance ---
-    per_item_bytes = estimate_dataset_bytes(ds, exclude_dims=exclude_dims, mode="total")
-    per_item_bytes *= working_set_multiplier
+    per_item_bytes = estimate_dataset_bytes(obj, exclude_dims=exclude_dims, mode="total")
 
     per_item_bytes = max(1, per_item_bytes)
 
     # --- Worker-aware memory budget ---
-    per_worker_budget, n_workers = get_worker_memory_budget(reserve_ratio)
-    usable_mem = per_worker_budget * safety_factor
+    usable_mem, n_workers = get_worker_memory_budget(reserve_ratio)
 
     # --- Compute max safe items ---
     max_items_fit = max(1, int(usable_mem // per_item_bytes))
-    batch_size = min(items_total, max_items_fit)
+
+    if items_total == 1:
+        batch_size = 1
+    else:
+        batch_size = max(2, min(items_total, max_items_fit))
 
     n_batches = min(items_total, int(np.ceil(items_total / batch_size)))
 
@@ -560,7 +582,7 @@ def optimal_batch_size(
               f"| usable/worker ≈ {_fmt_bytes(usable_mem)} ({n_workers} workers)"
               f"| Running {n_batches} batches of ≤{batch_size} (out of {items_total})")
 
-    return batch_size, n_batches
+    return batch_size
 
 
 # ---------------------------------------------------------------
@@ -615,7 +637,7 @@ def ensure_optimal_chunking(
         spatial_dims: Tuple[str, str] = ("lat", "lon"),
         vertical_dim: str = "z",
         memory_threshold_ratio: float = _MEMORY_RESERVE_RATIO,
-        deriv_edge_order: int = 2,
+        deriv_edge_order: int = 0,
         verbose: bool = True,
         rechunk_spatial: bool = False,
         output_scale_mult: int = 1,
