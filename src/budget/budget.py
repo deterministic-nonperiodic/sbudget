@@ -5,7 +5,7 @@ import numpy as np
 import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
-from .chunking_tools import ensure_optimal_chunking, DEFAULT_CHUNK_SIZE_MB
+from .memory_manager import ensure_optimal_chunking, DEFAULT_CHUNK_SIZE_MB
 from .constants import cp, Omega, epsilon
 from .numeric_tools import domain_mean, stack_vector, rotate_vector
 from .numeric_tools import horizontal_advection, horizontal_gradient
@@ -401,8 +401,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
                                      # largest chunk limit chunk size (MB)
                                      desired_chunk_size_mb=float(chunk_size_mb),
-                                     # Use up to 50% of available memory
-                                     memory_threshold_ratio=0.85,
+                                     # Use up to 90% of available memory
+                                     memory_threshold_ratio=0.9,
                                      # Stencil order for finite difference formulas
                                      deriv_edge_order=2,
                                      # Switch for spatial rechunk: small impact on the performance

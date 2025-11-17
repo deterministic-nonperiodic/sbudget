@@ -10,107 +10,85 @@ This module centralizes:
     - Safe cleanup of temporary files and grouped stores
     - Recommendations for persistence strategy (memory vs. disk)
 """
+
 import atexit
-import gc
-import hashlib
-import json
 import os
-import resource
 import shutil
 import tempfile
 import threading
+import time
 import uuid
-import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Lock
-from typing import *
-from typing import Optional
+from typing import Optional, ClassVar, Union, List, Tuple, Iterable, Dict, Any
 
-import dask.base
 import numpy as np
 import psutil
 import xarray as xr
+from dask.base import tokenize
 from dask.distributed import get_client, get_worker
-from filelock import FileLock, BaseFileLock
 from numcodecs import Blosc
 
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    message="Consolidated metadata is currently not part in the Zarr format 3 specification.*",
-)
-
-# --- Increase open file limit ---
-soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
-
-# ---------------------------------------------------------------
-# Global configuration constants
-# ---------------------------------------------------------------
+# ======================================================================
+# Global configuration parameters
+# ======================================================================
 _MEMORY_RESERVE_RATIO = 0.85
 _SMALL_DATA_THRESHOLD_MB = 64.0  # skip chunking for small datasets
 DEFAULT_CHUNK_SIZE_MB = 256  # MB
 
 
-# ==========================================================
-# Helper utilities
-# ==========================================================
+# ======================================================================
+# Utility
+# ======================================================================
+def _simple_tokenize(obj):
+    """Uses Dask's tokenize which is fast but not content-aware for NumPy arrays."""
+    return tokenize(obj)
 
-def _fmt_bytes(n: int) -> str:
+
+def _fmt_bytes(n):
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if n < 1024:
-            return f"{n:.2f} {unit}"
+            return f"{n:.1f}{unit}"
         n /= 1024
-    return f"{n:.2f} PB"
+    return f"{n:.1f}PB"
 
 
-# ---------------------------------------------------------------------
-# Global cleanup registry (ensures all temp dirs removed on exit)
-# ---------------------------------------------------------------------
+# ======================================================================
+# Async, Worker-Aware CacheManager
+# ======================================================================
 
-_LOCKS_LOCK = threading.Lock()
-_LOCKS: Dict[str, threading.Lock] = {}
-
-
-def _get_lock(lock_id: str, tmpdir: Path) -> tuple[Lock, BaseFileLock]:
-    """Returns a (threading.Lock, FileLock) pair for thread and process safety."""
-
-    # 1. Thread Lock (Intra-process)
-    with _LOCKS_LOCK:
-        if lock_id not in _LOCKS:
-            _LOCKS[lock_id] = threading.Lock()
-        thread_lock = _LOCKS[lock_id]
-
-    # 2. File Lock (Cross-process)
-    lock_hash = hashlib.md5(lock_id.encode()).hexdigest()
-    lock_file = tmpdir / f".lock_{lock_hash}.lock"
-    file_lock = FileLock(lock_file)
-
-    return thread_lock, file_lock
-
-
-# --- CacheManager Class ---
 class CacheManager:
-    """Worker-aware hybrid cache manager for Zarr and Joblib persistence.
+    """
+    High-performance hybrid persistence manager.
 
-    Provides:
-      • Automatic in-memory vs. disk persistence based on memory pressure.
-      • Separate cache sessions per worker (safe for Dask/distributed runs).
-      • Automatic cleanup and disk quota enforcement.
-      • Reuse of existing cache files when possible.
+    Features:
+    ----------
+    • Worker-aware singleton instance (one per Dask worker process).
+    • Automatic memory/disk spill based on free RAM.
+    • Asynchronous Zarr-v2 writing via a dedicated writer thread.
+    • Reuse of existing cached files + hit ratio tracking.
+    • Optional auto cleanup + disk quota enforcement.
     """
 
-    _GLOBAL_SESSION = None
-    _CACHE_INDEX_NAME = "cache_index.json"
+    _GLOBAL_SESSION: ClassVar[Optional[Path]] = None
+    _CACHE_INDEX_NAME: ClassVar[str] = "cache_index.json"
 
+    # Worker-aware singleton storage
+    _INSTANCES: ClassVar[dict] = {}
+    _INSTANCE_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
     def __init__(
             self,
-            base_dir: Optional[str] = None,
+            base_dir: str | None = None,
             max_total_gb: float = 50.0,
             force_threshold: float = 0.2,
             verbose: bool = False,
             auto_cleanup: bool = True,
             compressor: str = "lz4",
+            max_workers: int = 4,  # Increased default to 4 for better I/O concurrency
     ):
         self.verbose = verbose
         self.auto_cleanup = auto_cleanup
@@ -118,43 +96,77 @@ class CacheManager:
         self.max_total_bytes = max_total_gb * 1024 ** 3
         self.compressor = Blosc(cname=compressor, clevel=1, shuffle=Blosc.SHUFFLE)
 
-        self._tracked_dirs: set[str] = set()
-        self.total_reused_files = 0
+        # Metrics
         self.total_processed_files = 0
+        self.total_reused_files = 0
 
-        # ----------------------------------------------------------
-        # 1. Resolve base directory (worker-aware)
-        # ----------------------------------------------------------
+        # Resolve global base directory
         self.base_dir = self._resolve_base_dir(base_dir)
 
-        # ----------------------------------------------------------
-        # 2. Create unique session per worker
-        # ----------------------------------------------------------
+        # Worker-aware session directory
         worker_id = self._get_worker_id()
-        session_suffix = f"session_{os.getpid()}_{uuid.uuid4().hex[:6]}"
-        if worker_id:
-            session_suffix += f"_worker_{worker_id}"
 
-        # cleanup stale sessions before creating a new one
+        # Use a deterministic name for workers to potentially simplify reuse/debugging
+        if worker_id:
+            session_suffix = f"session_worker_{worker_id}_{os.getpid()}"
+        else:
+            session_suffix = f"session_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+
+        # Cleanup any stale sessions
         self._cleanup_stale_sessions()
-        self.session_dir = self.base_dir / session_suffix
+
+        # Create this session directory
+        self.session_dir = Path(self.base_dir) / session_suffix
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
         if CacheManager._GLOBAL_SESSION is None:
             CacheManager._GLOBAL_SESSION = self.session_dir
 
-        # ----------------------------------------------------------
-        # 4. Register automatic cleanup
-        # ----------------------------------------------------------
+        # Active var-cache root (created on demand)
+        self._active_cache_dir = None
+        self._tracked_dirs: set[str] = set()
+
+        # Encoding cache (set on first write)
+        self._encoding_cache = None
+
+        # Async executor for Zarr writes
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._pending_writes = {}  # key → Future
+        atexit.register(self._shutdown_executor)
+
+        # Enforce quota if desired
         if self.auto_cleanup:
             self._enforce_quota()
             atexit.register(self.cleanup_session)
+
+    # --- FACTORY METHOD ---
+    @classmethod
+    def for_current_worker(cls, **kwargs) -> "CacheManager":
+        """
+        Factory method to get or create a CacheManager for the current worker/process.
+        Ensures only one instance exists per Dask worker process.
+        """
+        worker_id = cls._get_worker_id()
+
+        # Use a key unique to the execution context
+        key = f"worker_{worker_id}" if worker_id else f"pid_{os.getpid()}"
+
+        with cls._INSTANCE_LOCK:
+            if key not in cls._INSTANCES:
+                if kwargs.get('verbose'):
+                    print(f"[CacheManager] Initializing new instance for {key}")
+                cls._INSTANCES[key] = cls(**kwargs)
+
+            return cls._INSTANCES[key]
+
+    # ==================================================================
+    # Directory utilities
+    # ==================================================================
 
     @classmethod
     def _resolve_base_dir(cls, base_dir: str | None = None) -> Path:
         """
         Resolve the cache base directory using the same logic everywhere.
-        Honors SBUDGET_CACHE_DIR, TMPDIR, or defaults to ~/.cache/sbudget.
         """
         base_dir = (
                 base_dir
@@ -166,121 +178,30 @@ class CacheManager:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _get_worker_id(self) -> str | None:
+    @staticmethod
+    def _get_worker_id():
         """
-        Calls dask.distributed.get_worker.
         Returns the worker ID if running on a worker, otherwise returns None.
         """
         try:
             worker = get_worker()
             return getattr(worker, "name", None) or getattr(worker, "id", None)
-        except ValueError:
-            # Running locally or outside a Dask worker context
+        except Exception:
             return None
 
-    # ==========================================================
-    # Index and cleanup utilities
-    # ==========================================================
-    def _index_path(self, tmpdir: Path | None = None) -> Path:
-        return Path(tmpdir or self.session_dir) / self._CACHE_INDEX_NAME
-
-    def load_index(self, tmpdir: str | Path | None = None) -> dict:
-        """Load or initialize a cache index from a directory."""
-        path = self._index_path(tmpdir)
-        if not path.exists():
-            return {}
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def save_index(self, index: dict, tmpdir: str | Path | None = None) -> None:
-        """Write updated cache index to disk."""
-        path = self._index_path(tmpdir)
-        try:
-            with open(path, "w") as f:
-                json.dump(index, f, indent=2)
-        except Exception as e:
-            if self.verbose:
-                print(f"[cache] WARNING: Failed to write cache index: {e}")
-
-    def cleanup_stale_entries(self, tmpdir: str | Path | None = None) -> dict:
-        """Remove orphaned entries from cache index."""
-        tmpdir = Path(tmpdir or self.session_dir)
-        # Lock required before accessing/modifying the index file
-        thread_lock, file_lock = _get_lock(str(tmpdir / self._CACHE_INDEX_NAME), self.session_dir)
-
-        with thread_lock, file_lock:
-            index = self.load_index(tmpdir)
-            changed = False
-            for key, path in list(index.items()):
-                # If path doesn't exist (e.g., deleted by another process's quota enforcement)
-                if not os.path.exists(path):
-                    del index[key]
-                    changed = True
-            if changed:
-                self.save_index(index, tmpdir)
-            return index
-
-    def _cleanup_stale_sessions(self):
-        """Remove stale cache sessions from dead processes."""
-        for s in self.base_dir.glob("session_*"):
-            if not s.is_dir():
-                continue
-            # Extract PID from directory name (format: session_<pid>_<uuid>)
-            try:
-                pid = int(s.name.split("_")[1])
-            except (IndexError, ValueError):
-                continue
-
-            # If that PID no longer exists, remove the directory
-            if not psutil.pid_exists(pid):
-                if self.verbose:
-                    print(f"[cache] Removing stale cache session {s}")
-                shutil.rmtree(s, ignore_errors=True)
-
-    def cleanup_session(self):
-        """Delete tracked temporary directories and the session directory."""
-        # Note: atexit already handles cleanup, this is mainly for manual calls.
-        for p in list(self._tracked_dirs):
-            shutil.rmtree(p, ignore_errors=True)
-        self._tracked_dirs.clear()
-        if self.session_dir.exists():
-            shutil.rmtree(self.session_dir, ignore_errors=True)
-            if self.verbose:
-                print(f"[cache] Cleaned session cache: {self.session_dir}")
-
-    def cleanup_all(self):
-        """Delete all cache sessions under the base directory."""
-        for s in self.base_dir.glob("session_*"):
-            if s.is_dir():
-                shutil.rmtree(s, ignore_errors=True)
-        if self.verbose:
-            print(f"[cache] Cleaned all sessions under {self.base_dir}")
-
-    # ==========================================================
-    # Directory management
-    # ==========================================================
-    def new_var_cache(self, prefix: str = "var_cache", subdir: str | None = None) -> Path:
+    def new_var_cache(self, prefix="var_cache", subdir=None):
         """
         Create a variable-specific cache directory under this session.
-        Respects the user-specified base_dir.
         """
-        # ensure a global session
         if CacheManager._GLOBAL_SESSION is None:
             CacheManager._GLOBAL_SESSION = self.session_dir
 
-        # always use this instance's session, not the class global one
-        base_dir = self.session_dir
+        base = self.session_dir
+        if subdir:
+            base = base / str(subdir)
+            base.mkdir(parents=True, exist_ok=True)
 
-        # optionally add subdir (e.g. r40500)
-        if subdir is not None:
-            base_dir = os.path.join(base_dir, str(subdir))
-            os.makedirs(base_dir, exist_ok=True)
-
-        tmp = tempfile.mkdtemp(prefix=f"{prefix}_", dir=base_dir)
-        path = Path(tmp)
+        path = Path(tempfile.mkdtemp(prefix=f"{prefix}_", dir=base))
         self._register_temp_dir(path)
 
         if self.verbose:
@@ -288,36 +209,84 @@ class CacheManager:
 
         return path
 
-    def _register_temp_dir(self, path: str | Path):
-        """Track a temporary directory for later cleanup."""
-        path = str(path)
-        self._tracked_dirs.add(path)
-        # Note: atexit cleanup is handled in __init__ for the main session,
-        # but registering here handles subdirectories created post-init.
+    def _register_temp_dir(self, p: Path):
+        p = str(p)
+        self._tracked_dirs.add(p)
         if self.auto_cleanup:
-            atexit.register(lambda p=path: shutil.rmtree(p, ignore_errors=True))
+            atexit.register(lambda path=p: shutil.rmtree(path, ignore_errors=True))
 
-    def _get_active_cache_dir(self, subdir=None) -> Path:
-        """Return a persistent per-session cache directory for shifts."""
-        if not hasattr(self, "_active_cache_dir"):
-            self._active_cache_dir = self.new_var_cache(subdir=subdir)
-        return Path(self._active_cache_dir)
+    def _get_active_cache_dir(self):
+        if self._active_cache_dir is None:
+            self._active_cache_dir = self.new_var_cache(prefix="zarr_cache")
+        return self._active_cache_dir
 
-    # ==========================================================
-    # Memory & quota management
-    # ==========================================================
-    def _available_memory_ratio(self) -> float:
-        # mem = psutil.virtual_memory()
-        # return mem.available / mem.total
-        return 1.0 - psutil.virtual_memory().percent / 100.0
+    # ==================================================================
+    # Cleanup utilities
+    # ==================================================================
+
+    def _cleanup_stale_sessions(self):
+        """Remove stale cache sessions from dead processes, handling worker names."""
+        for s in Path(self.base_dir).glob("session_*"):
+            if not s.is_dir():
+                continue
+            try:
+                # Attempt to parse PID, handles: session_<pid>_... or session_worker_<id>_<pid>
+                parts = s.name.split("_")
+                if "worker" in parts:
+                    # format: session_worker_<id>_<pid>
+                    pid = int(parts[-1])
+                else:
+                    # format: session_<pid>_<uuid>
+                    pid = int(parts[1])
+            except (IndexError, ValueError):
+                continue
+
+            # If that PID no longer exists, remove the directory
+            if not psutil.pid_exists(pid):
+                if self.verbose:
+                    print(f"[cache] Removing stale session: {s}")
+                shutil.rmtree(s, ignore_errors=True)
+
+    def cleanup_session(self):
+        for p in list(self._tracked_dirs):
+            shutil.rmtree(p, ignore_errors=True)
+
+        # Ensure the executor is shut down before attempting to remove the session dir
+        self._shutdown_executor()
+
+        if self.session_dir.exists():
+            shutil.rmtree(self.session_dir, ignore_errors=True)
+            if self.verbose:
+                print(f"[cache] Cleaned session cache: {self.session_dir}")
+
+    def cleanup_all(self):
+        for s in Path(self.base_dir).glob("session_*"):
+            shutil.rmtree(s, ignore_errors=True)
+        if self.verbose:
+            print(f"[cache] Cleaned all sessions under {self.base_dir}")
+
+    # ==================================================================
+    # Metrics
+    # ==================================================================
+    def get_reuse_fraction(self) -> float:
+        """Returns the ratio of reused files to total processed files (0.0 to 1.0)."""
+        if self.total_processed_files == 0:
+            return 0.0
+        return self.total_reused_files / self.total_processed_files
+
+    # ==================================================================
+    # Memory + quota utilities
+    # ==================================================================
+
+    def _available_memory_ratio(self):
+        mem = psutil.virtual_memory()
+        return mem.available / mem.total
 
     def _enforce_quota(self):
-        """Safely delete old sessions to stay within disk quota."""
-        sessions = [p for p in self.base_dir.glob("session_*") if p.is_dir()]
+        sessions = [p for p in Path(self.base_dir).glob("session_*") if p.is_dir()]
         if not sessions:
             return
 
-        # Never delete the active session
         sessions = [s for s in sessions if s != self.session_dir]
 
         total_bytes = sum(
@@ -329,8 +298,9 @@ class CacheManager:
             return
 
         sessions.sort(key=lambda p: p.stat().st_mtime)
+
         if self.verbose:
-            print(f"[cache] Quota exceeded ({_fmt_bytes(total_bytes)}). Cleaning old sessions...")
+            print(f"[cache] Disk quota exceeded ({_fmt_bytes(total_bytes)})")
 
         while sessions and total_bytes > self.max_total_bytes:
             victim = sessions.pop(0)
@@ -344,43 +314,74 @@ class CacheManager:
                 if self.verbose:
                     print(f"[cache] WARNING: failed to remove {victim}: {e}")
 
-    # ===============================================================
-    # Core I/O
-    # ===============================================================
-    def _reopen_zarr(self, store: str, ref: xr.Dataset | xr.DataArray):
+    # ==================================================================
+    # Async executor shutdown
+    # ==================================================================
+
+    def _shutdown_executor(self):
+        # Wait for all pending writes to finish before shutting down
+        self.wait_for_all_writes()
+
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    def wait_for_all_writes(self):
+        """Public method to block until all pending asynchronous writes are complete."""
+        keys_to_wait = list(self._pending_writes.keys())
+        if self.verbose and keys_to_wait:
+            print(f"[CacheManager] Waiting for {len(keys_to_wait)} pending writes to finish...")
+
+        for key in keys_to_wait:
+            self._ensure_finished(key, log_slow=False)
+
+    # ==================================================================
+    # Async write + lazy reopen utilities
+    # ==================================================================
+
+    def _async_write(self, ds: xr.Dataset, z_path: str, encoding: dict):
+        """Target function for ThreadPoolExecutor."""
+        # Note: compute=True is critical here to ensure write happens in the thread
+        ds.to_zarr(
+            z_path,
+            mode="w",
+            consolidated=False,
+            zarr_format=2,
+            encoding=encoding,
+            compute=True,
+        )
+        return z_path
+
+    def _ensure_finished(self, key: str, log_slow: bool = True):
+        """Waits for a specific write job to complete and removes it from pending list."""
+        fut = self._pending_writes.get(key)
+        if fut is None:
+            return
+
+        start_time = time.time()
+        try:
+            # This will block until write is done (or raises an exception)
+            fut.result()
+        finally:
+            del self._pending_writes[key]
+
+        block_time = time.time() - start_time
+        if self.verbose and log_slow and block_time > 0.1:  # Log if blocking is significant (> 100ms)
+            print(
+                f"[CacheManager] WARNING: Main thread blocked for {block_time:.3f}s waiting for {key}")
+
+    def _open_lazy(self, z_path: str, ref: Union[xr.Dataset, xr.DataArray]):
         """
-        Reopen a Zarr store and return an object with the same
-        structure (Dataset or DataArray) as `ref`.
+        Opens the Zarr store lazily and ensures dimensions/coordinates match the reference
+        object (DataArray or Dataset) for downstream xarray use.
         """
+        ds = xr.open_zarr(z_path, consolidated=False, zarr_format=2)
 
-        reopened = xr.open_zarr(store, zarr_format=2, consolidated=False)
-
-        # ---------- Case 1: reference is a Dataset ----------
-        if isinstance(ref, xr.Dataset):
-            # Check variable consistency
-            if set(ref.data_vars) == set(reopened.data_vars):
-                reopened = reopened[list(ref.data_vars)]
-            else:
-                print("[CacheManager] Corrupted Zarr file → deleting:", store)
-                shutil.rmtree(store, ignore_errors=True)
-                raise RuntimeError("Corrupted cache entry")
-
-            # reorder dims + coords
-            reopened = reopened.transpose(*ref.dims, missing_dims="ignore")
-            reopened = reopened.assign_coords(
-                {dim: ref[dim] for dim in ref.dims if dim in reopened.dims}
-            )
-            return reopened
-
-        # ---------- Case 2: reference is a DataArray ----------
         if isinstance(ref, xr.DataArray):
-            var = ref.name or "data"
-            if var not in reopened:
-                print("[CacheManager] Corrupted Zarr file → deleting:", store)
-                shutil.rmtree(store, ignore_errors=True)
-                raise RuntimeError("Corrupted cache entry")
-
-            da = reopened[var]
+            # If the original was a DataArray, we extract it and transpose
+            var_name = ref.name or list(ds.data_vars)[0]
+            da = ds[var_name]
             da = da.transpose(*ref.dims, missing_dims="ignore")
             da = da.assign_coords(
                 {dim: ref[dim] for dim in ref.dims if dim in da.dims}
@@ -388,83 +389,96 @@ class CacheManager:
             da.name = ref.name
             return da
 
-        raise TypeError("ref must be a Dataset or DataArray")
+        # Otherwise, assume it's a Dataset
+        ds = ds.transpose(*ref.dims, missing_dims="ignore")
+        ds = ds.assign_coords(
+            {dim: ref[dim] for dim in ds.dims if dim in ref.dims}
+        )
+        return ds
 
-    def _write_to_disk_zarr(self, obj: xr.Dataset | xr.DataArray, key: str):
+    def _ensure_array_dimensions(self, ds: xr.Dataset) -> xr.Dataset:
         """
-        Write Dataset/DataArray to Zarr using fast Zarr-v2 writer.
-        Reuse existing files when possible.
+        Ensure each variable has attribute `_ARRAY_DIMENSIONS`,
+        required for xarray to reopen a Zarr v2 store safely.
         """
+        fixed = {}
+        for var, da in ds.data_vars.items():
+            attrs = dict(da.attrs)
+            # CRITICAL FIX: Ensure _ARRAY_DIMENSIONS is present
+            attrs["_ARRAY_DIMENSIONS"] = list(da.dims)
+            fixed[var] = da.assign_attrs(attrs)
 
+        # Use .copy(deep=False) to preserve coordinate attributes/encoding
+        return xr.Dataset(fixed, coords=ds.coords).copy(deep=False)
+
+    # ==================================================================
+    # Core I/O
+    # ==================================================================
+    def _write_to_disk_zarr(self, obj: Union[xr.Dataset, xr.DataArray], key: str):
         cache_dir = self._get_active_cache_dir()
-        z_path = os.path.join(cache_dir, f"shift_{key}.zarr")
+        z_path = os.path.join(cache_dir, f"{key}.zarr")
 
         self.total_processed_files += 1
 
-        # ---------- Reuse if exists ----------
+        # 1. Reuse (Cache Hit)
         if os.path.exists(z_path):
             self.total_reused_files += 1
-            return self._reopen_zarr(z_path, obj)
+            if self.verbose:
+                print(f"[CacheManager] Reused cached entry {key} at {z_path}")
+            return self._open_lazy(z_path, obj)
 
-        # ---------- Normalize: always write a Dataset ----------
+        # 2. Normalize to dataset (for internal processing)
         if isinstance(obj, xr.DataArray):
-            ds = obj.to_dataset(name=obj.name or "data")
+            ds_to_write = obj.to_dataset(name=obj.name or "data")
         else:
-            ds = obj
+            ds_to_write = obj
 
-        # ---------- Encoding cache ----------
-        if not hasattr(self, "_encoding_cache"):
-            self._encoding_cache = {v: {"compressor": self.compressor} for v in ds.data_vars}
+        # 3. Fix Zarr metadata dimensions
+        ds_to_write = self._ensure_array_dimensions(ds_to_write)
 
-        # ---------- Zarr write ----------
-        ds.to_zarr(
-            z_path,
-            mode="w",
-            consolidated=False,
-            zarr_format=2,
-            encoding=self._encoding_cache,
-            compute=False
-        ).compute()
+        # 4. Encoding cache initialization (if needed)
+        if self._encoding_cache is None:
+            self._encoding_cache = {
+                v: {"compressor": self.compressor}
+                for v in ds_to_write.data_vars
+            }
 
-        # ---------- Update cache index ----------
-        index = self.cleanup_stale_entries(cache_dir)
-        index[str(key)] = z_path
-        self.save_index(index, cache_dir)
-
-        gc.collect()
+        # 5. Submit async write
+        fut = self._executor.submit(self._async_write, ds_to_write, z_path, self._encoding_cache)
+        self._pending_writes[key] = fut
 
         if self.verbose:
-            print(f"[CacheManager] Stored and reopened {key} at {z_path}")
+            print(f"[CacheManager] Submitted async write for {key} to {z_path}")
 
-        # Return the same type as passed in
-        return self._reopen_zarr(z_path, obj)
+        # 6. BLOCKING CALL: Wait for the write thread to finish before attempting to open the file.
+        # This is necessary to prevent FileNotFoundError on immediate subsequent read.
+        self._ensure_finished(key)
 
-    # ==========================================================
-    # Unified hybrid persistence API
-    # ==========================================================
-    def _generate_key(self, ds):
-        token = dask.base.tokenize(ds)
-        return token
+        # 7. Return lazy reader
+        return self._open_lazy(z_path, obj)
 
-    def persist(self, ds: xr.Dataset | xr.DataArray, key: str = None) -> xr.Dataset | None:
+    # ==================================================================
+    # Hybrid persistence API
+    # ==================================================================
+    def persist(self, obj: xr.Dataset | xr.DataArray, key: str = None) -> Union[
+        xr.Dataset, xr.DataArray]:
 
         # Check available memory
         if key is None:
-            key = self._generate_key(ds)
+            # Generate a dask-safe toke for dataset
+            key = _simple_tokenize(obj)
 
         avail_ratio = self._available_memory_ratio()
 
         if avail_ratio > self.force_threshold:
             if self.verbose:
                 print(f"[CacheManager] Keeping {key} in memory ({avail_ratio:.1%} free RAM)")
-            return ds.persist()
+            return obj.persist()
 
         if self.verbose:
             print(f"[CacheManager] Spilling {key} to disk ({avail_ratio:.1%} free RAM)")
 
-        # enforce quota or cached files
-        # self._enforce_quota()
-        return self._write_to_disk_zarr(ds, key)
+        return self._write_to_disk_zarr(obj, key)
 
 
 # ---------------------------------------------------------------
