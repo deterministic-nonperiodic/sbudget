@@ -5,7 +5,7 @@ import numpy as np
 import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
-from .chunking_tools import ensure_optimal_chunking, DEFAULT_CHUNK_SIZE_MB
+from .memory_manager import ensure_optimal_chunking, DEFAULT_CHUNK_SIZE_MB
 from .constants import cp, Omega, epsilon
 from .numeric_tools import domain_mean, stack_vector, rotate_vector
 from .numeric_tools import horizontal_advection, horizontal_gradient

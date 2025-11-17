@@ -8,10 +8,10 @@ from pyproj import Geod
 from scipy.integrate import trapezoid
 
 from .budget import get_spatial_dims
+from .memory_manager import CacheManager
 from .cf_coords import is_geographic_grid, _is_global_longitude
-from .chunking_tools import CacheManager
-from .chunking_tools import DEFAULT_CHUNK_SIZE_MB
-from .chunking_tools import ensure_optimal_chunking
+from .memory_manager import DEFAULT_CHUNK_SIZE_MB
+from .memory_manager import ensure_optimal_chunking
 from .constants import earth_radius, epsilon
 
 # Constants
@@ -688,7 +688,11 @@ def _block_space_scale_integral(
     # ----------------------------------------------------------------
     # CacheManager: per block per worker
     # ----------------------------------------------------------------
-    cache_manager = CacheManager(verbose=False, force_threshold=0.20, auto_cleanup=True)
+    cache_manager = CacheManager.for_current_worker(
+        verbose=False,
+        force_threshold=0.20,
+        auto_cleanup=True
+    )
 
     # ----------------------------------------------------------------
     # Compute projected cubed velocity differences for all r-values

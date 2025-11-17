@@ -9,7 +9,7 @@ from dask.diagnostics import ProgressBar
 
 from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter
 from .cf_coords import convert_units, check_convert_units
-from .chunking_tools import CacheManager
+from .memory_manager import CacheManager
 
 _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git',
                  'institution': 'Leibniz Institute for Atmospheric Physics (IAP)',
