@@ -1,5 +1,5 @@
 """
-chunking_utils.py
+DESCRIPTION
 ----------------
 System- and memory-aware utilities for xarray/Dask computations.
 
@@ -26,6 +26,7 @@ from threading import Lock
 from typing import *
 from typing import Optional
 
+import dask.base
 import numpy as np
 import psutil
 import xarray as xr
@@ -47,8 +48,8 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
 # Global configuration constants
 # ---------------------------------------------------------------
 _MEMORY_RESERVE_RATIO = 0.85
-_SMALL_DATA_THRESHOLD_MB = 512.0  # skip chunking for small datasets
-DEFAULT_CHUNK_SIZE_MB = 2048  # MB
+_SMALL_DATA_THRESHOLD_MB = 64.0  # skip chunking for small datasets
+DEFAULT_CHUNK_SIZE_MB = 256  # MB
 
 
 # ==========================================================
@@ -66,10 +67,6 @@ def _fmt_bytes(n: int) -> str:
 # ---------------------------------------------------------------------
 # Global cleanup registry (ensures all temp dirs removed on exit)
 # ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# Global cleanup registry (ensures all temp dirs removed on exit)
-# ---------------------------------------------------------------------
-# --- Global Lock Management ---
 
 _LOCKS_LOCK = threading.Lock()
 _LOCKS: Dict[str, threading.Lock] = {}
@@ -93,7 +90,6 @@ def _get_lock(lock_id: str, tmpdir: Path) -> tuple[Lock, BaseFileLock]:
 
 
 # --- CacheManager Class ---
-
 class CacheManager:
     """Worker-aware hybrid cache manager for Zarr and Joblib persistence.
 
@@ -111,18 +107,20 @@ class CacheManager:
             self,
             base_dir: Optional[str] = None,
             max_total_gb: float = 50.0,
-            mem_threshold: float = 0.2,
+            force_threshold: float = 0.2,
             verbose: bool = False,
             auto_cleanup: bool = True,
             compressor: str = "lz4",
     ):
         self.verbose = verbose
         self.auto_cleanup = auto_cleanup
-        self.mem_threshold = mem_threshold
+        self.force_threshold = force_threshold
         self.max_total_bytes = max_total_gb * 1024 ** 3
-        self.compressor = Blosc(cname=compressor, clevel=1, shuffle=1)
+        self.compressor = Blosc(cname=compressor, clevel=1, shuffle=Blosc.SHUFFLE)
 
         self._tracked_dirs: set[str] = set()
+        self.total_reused_files = 0
+        self.total_processed_files = 0
 
         # ----------------------------------------------------------
         # 1. Resolve base directory (worker-aware)
@@ -309,8 +307,9 @@ class CacheManager:
     # Memory & quota management
     # ==========================================================
     def _available_memory_ratio(self) -> float:
-        mem = psutil.virtual_memory()
-        return mem.available / mem.total
+        # mem = psutil.virtual_memory()
+        # return mem.available / mem.total
+        return 1.0 - psutil.virtual_memory().percent / 100.0
 
     def _enforce_quota(self):
         """Safely delete old sessions to stay within disk quota."""
@@ -345,74 +344,117 @@ class CacheManager:
                 if self.verbose:
                     print(f"[cache] WARNING: failed to remove {victim}: {e}")
 
-    def _write_to_disk_zarr(self, ds: xr.Dataset, key: tuple[int, int, str]) -> xr.Dataset:
+    # ===============================================================
+    # Core I/O
+    # ===============================================================
+    def _reopen_zarr(self, store: str, ref: xr.Dataset | xr.DataArray):
         """
-        Efficiently write a Dataset to disk as a Zarr store.
-
-        This version is optimized for single-process or per-session usage
-        (e.g., one CacheManager per `r`). It supports fast writes with
-        cached compression encoding and safe reuse of existing files.
+        Reopen a Zarr store and return an object with the same
+        structure (Dataset or DataArray) as `ref`.
         """
 
-        # --- Active session directory ---
+        reopened = xr.open_zarr(store, zarr_format=2, consolidated=False)
+
+        # ---------- Case 1: reference is a Dataset ----------
+        if isinstance(ref, xr.Dataset):
+            # Check variable consistency
+            if set(ref.data_vars) == set(reopened.data_vars):
+                reopened = reopened[list(ref.data_vars)]
+            else:
+                print("[CacheManager] Corrupted Zarr file → deleting:", store)
+                shutil.rmtree(store, ignore_errors=True)
+                raise RuntimeError("Corrupted cache entry")
+
+            # reorder dims + coords
+            reopened = reopened.transpose(*ref.dims, missing_dims="ignore")
+            reopened = reopened.assign_coords(
+                {dim: ref[dim] for dim in ref.dims if dim in reopened.dims}
+            )
+            return reopened
+
+        # ---------- Case 2: reference is a DataArray ----------
+        if isinstance(ref, xr.DataArray):
+            var = ref.name or "data"
+            if var not in reopened:
+                print("[CacheManager] Corrupted Zarr file → deleting:", store)
+                shutil.rmtree(store, ignore_errors=True)
+                raise RuntimeError("Corrupted cache entry")
+
+            da = reopened[var]
+            da = da.transpose(*ref.dims, missing_dims="ignore")
+            da = da.assign_coords(
+                {dim: ref[dim] for dim in ref.dims if dim in da.dims}
+            )
+            da.name = ref.name
+            return da
+
+        raise TypeError("ref must be a Dataset or DataArray")
+
+    def _write_to_disk_zarr(self, obj: xr.Dataset | xr.DataArray, key: str):
+        """
+        Write Dataset/DataArray to Zarr using fast Zarr-v2 writer.
+        Reuse existing files when possible.
+        """
+
         cache_dir = self._get_active_cache_dir()
-        nx, ny, hs = key
-        z_path = os.path.join(cache_dir, f"shift_{nx:+04d}_{ny:+04d}_{hs}.zarr")
+        z_path = os.path.join(cache_dir, f"shift_{key}.zarr")
 
-        # --- Try to reuse existing cache ---
+        self.total_processed_files += 1
+
+        # ---------- Reuse if exists ----------
         if os.path.exists(z_path):
-            try:
-                reopened = xr.open_zarr(z_path, consolidated=False, chunks=None)
-                if set(ds.data_vars) == set(reopened.data_vars):
-                    if self.verbose:
-                        print(f"[CacheManager] Reusing cached shift {key} at {z_path}")
-                    return reopened
-            except Exception:
-                # Remove corrupted or partial store
-                shutil.rmtree(z_path, ignore_errors=True)
+            self.total_reused_files += 1
+            return self._reopen_zarr(z_path, obj)
 
-        # --- Compressor encoding cache (reused across calls) ---
+        # ---------- Normalize: always write a Dataset ----------
+        if isinstance(obj, xr.DataArray):
+            ds = obj.to_dataset(name=obj.name or "data")
+        else:
+            ds = obj
+
+        # ---------- Encoding cache ----------
         if not hasattr(self, "_encoding_cache"):
             self._encoding_cache = {v: {"compressor": self.compressor} for v in ds.data_vars}
-        encoding = self._encoding_cache
 
-        # --- Write to disk (directly, not via tmpdir) ---
-        ds.to_zarr(z_path,
-                   mode="w",
-                   consolidated=False,
-                   zarr_format=2,
-                   encoding=encoding,
-                   compute=False
-                   ).compute()
+        # ---------- Zarr write ----------
+        ds.to_zarr(
+            z_path,
+            mode="w",
+            consolidated=False,
+            zarr_format=2,
+            encoding=self._encoding_cache,
+            compute=False
+        ).compute()
 
-        # --- Update cache index ---
-        index = self.cleanup_stale_entries(cache_dir) if os.path.exists(cache_dir) else {}
+        # ---------- Update cache index ----------
+        index = self.cleanup_stale_entries(cache_dir)
         index[str(key)] = z_path
         self.save_index(index, cache_dir)
 
-        # --- Reopen the stored dataset for use ---
-        reopened = xr.open_zarr(z_path, consolidated=False, chunks=None)
-        reopened = reopened.transpose(*ds.dims, missing_dims="ignore")
-        reopened = reopened.assign_coords(
-            {dim: ds[dim] for dim in ds.dims if dim in reopened.dims}
-        )
-        del ds
         gc.collect()
 
         if self.verbose:
-            print(f"[CacheManager] Stored and reopened shift {key} at {z_path}")
+            print(f"[CacheManager] Stored and reopened {key} at {z_path}")
 
-        return reopened
+        # Return the same type as passed in
+        return self._reopen_zarr(z_path, obj)
 
     # ==========================================================
     # Unified hybrid persistence API
     # ==========================================================
-    def persist(self, ds: xr.Dataset, key: tuple[int, int, str]) -> xr.Dataset | None:
+    def _generate_key(self, ds):
+        token = dask.base.tokenize(ds)
+        return token
+
+    def persist(self, ds: xr.Dataset | xr.DataArray, key: str = None) -> xr.Dataset | None:
 
         # Check available memory
+        if key is None:
+            key = self._generate_key(ds)
+
         avail_ratio = self._available_memory_ratio()
 
-        if avail_ratio > self.mem_threshold:
+        if avail_ratio > self.force_threshold:
             if self.verbose:
                 print(f"[CacheManager] Keeping {key} in memory ({avail_ratio:.1%} free RAM)")
             return ds.persist()
@@ -421,7 +463,7 @@ class CacheManager:
             print(f"[CacheManager] Spilling {key} to disk ({avail_ratio:.1%} free RAM)")
 
         # enforce quota or cached files
-        self._enforce_quota()
+        # self._enforce_quota()
         return self._write_to_disk_zarr(ds, key)
 
 
@@ -550,7 +592,8 @@ def optimal_batch_size(
         items_total: int,
         exclude_dims: Iterable[str] | str | None = None,
         reserve_ratio: float = _MEMORY_RESERVE_RATIO,
-        verbose: bool = True) -> int:
+        target_size_bytes: int = DEFAULT_CHUNK_SIZE_MB * 1024 ** 2,
+        verbose: bool = True) -> tuple[int, int]:
     """
     Estimate a safe batch size for processing multiple scales or loop items
     based on available memory and dataset footprint.
@@ -566,7 +609,7 @@ def optimal_batch_size(
     usable_mem, n_workers = get_worker_memory_budget(reserve_ratio)
 
     # --- Compute max safe items ---
-    max_items_fit = max(1, int(usable_mem // per_item_bytes))
+    max_items_fit = max(1, int(min(usable_mem, target_size_bytes) // per_item_bytes))
 
     if items_total == 1:
         batch_size = 1
@@ -582,7 +625,7 @@ def optimal_batch_size(
               f"| usable/worker ≈ {_fmt_bytes(usable_mem)} ({n_workers} workers)"
               f"| Running {n_batches} batches of ≤{batch_size} (out of {items_total})")
 
-    return batch_size
+    return batch_size, n_batches
 
 
 # ---------------------------------------------------------------
