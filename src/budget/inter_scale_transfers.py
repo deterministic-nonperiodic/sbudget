@@ -302,13 +302,13 @@ def get_max_radial_distance(
     """
 
     # ---------------------------------------------------------------
-    # 1. Handle both inputs being None → no information available
+    # Handle both inputs being None → no information available
     # ---------------------------------------------------------------
     if length_scales is None and max_r_input is None:
         return None
 
     # ---------------------------------------------------------------
-    # 2. Determine initial max_r_m from user input or from length_scales
+    # Determine initial max_r_m from user input or from length_scales
     # ---------------------------------------------------------------
     if max_r_input is not None:
         if isinstance(max_r_input, Quantity):
@@ -320,7 +320,7 @@ def get_max_radial_distance(
         max_r_m = float(max(length_scales))
 
     # ---------------------------------------------------------------
-    # 3. Enforce constraint: cannot exceed twice the largest scale
+    # Enforce constraint: cannot exceed twice the largest scale
     # ---------------------------------------------------------------
     if length_scales is not None:
         max_scale_limit = 2.0 * float(max(length_scales))
@@ -352,7 +352,7 @@ def scale_increments(
     # Calculate grid spacing and domain centers (assumes GEODE and _get_spacing are available)
     x_center = float(x_coord.mean())
     y_center = float(y_coord.mean())
-    # Note: _get_spacing is a helper function assumed to be available
+
     dx = max(_get_spacing(x_coord, y_center, use_geode=use_geode, axis='x'), 1e-6)
     dy = max(_get_spacing(y_coord, x_center, use_geode=use_geode, axis='y'), 1e-6)
 
@@ -361,7 +361,7 @@ def scale_increments(
     x_min, x_max = float(x_coord.min()), float(x_coord.max())
     y_min, y_max = float(y_coord.min()), float(y_coord.max())
 
-    # 2. Calculate Domain Lengths (lx, ly)
+    # Calculate Domain Lengths (lx, ly)
     if use_geode:
         spacing = float(np.median(np.diff(x_coord)))
         span = x_max - x_min + spacing
@@ -377,7 +377,7 @@ def scale_increments(
     else:
         lx, ly = x_max - x_min, y_max - y_min
 
-    # 3. Define Analysis Scales (r_values). Effective max scale limited by half the domain size
+    # Define Analysis Scales (r_values). Effective max scale limited by half the domain size
     domain_half_size_m = min(lx, ly) / 2.0
     effective_max_r = min(max_r_m, domain_half_size_m) if max_r_m else domain_half_size_m
 
@@ -392,7 +392,7 @@ def scale_increments(
         attrs={"units": "m", "long_name": "Separation distance (scale)"}
     )
 
-    # 4. Define Shift Indices (nx, ny)
+    # Define Shift Indices (nx, ny)
     max_nx = int(np.ceil(effective_max_r / dx))
     max_ny = int(np.ceil(effective_max_r / dy))
 
@@ -404,7 +404,7 @@ def scale_increments(
     da_ny = xr.DataArray(ny_vals, dims="ny")
     ny_grid, nx_grid = xr.broadcast(da_ny, da_nx)
 
-    # 5. Calculate Distance (r) and Angle (phi) for all shifts (nx, ny)
+    # Calculate Distance (r) and Angle (phi) for all shifts (nx, ny)
     if use_geode:
         # Calculate metric shifts
         dx_shift = nx_grid * dx
@@ -447,14 +447,14 @@ def scale_increments(
         distance_vals = np.sqrt(dx_grid ** 2 + dy_grid ** 2).values
         angle_vals = np.arctan2(dy_grid, dx_grid).values
 
-    # 6. Create Distance and Angle DataArrays
+    # Create Distance and Angle DataArrays
     distance = xr.DataArray(distance_vals, dims=("ny", "nx"), name="distance_grid")
     distance.attrs = {"units": "m", "long_name": "Distance from origin"}
 
     angle = xr.DataArray(angle_vals, dims=("ny", "nx"), name="angle_grid")
     angle.attrs = {"units": "radians", "long_name": "Angle of offset from origin"}
 
-    # 7. Angle Weighting Calculation
+    # Angle Weighting Calculation
     flat_angles = angle_vals.flatten()
     # Use float for unique to avoid precision issues if the angles are very close
     unique_angles, counts = np.unique(flat_angles.round(10), return_counts=True)
@@ -469,7 +469,7 @@ def scale_increments(
         dims=("ny", "nx"), name="angle_weight"
     )
 
-    # 8. Create r_mask (Bin distances into r_values)
+    # Create r_mask (Bin distances into r_values)
     lower_bound = r_values[:, np.newaxis, np.newaxis] - r_step / 2.0
     upper_bound = r_values[:, np.newaxis, np.newaxis] + r_step / 2.0
 
@@ -482,7 +482,7 @@ def scale_increments(
         coords={"r": r_coord_da, "ny": da_ny, "nx": da_nx}, name="r_mask"
     )
 
-    # 9. Create Increments Dataset
+    # Create Increments Dataset
     increments = xr.Dataset(
         {"r": r_coord_da,
          "mask": r_mask,
@@ -493,11 +493,11 @@ def scale_increments(
          "delta_y_spacing": xr.DataArray(dy, name="delta_y_spacing", attrs={"units": "m"})}
     )
 
-    # 10. Filter scales based on directional coverage
+    # Filter scales based on directional coverage
     valid_mask = filter_by_directional_coverage(increments, min_valid_shifts=min_valid_shifts)
     increments = increments.sel(r=valid_mask)
 
-    # 11. Verbose Output
+    # Verbose Output
     effective_min_r = increments["r"].min().values
     effective_max_r = increments["r"].max().values
     requested_max_r = "None" if not max_r_m else f"{max_r_m:.2f} m"
