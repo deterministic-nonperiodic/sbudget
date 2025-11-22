@@ -1,11 +1,11 @@
 input:
   path: ./model_output.nc
   dims: [ z_mc,  lat, lon ] # [y, x] Names of the horizontal spatial dimensions
-  engine: h5netcdf          # optional: h5netcdf | netcdf4 | scipy
+  engine: netcdf4           # optional: h5netcdf | netcdf4 | scipy
 
 output:
-  path: ./budget_out.nc
-  store: netcdf             # [netcdf, zarr] format for output files
+  path: ./budget_out.zarr   # output file path
+  store: zarr               # [netcdf, zarr] format for output files
   overwrite: true           # overwrite existing output files
 
 compute:
@@ -18,7 +18,6 @@ compute:
   transfer_form: flux       # invariant, flux. Method for computing nonlinear spectral transfers
   # FFT stability & memory control
   rechunk_spatial: false    # ensure single spatial chunks (y, x) for FFTs, and convolutions
-  dask_allow_rechunk: true  # allow apply_ufunc to rechunk as a fallback
   chunk_size: 512           # constraint on largest chunk size [MB] for a horizontal plane (y, x)
   scheduler: threads        # Dask scheduler [threads, distributed, processes]
 
@@ -30,7 +29,6 @@ variables:
   theta: theta              # preferred; if missing, derive from pressure & temperature
   pressure: p               # optional if theta present
   temperature: temp         # optional if theta present
-  density: rho              # optional; derive from pressure & temperature
-  # Optional precomputed diagnostics (used if present)
-  divergence: div           # horizontal divergence of wind
-  vorticity: vor            # vertical component of the relative vorticity of wind
+  density: rho              # optional: derive from pressure & temperature
+  divergence: div           # optional: horizontal divergence of wind
+  vorticity: vor            # optional;: vertical component of the relative vorticity of wind

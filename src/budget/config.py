@@ -7,7 +7,6 @@ import yaml
 class IOConfig:
     path: str
     dims: list[str]  # [z, lat, lon] or [z, y, x]
-    time: str | None = None
     engine: str | None = None  # optional: h5netcdf, netcdf4, or scipy for .nc files
 
 
@@ -28,8 +27,7 @@ class ComputeConfig:
     dy: float | None = None
     transfer_form: str | None = "flux"  # e.g. "invariant", "flux"
     cumulative: bool = True  # default True per request
-    rechunk_spatial: bool = True  # ensure (y,x) are single chunks before FFTs
-    dask_allow_rechunk: bool = True  # allow apply_ufunc to rechunk as fallback
+    rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
     scheduler: str | None = None
     chunk_size: float | None = None  # approximate chunk size in MiB for non-spatial dimensions
 

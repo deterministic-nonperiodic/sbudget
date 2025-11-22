@@ -1,12 +1,15 @@
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Tuple, Optional
 
 import dask
 import xarray as xr
 from dask.base import is_dask_collection
 from dask.diagnostics import ProgressBar
+from dask.distributed import progress
 
+from .cf_coords import _cf_guess
 from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter
 from .cf_coords import convert_units, check_convert_units
 from .memory_manager import CacheManager
@@ -46,7 +49,37 @@ def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
     return ds
 
 
-def open_dataset(cfg) -> xr.Dataset:
+def _report_var_existence(raw: xr.Dataset, cfg) -> str:
+    """Create a plain-text report showing whether configured variables exist in the raw dataset.
+
+    Checks both the *actual* names provided under cfg.variables and, after renaming,
+    validates the presence of the *logical* names our code expects.
+    """
+    lines = []
+    mapping = cfg.variables or {}
+    # 1) Check actual names against the raw dataset
+    lines.append("[I/O] Configured variables (actual names) in file:\n")
+    for logical, actual in mapping.items():
+        exists = (actual in raw.data_vars) or (actual in raw.coords)
+        status = "OK" if exists else "MISSING"
+        hint = ""
+        if not exists:
+            guess = _cf_guess(raw, logical)
+            if guess:
+                hint = f"  (hint: possible '{logical}' → '{guess}' by CF)"
+        lines.append(f"[I/O]  - {logical:11s} ← {actual:20s} : {status}{hint}\n")
+
+    # 2) Minimal logical requirements after renaming
+    required = ["u", "v", "w"]
+    lines.append("[I/O] Logical requirements: ")
+    for key in required:
+        lines.append(f"  - {key} : required")
+    lines.append("  - theta : preferred (else need pressure + temperature)")
+
+    return " ".join(lines)
+
+
+def open_dataset(cfg, verbose=False) -> xr.Dataset:
     """Open input dataset and normalize variable names using cfg.variables.
 
     cfg.variables should map logical names to actual dataset variable names, e.g.::
@@ -70,6 +103,10 @@ def open_dataset(cfg) -> xr.Dataset:
 
     # unify data type
     ds = ds.astype("float32")
+
+    if verbose:
+        report = _report_var_existence(ds, cfg)
+        print(report)
 
     # Rename dataset variables to logical names used by the code
     rename = {}
@@ -141,7 +178,61 @@ def open_dataset(cfg) -> xr.Dataset:
     return ds
 
 
-def write_dataset(ds: xr.Dataset, cfg) -> None:
+def _resolve_store_and_path(path: Path | str, store_type: Optional[str] = None) -> Tuple[Path, str]:
+    """
+    Validates and resolves the output store type and file path extension.
+
+    1. Determines the target store (zarr or netcdf), defaulting to 'zarr'.
+    2. Ensures the Path has the correct corresponding extension (.zarr or .nc).
+
+    Parameters
+    ----------
+    path : Path or str
+        The output path specified by the user.
+    store_type : Optional[str]
+        The store type specified in the configuration (e.g., 'netcdf').
+
+    Returns
+    -------
+    Tuple[Path, str]
+        The corrected Path object and the resolved store type.
+    """
+    if isinstance(path, str):
+        path = Path(path)
+
+    # 1. Determine Target Store
+    store = (store_type or "").lower()
+
+    # Infer store from extension if config_store_type is empty/none
+    suffix = path.suffix.lower()
+
+    if store not in {"netcdf", "zarr"}:
+        if suffix in {".nc", ".nc4", ".cdf"}:
+            store = "netcdf"
+        elif suffix == ".zarr":
+            store = "zarr"
+        else:
+            # Default preference if nothing is recognized
+            store = "zarr"
+            if suffix != "":
+                print(f"Unrecognized output extension '{suffix}' -- defaulting to Zarr.")
+
+    # 2. Ensure Extension Matches Resolved Store
+    if store == "zarr":
+        # Force .zarr suffix for clarity
+        if suffix != ".zarr":
+            path = path.with_suffix(".zarr")
+            print(f"[I/O] Corrected output path to {path} (Zarr).")
+    elif store == "netcdf":
+        # Force .nc suffix for consistency
+        if suffix not in {".nc", ".nc4", ".cdf"}:
+            path = path.with_suffix(".nc")
+            print(f"[I/O] Corrected output path to {path} (NetCDF).")
+
+    return path, store
+
+
+def write_dataset(ds: xr.Dataset, cfg, client=None) -> None:
     """
     Write a Dask-backed xarray.Dataset to disk efficiently.
 
@@ -163,6 +254,9 @@ def write_dataset(ds: xr.Dataset, cfg) -> None:
             - `output.store` (str): Either 'zarr' or 'netcdf'.
             - `output.overwrite` (bool): Whether to overwrite existing files.
             - Optionally, `input.engine` for NetCDF (e.g., 'h5netcdf', 'netcdf4').
+    client : dask.distributed.Client, optional
+        An optional Dask client for distributed computation. If provided,
+        it will be used to manage the Dask graph execution.
 
     Notes
     -----
@@ -184,39 +278,87 @@ def write_dataset(ds: xr.Dataset, cfg) -> None:
     cleans up all temporary cache directories after completion.
     """
 
-    out = Path(cfg.output.path)
-    if out.exists() and not cfg.output.overwrite:
-        raise FileExistsError(f"{out} exists; set output.overwrite: true to replace")
+    # Get output path and store. Overwrite settings
+    # --- Validation and Path Resolution ---
+    output_path = Path(getattr(cfg.output, "path", "output.zarr"))
+    store_type = getattr(cfg.output, "store", None)
 
+    # Determine the final path and store type requested by the user
+    output_path, store_type = _resolve_store_and_path(output_path, store_type)
+
+    temp_zarr_path = Path(str(output_path) + ".tmp.zarr")
+
+    # The actual parallel write destination is always Zarr
+    write_target = temp_zarr_path if store_type == "netcdf" else output_path
+
+    # Clean up any remnants or requested final output before starting
+    if write_target.exists() or temp_zarr_path.exists():
+        if not cfg.output.overwrite:
+            raise FileExistsError(f"{output_path} exists; set output.overwrite: true to replace")
+
+        # Clean up both potential paths if overwrite is true
+        if write_target.exists():
+            shutil.rmtree(write_target)
+        if temp_zarr_path.exists():
+            shutil.rmtree(temp_zarr_path)
+
+    # --- Setup Parallel Zarr Write ---
     ds.attrs.update(_global_attrs)
 
-    store_type = cfg.output.store.lower()
-    engine = getattr(cfg.input, "engine", "h5netcdf")
-    scheduler = getattr(cfg.compute, "scheduler", "threads")
+    engine = getattr(cfg.input, "engine", "netcdf4")
+    print(f"[I/O] Starting computation and write to temporary store: {write_target} (Zarr)")
 
-    print(f"[I/O] Writing output to {cfg.output.path} (store={store_type})")
+    # Define the lazy Zarr write operation
+    delayed_write_op = ds.to_zarr(
+        write_target,
+        mode="w",
+        compute=False,
+        zarr_format=3,
+        consolidated=False,
+    )
 
-    # --- Choose writing method ---
-    if store_type == "zarr":
-        if out.exists():
-            shutil.rmtree(out)
-        write_op = ds.to_zarr(out, mode="w", compute=False)
-    elif store_type == "netcdf":
-        # For Dask safety, use compute=False (requires recent xarray)
-        encoding = {var: {'zlib': True, 'complevel': 4} for var in ds.data_vars}
-        write_op = ds.to_netcdf(out, engine=engine, encoding=encoding, compute=False)
+    # --- Execute Parallel Write (Triggers Dask Graph) ---
+    if is_dask_collection(delayed_write_op):
+        if client:
+            print(f"[I/O] Executing parallel Dask graph via distributed client...")
+            future = client.compute(delayed_write_op)
+            progress(future, notebook=False)
+
+            try:
+                future.result()
+            except Exception as e:
+                print(f"\n[I/O] FATAL WRITE ERROR: Zarr computation failed on the cluster.")
+                # Attempt to clean up temp store before raising
+                if temp_zarr_path.exists(): shutil.rmtree(temp_zarr_path)
+                raise e
+
+        else:
+            # Synchronous fallback
+            print(f"[I/O] Executing synchronous Dask graph using local threads...")
+            with dask.config.set(scheduler='threads'):
+                with ProgressBar():
+                    dask.compute(delayed_write_op)
+
+    print(f"[I/O] Calculation completed")
+
+    # --- Synchronous NetCDF Conversion (If Requested) ---
+    if store_type == "netcdf":
+        print(f"[I/O] NetCDF output requested. Starting synchronous Zarr-to-NetCDF conversion...")
+
+        # Load Zarr store (should be fast metadata read, data is already computed)
+        ds_computed = xr.open_zarr(temp_zarr_path, consolidated=False)
+
+        # Synchronous write to final NetCDF file (this resolves the HDF5 lock issue)
+        ds_computed.to_netcdf(output_path, engine=engine)
+
+        print(f"[I/O] Final output successfully written to: {output_path} (NetCDF).")
+
+        # Clean up the temporary Zarr store immediately
+        shutil.rmtree(temp_zarr_path)
+
     else:
-        raise ValueError("output.store must be 'zarr' or 'netcdf'")
-
-    # --- Trigger computation explicitly and safely ---
-    if is_dask_collection(write_op):
-        print(f"[I/O] Executing parallel Dask graph with scheduler: {scheduler} ...")
-        with ProgressBar():
-            dask.compute(write_op, scheduler=scheduler)
-    else:
-        print("[I/O] Calculation completed.")
-
-    print(f"[I/O] Wrote output file: {cfg.output.path}")
+        # Final output was Zarr, written in step 3.
+        print(f"[I/O] Final output successfully written to: {output_path} (Zarr).")
 
     # --- Automatic cache cleanup ---
     print(f"[cache] Cleaning up temporary cache directories")

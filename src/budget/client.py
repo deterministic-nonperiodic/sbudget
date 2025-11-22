@@ -1,49 +1,182 @@
 import argparse
+import os
 import time
+import warnings
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
 
-import xarray as xr
+import dask
+import psutil
+from dask.distributed import Client, LocalCluster
 
 from .budget import compute_budget
-from .cf_coords import _cf_guess
 from .config import load_config, apply_overrides
 from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
 from .io_utils import open_dataset, write_dataset
+from .memory_manager import TARGET_WORKER_MEM_GB
+
+DASK_WARNING_PATTERN = r"Sending large graph of size .* MiB\."
+
+# Suppress Dask warnings about large graphs
+warnings.filterwarnings(
+    "ignore",
+    message=DASK_WARNING_PATTERN,
+    category=UserWarning,
+    module=r'distributed\.client'
+)
 
 
-def _report_var_existence(raw: xr.Dataset, cfg) -> str:
-    """Create a plain-text report showing whether configured variables exist in the raw dataset.
-
-    Checks both the *actual* names provided under cfg.variables and, after renaming,
-    validates the presence of the *logical* names our code expects.
+# ---------------------------------------------------------------------------
+# SLURM Resource Detection
+# ---------------------------------------------------------------------------
+def _detect_resources() -> Dict[str, Union[int, float, bool]]:
     """
-    lines = []
-    mapping = cfg.variables or {}
-    # 1) Check actual names against the raw dataset
-    lines.append("Configured variables (actual names) in file:\n")
-    for logical, actual in mapping.items():
-        exists = (actual in raw.data_vars) or (actual in raw.coords)
-        status = "OK" if exists else "MISSING"
-        hint = ""
-        if not exists:
-            guess = _cf_guess(raw, logical)
-            if guess:
-                hint = f"  (hint: possible '{logical}' → '{guess}' by CF)"
-        lines.append(f"  - {logical:11s} ← {actual:20s} : {status}{hint}\n")
+    Detects allocated resources, prioritizing SLURM environment variables.
+    """
+    is_slurm = "SLURM_JOB_ID" in os.environ
 
-    # 2) Minimal logical requirements after renaming
-    required = ["u", "v", "w"]
-    lines.append("Logical requirements: ")
-    for key in required:
-        lines.append(f"  - {key} : required")
-    lines.append("  - theta : preferred (else need pressure + temperature)")
+    # 1. Thread/Worker Allocation
+    if is_slurm:
+        # HPC: Maximize processes/workers (n_tasks) with assigned threads (cpus_per_task)
+        n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
+        cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+        n_threads = cpus_per_task
+        n_workers = n_tasks
+    else:
+        # Local: Maximize processes (n_workers=total_cores) with 1 thread per worker.
+        total_cores = psutil.cpu_count(logical=True) or 4
+        n_workers = total_cores
+        n_threads = 1
 
-    return " ".join(lines)
+        # 2. Total Memory Allocation (in GiB)
+    if "SLURM_MEM_PER_NODE" in os.environ:
+        total_mem_gb = int(os.environ["SLURM_MEM_PER_NODE"]) / 1024
+    elif "SLURM_MEM_PER_CPU" in os.environ:
+        total_mem_gb = n_workers * n_threads * (int(os.environ["SLURM_MEM_PER_CPU"]) / 1024)
+    else:
+        total_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
+
+    return {
+        "n_workers": n_workers,
+        "threads_per_worker": n_threads,
+        "total_mem_gb": total_mem_gb,
+        "is_slurm": is_slurm,
+    }
+
+
+def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
+    """
+    HPC-aware configuration of Dask global settings and cluster parameters.
+
+    Returns
+    -------
+    (num_workers, threads_per_worker)
+    """
+    resources = _detect_resources()
+
+    # --- Chunk Size Heuristic ---
+    total_mem_gb = resources["total_mem_gb"]
+
+    if total_mem_gb < 64:
+        default_chunk_mb = 512
+    else:
+        default_chunk_mb = 2048
+
+    chunk_mb = float(getattr(cfg.compute, "chunk_size", None) or default_chunk_mb)
+
+    # --- Configure Dask Global Settings (Memory Discipline) ---
+    dask.config.set({
+        "array.chunk-size": f"{chunk_mb}MB",
+        "array.slicing.split_large_chunks": False,
+        # "distributed.worker.memory.limit": f'{TARGET_WORKER_MEM_GB:.2f}GB',
+        "distributed.worker.memory.target": False,
+        "distributed.worker.memory.spill": False,
+        "distributed.worker.memory.pause": 0.95,
+        "distributed.worker.memory.terminate": 0.985,
+        "optimization.fuse.ave-width": 16,
+        "optimization.fuse.max-width": 128,
+    })
+
+    return int(resources["n_workers"]), int(resources["threads_per_worker"])
+
+
+def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Client:
+    """
+    Create and return a Dask client, supporting 'threads' or 'distributed' modes.
+    """
+    # Use scheduler type from config if not explicitly provided
+    scheduler = getattr(cfg.compute, "scheduler", "threads")
+
+    # ==============================================
+    # AUTO CONFIGURE DASK (based on Slurm/local OS)
+    # ==============================================
+    num_workers, threads_per_worker = auto_configure_dask(cfg)
+
+    print(f"[budget] Auto-Dask → workers={num_workers}, threads={threads_per_worker}")
+
+    # Calculate the total cores allocated/detected
+    total_cores = num_workers * threads_per_worker
+
+    if scheduler == "distributed":
+        # MODE 1: DISTRIBUTED (HPC, large local scale-out)
+        if scheduler_address:
+            return Client(scheduler_address)
+
+        cluster = LocalCluster(
+            n_workers=num_workers,
+            threads_per_worker=threads_per_worker,
+            processes=True,  # Always use processes in distributed mode
+            memory_limit=f'{TARGET_WORKER_MEM_GB:.2f}GB'
+        )
+        return Client(cluster)
+
+    elif scheduler == "threads":
+        # MODE 2: THREADS (Small local, minimal overhead)
+
+        # If the thread count is too high, recursively switch to 'distributed'.
+        THREAD_LIMIT = 12
+        if total_cores > THREAD_LIMIT:
+            print(
+                f"[budget] WARNING: Total cores ({total_cores}) exceeds thread limit ({THREAD_LIMIT}).")
+            print(
+                f"[budget]         Using 'distributed' scheduler instead for multiprocessing stability.")
+
+            # Change the scheduler type in the configuration
+            cfg.compute.scheduler = "distributed"
+
+            return init_dask_client(cfg, scheduler_address)
+
+        # Single process, multi-thread
+        cluster = LocalCluster(
+            n_workers=1,
+            threads_per_worker=total_cores,  # Use all available threads in one worker
+            processes=False,
+            memory_limit=f'{TARGET_WORKER_MEM_GB:.2f}GB'
+        )
+        return Client(cluster)
+
+    else:
+        # Fallback for old/unsupported scheduler types
+        raise ValueError(
+            f"Unknown or unsupported scheduler type: {scheduler}. Use 'threads' or 'distributed'.")
 
 
 def _cmd_compute(args) -> None:
     cfg = load_config(args.config)
     cfg = apply_overrides(cfg, args)
+
+    # ==============================================
+    # INITIALIZE DASK CLIENT
+    # ==============================================
+    client = init_dask_client(cfg, scheduler_address=None)
+
+    if client is not None:
+        print(f"[budget] Dask Dashboard: {client.dashboard_link}")
+        print(f"[budget] Using client: {client}")
+
+    # -------------------------------------------------------------------
+    # Open dataset with normalized variable/dimension names
+    ds = open_dataset(cfg, verbose=False)
 
     # Normalize/alias modes (backward compatibility)
     _MODE_ALIASES = {
@@ -60,9 +193,6 @@ def _cmd_compute(args) -> None:
     # store start time for profiling
     start_time = time.monotonic()
 
-    # Open dataset with normalized variable/dimension names
-    ds = open_dataset(cfg)
-
     if mode == "spectral_budget":
         print("[budget] Starting spectral budget calculation...")
         out = compute_budget(ds, cfg)
@@ -70,27 +200,25 @@ def _cmd_compute(args) -> None:
     elif mode == "scale_transfer":
         print("[budget] Starting inter-scale transfer calculation...")
 
-        # --- Auto-select cache mode if not explicitly given ---
-        kwargs = {
-            "scales": getattr(cfg.compute, "scales", None),
-            "ls_chunk_size": 1,  # write one scale at a time to limit memory use
-            "allow_rechunking": cfg.compute.dask_allow_rechunk,
-            "chunk_size": cfg.compute.chunk_size,
-            "verbose": True
-        }
-
+        # Extract kwargs for scale_increments
+        kwargs = {"scales": getattr(cfg.compute, "scales", None), "verbose": True}
+        # Compute scale-transfers
         out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
     else:
         raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
                          f"Use 'spectral_budget' or 'scale_transfer'.")
 
     # Write output to disk. Up to here, computations are lazy
-    write_dataset(out, cfg)
+    write_dataset(out, cfg, client=client)
+
+    # Clean up the local cluster if created
+    if client and hasattr(client, 'cluster') and client.cluster:
+        client.close()
+        client.cluster.close()
 
     # --- End Main Computation Block and Profiling ---
     end_time = time.monotonic()
     duration = end_time - start_time
-
     # Print the profiling information
     print(f"\n[budget] PROFILE: Total time elapsed: {duration:.2f} seconds")
 
@@ -160,10 +288,6 @@ def main(argv: list[str] | None = None) -> None:
     _add_bool_pair(p_compute, "rechunk-spatial", "rechunk_spatial",
                    "Force single spatial chunks for FFTs (recommended).",
                    "Skip spatial rechunking (faster, less stable for FFT).")
-
-    _add_bool_pair(p_compute, "dask-allow-rechunk", "dask_allow_rechunk",
-                   "Allow Dask to rechunk automatically during computation.",
-                   "Prevent automatic rechunking (for strict memory control).")
 
     # user-exposed argument:
     p_compute.add_argument(

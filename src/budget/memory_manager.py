@@ -32,9 +32,12 @@ from numcodecs import Blosc
 # ======================================================================
 # Global configuration parameters
 # ======================================================================
-_MEMORY_RESERVE_RATIO = 0.85
-_SMALL_DATA_THRESHOLD_MB = 64.0  # skip chunking for small datasets
-DEFAULT_CHUNK_SIZE_MB = 256  # MB
+_MEMORY_RESERVE_RATIO = 0.60
+_SMALL_DATA_THRESHOLD_MB = 200.0  # skip chunking for small datasets
+DEFAULT_CHUNK_SIZE_MB = 2048.0  # MB
+
+# --- CONFIGURATION CONSTANT ---
+TARGET_WORKER_MEM_GB = DEFAULT_CHUNK_SIZE_MB / 1024
 
 
 # ======================================================================
@@ -84,7 +87,7 @@ class CacheManager:
             self,
             base_dir: str | None = None,
             max_total_gb: float = 50.0,
-            force_threshold: float = 0.2,
+            force_threshold: float = _MEMORY_RESERVE_RATIO,
             verbose: bool = False,
             auto_cleanup: bool = True,
             compressor: str = "lz4",
@@ -468,15 +471,18 @@ class CacheManager:
             # Generate a dask-safe toke for dataset
             key = _simple_tokenize(obj)
 
-        avail_ratio = self._available_memory_ratio()
+        # Check if object fits in the 'force_threshold' fraction of the available memory
+        fits, obj_size, mem_limit = fits_in_memory(obj=obj, ratio_to_use=self.force_threshold)
 
-        if avail_ratio > self.force_threshold:
+        if fits:
             if self.verbose:
-                print(f"[CacheManager] Keeping {key} in memory ({avail_ratio:.1%} free RAM)")
+                print(print(f"[CacheManager] Keeping {key} in memory "
+                            f"(Obj size: {_fmt_bytes(obj_size)}, Limit: {_fmt_bytes(mem_limit)})"))
             return obj.persist()
 
         if self.verbose:
-            print(f"[CacheManager] Spilling {key} to disk ({avail_ratio:.1%} free RAM)")
+            print(f"[CacheManager] Spilling {key} to disk "
+                  f"(Obj size: {_fmt_bytes(obj_size)} exceeds limit {_fmt_bytes(mem_limit)})")
 
         return self._write_to_disk_zarr(obj, key)
 
@@ -484,6 +490,109 @@ class CacheManager:
 # ---------------------------------------------------------------
 # 2. Memory estimation utilities
 # ---------------------------------------------------------------
+def optimal_batch_size(
+        obj: Union[xr.Dataset, xr.Dataset],
+        items_total: int,
+        exclude_dims: Iterable[str] | str | None = None,
+        reserve_ratio: float = _MEMORY_RESERVE_RATIO,
+        target_size_bytes: int = DEFAULT_CHUNK_SIZE_MB * 1024 ** 2,
+        verbose: bool = True) -> tuple[int, int]:
+    """
+    Estimate a safe batch size for processing multiple scales or loop items
+    based on available memory and dataset footprint.
+
+    Automatically accounts for multi-worker (SLURM/Dask) environments.
+    """
+    # --- Estimate memory per dataset instance ---
+    per_item_bytes = estimate_dataset_bytes(obj, exclude_dims=exclude_dims, mode="total")
+
+    per_item_bytes = max(1, per_item_bytes)
+
+    # --- Worker-aware memory budget ---
+    usable_mem, n_workers = get_worker_memory_budget(reserve_ratio)
+
+    # --- Compute max safe items ---
+    max_items_fit = max(1, int(min(usable_mem, target_size_bytes) // per_item_bytes))
+
+    if items_total == 1:
+        batch_size = 1
+    else:
+        batch_size = max(2, min(items_total, max_items_fit))
+
+    n_batches = min(items_total, int(np.ceil(items_total / batch_size)))
+
+    # --- Verbose diagnostics ---
+    if verbose:
+        print(f"[batch] Estimating optimal batch size: "
+              f"per-item ≈ {_fmt_bytes(per_item_bytes)} "
+              f"| usable/worker ≈ {_fmt_bytes(usable_mem)} ({n_workers} workers)"
+              f"| Running {n_batches} batches of ≤{batch_size} (out of {items_total})")
+
+    return batch_size, n_batches
+
+
+def get_num_blocks(ds: xr.Dataset, ref_var_name: str = 'u') -> int:
+    """
+    Calculates the total number of Dask blocks (partitions) in the input dataset.
+
+    This is equivalent to the total number of tasks Dask needs to run across
+    all dimensions for the reference variable.
+
+    Args:
+        ds (xr.Dataset): The dataset containing Dask-backed DataArrays.
+        ref_var_name (str): The name of the reference variable to use for
+            counting blocks (e.g., 'u', 'v'). Defaults to 'u'.
+
+    Returns:
+        int: The total number of Dask blocks. Returns 0 if the dataset is not
+             Dask-backed or the reference variable is missing.
+    """
+    # 1. Select the reference DataArray
+    if ref_var_name in ds.data_vars:
+        ref_field = ds[ref_var_name]
+    elif ds.data_vars:
+        # Fallback to the first variable if 'u' is missing
+        ref_field = ds[list(ds.data_vars)[0]]
+    else:
+        # Dataset is empty
+        return 0
+
+    # Check if the variable is Dask-backed and return number of partitions
+    if hasattr(ref_field.data, 'npartitions'):
+        return ref_field.data.npartitions
+    else:
+        # Data is likely a NumPy array (fully loaded into memory/not chunked)
+        return 1
+
+
+def get_worker_memory_budget(reserve_ratio: float = 0.7) -> tuple[int, int]:
+    """
+    Estimate per‑worker memory budget using SLURM environment variables if
+    available, otherwise fallback to detected CPU count.
+    """
+    total = psutil.virtual_memory().total
+    env_keys = ["SLURM_NTASKS", "SLURM_NTASKS_PER_NODE",
+                "DASK_WORKER_NPROCS", "DASK_WORKER_NTHREADS"]
+
+    n = None
+    for key in env_keys:
+        if key in os.environ:
+            try:
+                n = int(os.environ[key])
+                break
+            except ValueError:
+                pass
+
+    if n is None:
+        n = psutil.cpu_count(logical=True) or 1
+
+    per_worker = total * reserve_ratio / n
+    return int(per_worker), int(n)
+
+
+# ---------------------------------------------------------------------------
+# 1. Memory / Worker Utilities
+# ---------------------------------------------------------------------------
 def estimate_dataset_bytes(
         obj: Union[xr.Dataset, xr.Dataset],
         exclude_dims: Iterable[str] | str | None = None,
@@ -558,137 +667,106 @@ def estimate_dataset_bytes(
 
 
 def fits_in_memory(
-        ds: xr.Dataset,
+        obj: xr.Dataset | xr.DataArray,
         expansion_factor: int = 1,
-        ratio_to_use: float = _MEMORY_RESERVE_RATIO,
+        ratio_to_use: float = 0.7,
         exclude_dims: Iterable[str] | str | None = None,
+        mode: str = "worker",
 ) -> tuple[bool, int, int]:
-    """Check if dataset fits into memory budget (returns fits, size, limit)."""
-    dataset_size = estimate_dataset_bytes(ds, exclude_dims) * max(1, expansion_factor)
+    """
+    Determine whether `obj` (possibly expanded by `expansion_factor`) fits into
+    the available per-worker memory budget.
+
+    Returns
+    -------
+    fits : bool
+        True if dataset fits within allowed memory.
+    size_bytes : int
+        Estimated dataset size.
+    limit_bytes : int
+        Allowed memory budget.
+    """
+    size_bytes = estimate_dataset_bytes(obj, exclude_dims) * max(1, expansion_factor)
+
+    # Obtain memory limit from Dask workers if available
+    if mode == "worker":
+        try:
+            client = get_client()
+            workers = client.scheduler_info().get("workers", {})
+            available = min(w["memory_limit"] for w in workers.values()) if workers else None
+            # print(f"[chunking] Detected Dask worker memory limit: {_fmt_bytes(available)}")
+        except Exception:
+            available = psutil.virtual_memory().available
+            # print(f"[chunking] Defaulting to system available memory: {_fmt_bytes(available)}")
+    else:
+        available = psutil.virtual_memory().available
+
+    # Fall back to system memory
+    limit = int(ratio_to_use * available)
+
+    return size_bytes < limit, size_bytes, limit
+
+
+def get_current_worker_count() -> int:
+    """
+    Return the actual number of active Dask workers.
+    If workers are still registering (common when LocalCluster starts),
+    this waits briefly to avoid underestimating parallelism.
+
+    Logic:
+    ------
+    1. If SLURM_NTASKS is set → authoritative worker count.
+    2. Otherwise poll scheduler for up to `timeout` seconds.
+    3. Fall back to os.cpu_count() if client missing.
+
+    Returns
+    -------
+    int
+        Number of workers ready for computation.
+    """
+    # --- SLURM authoritative override ---
+    if "SLURM_NTASKS" in os.environ:
+        try:
+            return max(1, int(os.environ["SLURM_NTASKS"]))
+        except ValueError:
+            pass
+
     try:
         client = get_client()
-        limits = client.scheduler_info()["workers"]
-        avail = min(w["memory_limit"] for w in limits.values()) if limits else None
     except Exception:
-        avail = None
+        return os.cpu_count() or 4
 
-    available = avail or psutil.virtual_memory().available
-    max_mem = int(ratio_to_use * available)
-    return dataset_size < max_mem, dataset_size, max_mem
+    # --- Poll for worker registration ---
+    workers = client.scheduler_info().get("workers", {})
+    n_workers = len(workers)
 
-
-# ---------------------------------------------------------------
-# 3. System resource helpers
-# ---------------------------------------------------------------
-def get_worker_memory_budget(reserve_ratio: float = _MEMORY_RESERVE_RATIO) -> tuple[int, int]:
-    """Estimate memory budget (bytes) per worker/task."""
-    total = psutil.virtual_memory().total
-    env_keys = [
-        "SLURM_NTASKS", "SLURM_NTASKS_PER_NODE",
-        "DASK_WORKER_NPROCS", "DASK_WORKER_NTHREADS",
-    ]
-    for k in env_keys:
-        if k in os.environ:
-            try:
-                n = int(os.environ[k])
-                break
-            except ValueError:
-                continue
-    else:
-        n = psutil.cpu_count(logical=True) or 1
-
-    per_worker = total * reserve_ratio / n
-    return int(per_worker), int(n)
+    # Make sure at least one worker is assumed
+    return max(1, n_workers)
 
 
-def optimal_batch_size(
-        obj: Union[xr.Dataset, xr.Dataset],
-        items_total: int,
-        exclude_dims: Iterable[str] | str | None = None,
-        reserve_ratio: float = _MEMORY_RESERVE_RATIO,
-        target_size_bytes: int = DEFAULT_CHUNK_SIZE_MB * 1024 ** 2,
-        verbose: bool = True) -> tuple[int, int]:
-    """
-    Estimate a safe batch size for processing multiple scales or loop items
-    based on available memory and dataset footprint.
-
-    Automatically accounts for multi-worker (SLURM/Dask) environments.
-    """
-    # --- Estimate memory per dataset instance ---
-    per_item_bytes = estimate_dataset_bytes(obj, exclude_dims=exclude_dims, mode="total")
-
-    per_item_bytes = max(1, per_item_bytes)
-
-    # --- Worker-aware memory budget ---
-    usable_mem, n_workers = get_worker_memory_budget(reserve_ratio)
-
-    # --- Compute max safe items ---
-    max_items_fit = max(1, int(min(usable_mem, target_size_bytes) // per_item_bytes))
-
-    if items_total == 1:
-        batch_size = 1
-    else:
-        batch_size = max(2, min(items_total, max_items_fit))
-
-    n_batches = min(items_total, int(np.ceil(items_total / batch_size)))
-
-    # --- Verbose diagnostics ---
-    if verbose:
-        print(f"[batch] Estimating optimal batch size: "
-              f"per-item ≈ {_fmt_bytes(per_item_bytes)} "
-              f"| usable/worker ≈ {_fmt_bytes(usable_mem)} ({n_workers} workers)"
-              f"| Running {n_batches} batches of ≤{batch_size} (out of {items_total})")
-
-    return batch_size, n_batches
-
-
-# ---------------------------------------------------------------
-# 4. Chunking helpers
-# ---------------------------------------------------------------
 def _balanced_chunks(n: int, target: int, min_size: int) -> Tuple[int, ...]:
     """
     Split length n into m nearly-equal chunks, all >= min_size,
-    with average near `target`. Returns a tuple of chunk sizes.
+    with average size near `target`.
     """
+    # m_target: Maximum m desired to keep the chunk size AT LEAST target.
+    m_target = int(np.ceil(n / max(1, target)))
 
-    if n <= 0:
-        return ()
+    # m_max: Maximum m allowed by the hard floor min_size.
+    m_max_allowed_by_min = n // max(1, min_size)
 
-    if target <= 0:
-        raise ValueError(f"'target' must be positive, got {target}")
+    # Choose the final number of chunks (m).
+    m = max(1, min(m_target, m_max_allowed_by_min))
 
-    if min_size <= 0:
-        raise ValueError(f"'min_size' must be positive, got {min_size}")
+    # Compute base distribution (standard integer division and remainder)
+    base, rem = n // m, n % m
 
-    # --- Determine number of chunks m ---
-    # m must be *int* after ceiling
-    m = max(1, int(np.ceil(n / max(1, target))))
-
-    # shrink m if too many chunks cause < min_size pieces
-    while m > 1 and (n // m) < min_size:
-        m -= 1
-
-    # --- Compute base distribution ---
-    base = n // m
-    rem = n % m
-
-    # create chunks (all integers)
+    # Create chunks: 'rem' chunks of size (base + 1), and (m - rem) chunks of size 'base'
     chunks = (base + 1,) * rem + (base,) * (m - rem)
-
-    # --- Safety: ensure no chunk < min_size ---
-    if any(c < min_size for c in chunks):
-        # recompute m based on min_size constraint only
-        m = max(1, n // min_size)
-        base = n // m
-        rem = n % m
-        chunks = (base + 1,) * rem + (base,) * (m - rem)
 
     return tuple(chunks)
 
 
-# ---------------------------------------------------------------
-# 5. High-level adaptive chunking interface
-# ---------------------------------------------------------------
 def ensure_optimal_chunking(
         ds: xr.Dataset,
         spatial_dims: Tuple[str, str] = ("lat", "lon"),
@@ -698,111 +776,134 @@ def ensure_optimal_chunking(
         verbose: bool = True,
         rechunk_spatial: bool = False,
         output_scale_mult: int = 1,
-        desired_chunk_size_mb: Optional[float] = None,
-        min_auto_rechunk_mb: float = _SMALL_DATA_THRESHOLD_MB
+        preferred_num_blocks: Optional[int] = None,
 ) -> xr.Dataset:
     """
-    Rechunk dataset to balance performance and memory usage.
-    Keeps full horizontal planes unless they exceed memory budget.
+    Adaptive, HPC‑aware multi‑dimensional chunking for Xarray+Dask datasets.
+    Optimized for the Distributed Scheduler by maximizing chunk size
+    within the memory budget while ensuring high parallelism.
     """
     y_dim, x_dim = spatial_dims
 
-    # ---- Small dataset shortcut ----
-    est_output_size = estimate_dataset_bytes(ds, mode="total") * output_scale_mult
-
-    if est_output_size < min_auto_rechunk_mb * 1024 ** 2:
+    # ---- 0. Small dataset fast path ----
+    est_total = estimate_dataset_bytes(ds, mode="total") * output_scale_mult
+    if est_total < _SMALL_DATA_THRESHOLD_MB * 1024 ** 2:
         if verbose:
-            print(f"[chunking] Estimated output dataset "
-                  f"size is small ({_fmt_bytes(est_output_size)}); "
-                  f"ensuring at least spatially contiguous.")
-        # ensure spatially contiguous
-        plan: Dict[str, Any] = {x_dim: -1, y_dim: -1}
-        return ds.chunk(plan)
+            print(f"[chunking] Dataset small {_fmt_bytes(est_total)} → "
+                  f"keeping full spatial chunks.")
+        # Ensure non-spatial dims are also chunked as -1 if they exist
+        return ds.compute()
 
-    exclude_dims = [str(d) for d in ds.dims if d not in spatial_dims]
-
-    spatial_fits, bytes_per_plane, max_mem = fits_in_memory(
-        ds, exclude_dims=exclude_dims,
+    # ---- 1. Check whether full spatial plane fits ----
+    exclude = [str(d) for d in ds.dims if d not in spatial_dims]
+    fits, plane_bytes, worker_limit = fits_in_memory(
+        ds, exclude_dims=exclude,
         expansion_factor=output_scale_mult,
         ratio_to_use=memory_threshold_ratio,
+        mode="worker",
     )
 
     plan: Dict[str, Any] = {}
 
-    # ---- Spatial chunking ----
-    if not rechunk_spatial and spatial_fits:
-        plan.update({y_dim: -1, x_dim: -1})
-    else:
-        reduction = max(1.0, bytes_per_plane / max(1, max_mem))
-        n_tiles = max(1, np.ceil(np.sqrt(reduction)))
-        cy, cx = np.ceil(ds.sizes[y_dim] / n_tiles), np.ceil(ds.sizes[x_dim] / n_tiles)
-        plan.update({y_dim: cy, x_dim: cx})
+    # ---- 2. Spatial chunking decision ----
+    if fits and not rechunk_spatial:
+        plan[y_dim] = -1
+        plan[x_dim] = -1
         if verbose:
-            print(f"[chunking] Applying spatial tiling: ({n_tiles}×{n_tiles}) → {cy}×{cx}")
+            print(f"[chunking] Full spatial slices fit in memory.")
+    else:
+        # Must tile spatial dims (logic remains correct for memory safety)
+        reduction = max(1.0, plane_bytes / max(1, worker_limit))
+        n_tiles = int(np.ceil(np.sqrt(reduction)))
+        cy = int(np.ceil(ds.sizes[y_dim] / n_tiles))
+        cx = int(np.ceil(ds.sizes[x_dim] / n_tiles))
+        plan[y_dim] = cy
+        plan[x_dim] = cx
+        if verbose:
+            print(f"[chunking] Spatial tiling → ({n_tiles}×{n_tiles}) → {cy}×{cx}")
 
-    # ---- Time / Vertical chunk balancing ----
+    # ---- 3. Non‑spatial dims (time & vertical) ----
     needs_t = "time" in ds.dims
     needs_z = vertical_dim in ds.dims
-    t_guess, z_guess = ds.sizes.get("time", 1), ds.sizes.get(vertical_dim, 1)
+    t_size = ds.sizes.get("time", 1)
+    z_size = ds.sizes.get(vertical_dim, 1)
 
-    # Estimate the size of one horizontal plane
-    target_bytes = (desired_chunk_size_mb or DEFAULT_CHUNK_SIZE_MB) * 1024 ** 2
+    # Estimate bytes per spatial tile
+    tile = ds.isel(
+        {
+            x_dim: slice(0, plan[x_dim] if plan[x_dim] != -1 else ds.sizes[x_dim]),
+            y_dim: slice(0, plan[y_dim] if plan[y_dim] != -1 else ds.sizes[y_dim])
+        }, drop=True)
+    tile_bytes = estimate_dataset_bytes(tile, mode="total")
 
-    # Compute how many planes fit into the target
-    n_planes_per_chunk = max(1, int(target_bytes // max(1, int(bytes_per_plane))))
+    total_planes = t_size * z_size
 
-    if verbose:
-        print(f"[chunking] Target chunk budget: {desired_chunk_size_mb or 128:.0f} MB "
-              f"→ {n_planes_per_chunk} planes per chunk")
+    # Memory Constraint: Minimum blocks needed for safety (blocks_mem)
+    planes_per_chunk_mem = max(1, int(worker_limit // max(1, tile_bytes)))
+    blocks_mem = max(1, int(np.ceil(total_planes / planes_per_chunk_mem)))
 
-    # ---- Choose chunking strategy ----
-    z_target = int(np.ceil(np.sqrt(n_planes_per_chunk)))  # split planes into time and z
-    min_z_chunk = int(deriv_edge_order + 1)
+    # Parallelism Constraint: Workers * Buffer (Goal: keep pipeline full)
+    workers = os.cpu_count() or 4
+
+    # Increase parallelism buffer from 4 to 10 (less memory aggressive)
+    PARALLEL_BUFFER = 10
+    target_parallel_blocks = preferred_num_blocks or (workers * PARALLEL_BUFFER)
+    target_parallel_blocks = int(np.ceil(target_parallel_blocks))
+
+    # Select Target Block Count: Use the largest count (smallest chunks) required by safety or parallelism.
+    # We still use max() because we MUST satisfy the memory constraint.
+    blocks_target = max(blocks_mem, target_parallel_blocks)
+
+    # Calculate final planes per chunk based on the target block count
+    planes_final = max(1, int(np.ceil(total_planes / blocks_target)))
+
+    # ---- 4. Choose chunking for time/Z ----
+    # Aim for a square chunk in the t-z plane if possible for easier access/caching.
+    z_target = int(np.ceil(np.sqrt(planes_final)))
+    min_z = deriv_edge_order + 1
 
     if needs_t and needs_z:
-        # Split budget roughly between z and time
-        z_chunk = _balanced_chunks(z_guess, z_target, min_z_chunk)
-        t_chunk = max(1, min(t_guess, n_planes_per_chunk // max(1, min(z_chunk))))
+        # Split vertical dim first, respecting the minimum stencil size
+        z_chunks_tuple = _balanced_chunks(z_size, z_target, min_z)
+        z_chunks_max = max(z_chunks_tuple)
 
-        plan.update({"time": t_chunk, vertical_dim: z_chunk})
+        # Split time dim to use up remaining planes budget
+        t_target = planes_final // max(1, z_chunks_max)
+        t_chunks_tuple = _balanced_chunks(t_size, t_target, min_size=1)
+
+        plan[vertical_dim] = z_chunks_tuple
+        plan["time"] = t_chunks_tuple
+
     elif needs_z:
-        z_chunk = _balanced_chunks(z_guess, n_planes_per_chunk, min_z_chunk)
-        plan[vertical_dim] = z_chunk
+        plan[vertical_dim] = _balanced_chunks(z_size, planes_final, min_z)
     elif needs_t:
-        plan["time"] = min(t_guess, n_planes_per_chunk)
+        plan["time"] = _balanced_chunks(t_size, planes_final, min_size=1)
 
-    # ---- Convert numeric chunk hints into balanced tuples ----
-    for dim, chunks in plan.items():
-        if dim not in ds.dims:
-            continue
-        dim_size = ds.sizes[dim]
-        if isinstance(chunks, int):
-            if dim not in spatial_dims:
-                n_chunks = max(1, np.ceil(dim_size / chunks))
-                plan[dim] = _balanced_chunks(dim_size, dim_size // n_chunks, min_size=1)
-            else:
-                plan[dim] = min(chunks, dim_size)
-
-    # ---- Final rechunk ----
+    # ---- 5. Final rechunk ----
     out = ds.unify_chunks().chunk(plan)
-    total_est = estimate_dataset_bytes(out, mode="largest_chunk") * output_scale_mult
-
-    # ---- Summary ----
-    msg_parts: List[str] = []
-    for d, c in plan.items():
-        if isinstance(c, (tuple, list)):
-            c_min, c_max = min(c), max(c)
-            msg_parts.append(f"{d}={c_min}" if c_min == c_max else f"{d}=({c_min}, {c_max})")
-        elif c == -1:
-            msg_parts.append(f"{d}={out.sizes[d]} (full)")
-        else:
-            msg_parts.append(f"{d}={c}")
-    if output_scale_mult > 1:
-        msg_parts.append(f"Scale=x{output_scale_mult}")
 
     if verbose:
-        print(f"[chunking] Target: {_fmt_bytes(target_bytes)} | "
+        msg_parts: List[str] = []
+        for d, c in plan.items():
+            if isinstance(c, (tuple, list)):
+                c_min, c_max = min(c), max(c)
+                # Display target chunk size for non-spatial dims
+                msg_parts.append(f"{d}={c_min}" if c_min == c_max else f"{d}=({c_min}, {c_max})")
+            elif c == -1:
+                msg_parts.append(f"{d}={out.sizes.get(d, 'N/A')} (full)")
+            else:
+                # Should not happen if _balanced_chunks is used correctly, but keep for robustness
+                msg_parts.append(f"{d}={c}")
+        if output_scale_mult > 1:
+            msg_parts.append(f"Scale=x{output_scale_mult}")
+
+        largest = estimate_dataset_bytes(out, mode="largest_chunk") * output_scale_mult
+        # Use get_num_blocks from the updated dask_utils.py
+        blocks = get_num_blocks(out, ref_var_name=list(ds.data_vars)[0])
+
+        print(f"[chunking] Budget: {_fmt_bytes(worker_limit)} | "
               f"Plan: {', '.join(msg_parts)} | "
-              f"Est. output working set: {_fmt_bytes(total_est)}")
+              f"Partitions: {blocks} | "
+              f"Est. largest chunk: {_fmt_bytes(largest)}")
 
     return out

@@ -1,12 +1,11 @@
 from typing import Union, Callable, Any
 
-import dask
 import numpy as np
 import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
-from .memory_manager import ensure_optimal_chunking, DEFAULT_CHUNK_SIZE_MB
 from .constants import cp, Omega, epsilon
+from .memory_manager import ensure_optimal_chunking
 from .numeric_tools import domain_mean, stack_vector, rotate_vector
 from .numeric_tools import horizontal_advection, horizontal_gradient
 from .numeric_tools import horizontal_divergence, relative_vorticity
@@ -386,29 +385,21 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     print(f"[budget] Resolved spatial dimensions {space_dims}")
 
-    # Apply consistent rechunking:
+    # Rechunk spatial dims switch (default False)
     rechunk_spatial = getattr(cfg.compute, "rechunk_spatial", False)
-    allow_rechunking = getattr(cfg.compute, "dask_allow_rechunk", True)
-    chunk_size_mb = getattr(cfg.compute, "chunksizes", DEFAULT_CHUNK_SIZE_MB)
 
-    # Resetting dask defaults from user override
-    dask.config.set({
-        "array.chunk-size": f"{max(1.0, chunk_size_mb):.1f}MB",
-        "array.slicing.split_large_chunks": False,
-    })
+    # ----------------------------------------------------------------------------
+    # Ensure 'optimal' chunks along non-spatial dimensions for high parallelism
+    # ----------------------------------------------------------------------------
+    ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
+                                 # Use up to 90% of available memory
+                                 memory_threshold_ratio=0.9,
+                                 # Stencil order for finite difference formulas
+                                 deriv_edge_order=2,
+                                 # Switch for spatial rechunk: small impact on the performance
+                                 rechunk_spatial=rechunk_spatial)
 
-    if allow_rechunking:
-        ds = ensure_optimal_chunking(ds, spatial_dims=(y_dim, x_dim), vertical_dim="z",
-                                     # largest chunk limit chunk size (MB)
-                                     desired_chunk_size_mb=float(chunk_size_mb),
-                                     # Use up to 90% of available memory
-                                     memory_threshold_ratio=0.9,
-                                     # Stencil order for finite difference formulas
-                                     deriv_edge_order=2,
-                                     # Switch for spatial rechunk: small impact on the performance
-                                     rechunk_spatial=rechunk_spatial)
-
-    # After open_dataset(), variable names are normalized to logical names.
+    # Get wind field, variable names are normalized to logical names.
     u = ds["u"]
     v = ds["v"]
     w = ds["w"]
@@ -418,7 +409,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     if missing:
         raise ValueError(f"Configured dims {space_dims} not all found in 'w' dims {tuple(w.dims)}")
 
-    # dx, dy infer if not set
+    # Infer grid resolution if not provided (provided for legacy reasons, should always be inferred)
     if cfg.compute.dx is None or cfg.compute.dy is None:
         dx, dy = infer_grid_resolution(ds)
         print(f"[budget] Estimated grid resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
@@ -426,7 +417,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         dx, dy = cfg.compute.dx, cfg.compute.dy
         print(f"[budget] Specified grid resolution: dx = {dx:.4f} m, dy = {dy:.4f} m")
 
-    # --- Thermodynamics ---
+    # ----------------------------------------------------------------------------
+    # --- Thermodynamics computations ---
+    # ----------------------------------------------------------------------------
     theta = ds.get("theta")
     pressure = ds.get("pressure")
     temperature = ds.get("temperature")
