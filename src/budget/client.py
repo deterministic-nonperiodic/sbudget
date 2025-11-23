@@ -1,5 +1,7 @@
 import argparse
 import os
+import re
+import resource
 import time
 import warnings
 from pathlib import Path
@@ -15,46 +17,101 @@ from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
 from .io_utils import open_dataset, write_dataset
 from .memory_manager import TARGET_WORKER_MEM_GB
 
-DASK_WARNING_PATTERN = r"Sending large graph of size .* MiB\."
-
 # Suppress Dask warnings about large graphs
 warnings.filterwarnings(
     "ignore",
-    message=DASK_WARNING_PATTERN,
+    message=r"Sending large graph of size .* MiB\.",
     category=UserWarning,
     module=r'distributed\.client'
 )
 
+# New constant for maximum file descriptors
+_MAX_FILE_DESCRIPTORS = 8192
+_THREAD_LIMIT = 64  # Arbitrary threshold for switching to distributed
 
-# ---------------------------------------------------------------------------
-# SLURM Resource Detection
-# ---------------------------------------------------------------------------
+
+# --- Helper Function for SLURM Memory Detection ---
+def _parse_slurm_memory() -> Optional[float]:
+    """
+    Parses SLURM memory variables (SLURM_MEM_PER_NODE, SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU)
+    to determine the total memory allocated to the job, in GiB.
+
+    Returns the total allocated memory in GiB, or None if no SLURM memory variable is found.
+    """
+    n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
+
+    # 1. SLURM_MEM_PER_NODE (Total memory for the whole job/node)
+    if "SLURM_MEM_PER_NODE" in os.environ:
+        # Value is usually in MiB
+        return int(os.environ["SLURM_MEM_PER_NODE"]) / 1024.0
+
+    # 2. SLURM_MEM_PER_CPU (Memory per task/CPU)
+    if "SLURM_MEM_PER_CPU" in os.environ:
+        # Value is usually in MiB
+        mem_per_task = int(os.environ["SLURM_MEM_PER_CPU"]) / 1024.0
+        return n_tasks * mem_per_task
+
+    # 3. SLUM_MEM (General total memory request, typically in GB or MB)
+    # This captures the --mem=256G request
+    if "SLURM_MEM" in os.environ:
+        mem_str = os.environ["SLURM_MEM"].upper()
+        match = re.search(r'(\d+)([MG])', mem_str)
+        if match:
+            value = float(match.group(1))
+            unit = match.group(2)
+            if unit == 'G':
+                return value
+            elif unit == 'M':
+                return value / 1024.0
+        # If it's a simple number (usually MB on some clusters)
+        try:
+            # Assume MB if no unit is given
+            return float(os.environ["SLURM_MEM"]) / 1024.0
+        except ValueError:
+            pass
+
+    return None
+
+
+# --- Helper function definitions (omitted for brevity) ---
+def _increase_fd_limit():
+    """Attempts to increase the file descriptor limit for the current process."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < _MAX_FILE_DESCRIPTORS:
+            new_soft = min(hard, _MAX_FILE_DESCRIPTORS)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+            print(f"[FD] Increased file descriptor limit from {soft} to {new_soft}.")
+    except Exception as e:
+        print(f"[FD] Warning: Could not increase FD limit: {e}")
+
+
 def _detect_resources() -> Dict[str, Union[int, float, bool]]:
-    """
-    Detects allocated resources, prioritizing SLURM environment variables.
-    """
+    """Detects allocated resources, prioritizing SLURM environment variables."""
     is_slurm = "SLURM_JOB_ID" in os.environ
 
     # 1. Thread/Worker Allocation
     if is_slurm:
-        # HPC: Maximize processes/workers (n_tasks) with assigned threads (cpus_per_task)
         n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
         cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         n_threads = cpus_per_task
         n_workers = n_tasks
     else:
-        # Local: Maximize processes (n_workers=total_cores) with 1 thread per worker.
         total_cores = psutil.cpu_count(logical=True) or 4
         n_workers = total_cores
         n_threads = 1
 
-        # 2. Total Memory Allocation (in GiB)
-    if "SLURM_MEM_PER_NODE" in os.environ:
-        total_mem_gb = int(os.environ["SLURM_MEM_PER_NODE"]) / 1024
-    elif "SLURM_MEM_PER_CPU" in os.environ:
-        total_mem_gb = n_workers * n_threads * (int(os.environ["SLURM_MEM_PER_CPU"]) / 1024)
+    # 2. Total Memory Allocation (in GiB)
+    slurm_mem = _parse_slurm_memory()
+
+    if slurm_mem is not None:
+        # Use SLURM detected memory pool
+        total_mem_gb = slurm_mem
+        if is_slurm:
+            print(f"[budget] Detected SLURM Memory Pool: {total_mem_gb:.2f} GiB")
     else:
-        total_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
+        # Local Machine: Total system memory (Fallback)
+        total_mem_gb = psutil.virtual_memory().total / (1024 ** 3)
 
     return {
         "n_workers": n_workers,
@@ -65,18 +122,11 @@ def _detect_resources() -> Dict[str, Union[int, float, bool]]:
 
 
 def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
-    """
-    HPC-aware configuration of Dask global settings and cluster parameters.
-
-    Returns
-    -------
-    (num_workers, threads_per_worker)
-    """
+    """HPC-aware configuration of Dask global settings and cluster parameters."""
     resources = _detect_resources()
 
     # --- Chunk Size Heuristic ---
     total_mem_gb = resources["total_mem_gb"]
-
     if total_mem_gb < 64:
         default_chunk_mb = 512
     else:
@@ -88,7 +138,8 @@ def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
     dask.config.set({
         "array.chunk-size": f"{chunk_mb}MB",
         "array.slicing.split_large_chunks": False,
-        # "distributed.worker.memory.limit": f'{TARGET_WORKER_MEM_GB:.2f}GB',
+        # Pass explicit memory limit to Dask config
+        "distributed.worker.memory.limit": f'{TARGET_WORKER_MEM_GB:.2f}GB',
         "distributed.worker.memory.target": False,
         "distributed.worker.memory.spill": False,
         "distributed.worker.memory.pause": 0.95,
@@ -104,15 +155,29 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
     """
     Create and return a Dask client, supporting 'threads' or 'distributed' modes.
     """
-    # Use scheduler type from config if not explicitly provided
+    _increase_fd_limit()  # Call the FD limit helper
+
     scheduler = getattr(cfg.compute, "scheduler", "threads")
 
-    # ==============================================
-    # AUTO CONFIGURE DASK (based on Slurm/local OS)
-    # ==============================================
-    num_workers, threads_per_worker = auto_configure_dask(cfg)
+    num_workers_detected, threads_per_worker_detected = auto_configure_dask(cfg)
 
-    print(f"[budget] Auto-Dask → workers={num_workers}, threads={threads_per_worker}")
+    total_mem_gb = _detect_resources()["total_mem_gb"]
+
+    # Calculate MAX workers allowed by the higher memory budget (3.0 GB)
+    max_workers_by_mem = int(total_mem_gb // TARGET_WORKER_MEM_GB)
+
+    # The final worker count must be the minimum of the requested count and the memory allowed.
+    num_workers = min(num_workers_detected, max_workers_by_mem)
+    threads_per_worker = threads_per_worker_detected
+
+    if num_workers == 0:
+        raise MemoryError(f"Insufficient memory ({total_mem_gb:.2f}GB) to start even one worker "
+                          f"with required budget ({TARGET_WORKER_MEM_GB}GB).")
+
+    print(
+        f"[budget] Auto-Dask → workers={num_workers} | "
+        f"threads={threads_per_worker} | "
+        f"Total memory={total_mem_gb:.2f}GB ")
 
     # Calculate the total cores allocated/detected
     total_cores = num_workers * threads_per_worker
@@ -125,38 +190,36 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
         cluster = LocalCluster(
             n_workers=num_workers,
             threads_per_worker=threads_per_worker,
-            processes=True,  # Always use processes in distributed mode
+            processes=True,
             memory_limit=f'{TARGET_WORKER_MEM_GB:.2f}GB'
         )
         return Client(cluster)
 
     elif scheduler == "threads":
         # MODE 2: THREADS (Small local, minimal overhead)
-
-        # If the thread count is too high, recursively switch to 'distributed'.
-        THREAD_LIMIT = 12
-        if total_cores > THREAD_LIMIT:
+        if total_cores > _THREAD_LIMIT:
             print(
-                f"[budget] WARNING: Total cores ({total_cores}) exceeds thread limit ({THREAD_LIMIT}).")
+                f"[budget] WARNING: Total cores ({total_cores}) exceeds thread limit "
+                f"({_THREAD_LIMIT}).")
             print(
                 f"[budget]         Using 'distributed' scheduler instead for multiprocessing stability.")
 
-            # Change the scheduler type in the configuration
+            # Note: cfg.compute.scheduler change is handled in the original code logic path
             cfg.compute.scheduler = "distributed"
 
+            # Recursively call to run the distributed logic with updated worker count
             return init_dask_client(cfg, scheduler_address)
 
         # Single process, multi-thread
         cluster = LocalCluster(
             n_workers=1,
-            threads_per_worker=total_cores,  # Use all available threads in one worker
+            threads_per_worker=total_cores,
             processes=False,
             memory_limit=f'{TARGET_WORKER_MEM_GB:.2f}GB'
         )
         return Client(cluster)
 
     else:
-        # Fallback for old/unsupported scheduler types
         raise ValueError(
             f"Unknown or unsupported scheduler type: {scheduler}. Use 'threads' or 'distributed'.")
 
@@ -171,8 +234,8 @@ def _cmd_compute(args) -> None:
     client = init_dask_client(cfg, scheduler_address=None)
 
     if client is not None:
-        print(f"[budget] Dask Dashboard: {client.dashboard_link}")
-        print(f"[budget] Using client: {client}")
+        print(f"[sbudget] Dask Dashboard: {client.dashboard_link}")
+        print(f"[sbudget] Using client: {client}")
 
     # -------------------------------------------------------------------
     # Open dataset with normalized variable/dimension names
@@ -186,19 +249,19 @@ def _cmd_compute(args) -> None:
     mode_in = str(cfg.compute.mode).strip()
     mode = _MODE_ALIASES.get(mode_in, mode_in)
     if mode_in in _MODE_ALIASES:
-        print(f"[budget] NOTE: mode '{mode_in}' is deprecated; use '{mode}'")
+        print(f"[sbudget] NOTE: mode '{mode_in}' is deprecated; use '{mode}'")
 
-    print(f"[budget] RUNNING MODE: {mode}")
+    print(f"[sbudget] RUNNING MODE: {mode}")
 
     # store start time for profiling
     start_time = time.monotonic()
 
     if mode == "spectral_budget":
-        print("[budget] Starting spectral budget calculation...")
+        print("[sbudget] Starting spectral budget calculation...")
         out = compute_budget(ds, cfg)
-        print("[budget] Constructed dask graph for spectral budget calculation")
+        print("[sbudget] Constructed dask graph for spectral budget calculation")
     elif mode == "scale_transfer":
-        print("[budget] Starting inter-scale transfer calculation...")
+        print("[sbudget] Starting inter-scale transfer calculation...")
 
         # Extract kwargs for scale_increments
         kwargs = {"scales": getattr(cfg.compute, "scales", None), "verbose": True}
@@ -220,7 +283,7 @@ def _cmd_compute(args) -> None:
     end_time = time.monotonic()
     duration = end_time - start_time
     # Print the profiling information
-    print(f"\n[budget] PROFILE: Total time elapsed: {duration:.2f} seconds")
+    print(f"\n[sbudget] PROFILE: Total time elapsed: {duration:.2f} seconds")
 
 
 def _add_bool_pair(p, name, dest, help_true, help_false):
@@ -320,7 +383,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # optional echo of scheduler if present
     if hasattr(args, "scheduler") and args.scheduler:
-        print(f"[budget] scheduler={args.scheduler}")
+        print(f"[sbudget] scheduler={args.scheduler}")
 
     args.func(args)
 

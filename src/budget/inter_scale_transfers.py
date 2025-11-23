@@ -502,7 +502,7 @@ def scale_transfer(
         Integrated field with dimension 'scale' and same spatial dims as integrand.
     """
     if verbose:
-        print(f"[scale-integral] Computing '{name}' ...")
+        print(f"[scale-integral] Building parallel graph for '{name}' ...")
 
     # ------------------------------------------------------------
     # Build integration kernels dG_ℓ(r)/dr for all ℓ and r
@@ -598,10 +598,14 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # ----------------------------------------------------------------------------
     # Ensure 'optimal' chunks along non-spatial dimensions for high parallelism
     # ----------------------------------------------------------------------------
+    num_workers = kwargs.get("num_workers", None)
+
     wind = ensure_optimal_chunking(wind,
                                    spatial_dims=(y_name, x_name), vertical_dim="z",
                                    # Data size increases by the number of scales
-                                   output_scale_mult=radial_distance.size)
+                                   output_scale_mult=radial_distance.size,
+                                   # Limit number of workers to avoid overheads
+                                   num_workers=num_workers)
 
     # ----------------------------------------------------------------------------
     # Compute third-order structure functions for each radial distance

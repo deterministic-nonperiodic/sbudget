@@ -503,10 +503,10 @@ def scale_increments(
 
     # Diagnostics
     if verbose:
-        print(f"[GRID] Domain size     : Lx={domain[0]:.2f} m, Ly={domain[1]:.2f} m")
-        print(f"[GRID] Grid spacing    : dx = {grid_res[0]:8.2f} m, dy = {grid_res[1]:8.2f} m")
-        print(f"[GRID] Effective range : [{float(ds.r.min()):.2f}, {float(ds.r.max()):.2f}] m")
-        print(f"[GRID] Scales retained : {summarize_scales(ds.scale.values)} m")
+        print(f"[GRID] Domain extension    : Lx={domain[0]:.2f} m, Ly={domain[1]:.2f} m")
+        print(f"[GRID] Grid resolution     : dx = {grid_res[0]:8.2f} m, dy = {grid_res[1]:8.2f} m")
+        print(f"[GRID] Effective range     : [{float(ds.r.min()):.2f}, {float(ds.r.max()):.2f}] m")
+        print(f"[GRID] Retained {ds.scale.size:3d} scales : {summarize_scales(ds.scale.values)} m")
         print("====================================================================")
 
     # Force computation to NumPy on client for efficient Dask serialization

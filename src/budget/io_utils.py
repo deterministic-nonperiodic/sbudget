@@ -173,7 +173,7 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
     # select specified vertical levels
     if levels is not None and mode == "scale_transfer":
         ds = ds.sel(z=levels, method='nearest')
-        print("[budget] Performing analysis on selected levels: ", ds.z.values)
+        print("[sbudget] Performing analysis on selected levels: ", ds.z.values)
 
     return ds
 
@@ -306,7 +306,7 @@ def write_dataset(ds: xr.Dataset, cfg, client=None) -> None:
     ds.attrs.update(_global_attrs)
 
     engine = getattr(cfg.input, "engine", "netcdf4")
-    print(f"[I/O] Starting computation and write to temporary store: {write_target} (Zarr)")
+    print(f"[I/O] Starting computation ...")
 
     # Define the lazy Zarr write operation
     delayed_write_op = ds.to_zarr(
@@ -320,7 +320,7 @@ def write_dataset(ds: xr.Dataset, cfg, client=None) -> None:
     # --- Execute Parallel Write (Triggers Dask Graph) ---
     if is_dask_collection(delayed_write_op):
         if client:
-            print(f"[I/O] Executing parallel Dask graph via distributed client...")
+            print(f"[I/O] Executing parallel Dask graph ...")
             future = client.compute(delayed_write_op)
             progress(future, notebook=False)
 
@@ -343,7 +343,7 @@ def write_dataset(ds: xr.Dataset, cfg, client=None) -> None:
 
     # --- Synchronous NetCDF Conversion (If Requested) ---
     if store_type == "netcdf":
-        print(f"[I/O] NetCDF output requested. Starting synchronous Zarr-to-NetCDF conversion...")
+        print(f"[I/O] Starting synchronous Zarr-to-NetCDF conversion...")
 
         # Load Zarr store (should be fast metadata read, data is already computed)
         ds_computed = xr.open_zarr(temp_zarr_path, consolidated=False)
@@ -351,7 +351,7 @@ def write_dataset(ds: xr.Dataset, cfg, client=None) -> None:
         # Synchronous write to final NetCDF file (this resolves the HDF5 lock issue)
         ds_computed.to_netcdf(output_path, engine=engine)
 
-        print(f"[I/O] Final output successfully written to: {output_path} (NetCDF).")
+        print(f"[I/O] Final output successfully written to: '{output_path}' (NetCDF).")
 
         # Clean up the temporary Zarr store immediately
         shutil.rmtree(temp_zarr_path)

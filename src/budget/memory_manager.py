@@ -34,7 +34,7 @@ from numcodecs import Blosc
 # ======================================================================
 _MEMORY_RESERVE_RATIO = 0.60
 _SMALL_DATA_THRESHOLD_MB = 200.0  # skip chunking for small datasets
-DEFAULT_CHUNK_SIZE_MB = 2048.0  # MB
+DEFAULT_CHUNK_SIZE_MB = 3072.0  # MB
 
 # --- CONFIGURATION CONSTANT ---
 TARGET_WORKER_MEM_GB = DEFAULT_CHUNK_SIZE_MB / 1024
@@ -709,39 +709,47 @@ def fits_in_memory(
 
 def get_current_worker_count() -> int:
     """
-    Return the actual number of active Dask workers.
-    If workers are still registering (common when LocalCluster starts),
-    this waits briefly to avoid underestimating parallelism.
+    Return the total number of threads available for computation
+    (workers * threads_per_worker).
 
     Logic:
     ------
-    1. If SLURM_NTASKS is set → authoritative worker count.
-    2. Otherwise poll scheduler for up to `timeout` seconds.
+    1. If SLURM_NTASKS is set → authoritative total thread count.
+    2. Otherwise, check active Dask client for total threads used.
     3. Fall back to os.cpu_count() if client missing.
 
     Returns
     -------
     int
-        Number of workers ready for computation.
+        Total number of threads (cores) ready for computation.
     """
-    # --- SLURM authoritative override ---
-    if "SLURM_NTASKS" in os.environ:
+    # --- 1. SLURM authoritative override (Total Threads = Ntasks * Nthreads/task) ---
+    if "SLURM_JOB_ID" in os.environ:
+        print("[chunking] SLURM environment detected.")
         try:
-            return max(1, int(os.environ["SLURM_NTASKS"]))
+            n_tasks = int(os.environ["SLURM_NTASKS"])
+            # Default to 1 thread per task if SLURM_CPUS_PER_TASK is not set
+            threads_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+            total_threads = n_tasks * threads_per_task
+            return max(1, total_threads)
         except ValueError:
-            pass
+            pass  # Continue to Dask check if variable is corrupted
 
+    # --- 2. Dask client check (Total Threads = Sum of nthreads across all workers) ---
     try:
         client = get_client()
+        workers = client.scheduler_info().get("workers", {})
+
+        # Sum the 'nthreads' value for all workers
+        total_threads = sum(w.get("nthreads", 1) for w in workers.values())
+
+        # Ensure at least one thread is assumed if client is active
+        return max(1, total_threads)
+
     except Exception:
+        print("[chunking] Fallback to local CPU count.")
+        # --- 3. Fallback to local machine resources (Total logical CPUs) ---
         return os.cpu_count() or 4
-
-    # --- Poll for worker registration ---
-    workers = client.scheduler_info().get("workers", {})
-    n_workers = len(workers)
-
-    # Make sure at least one worker is assumed
-    return max(1, n_workers)
 
 
 def _balanced_chunks(n: int, target: int, min_size: int) -> Tuple[int, ...]:
@@ -776,6 +784,7 @@ def ensure_optimal_chunking(
         verbose: bool = True,
         rechunk_spatial: bool = False,
         output_scale_mult: int = 1,
+        num_workers: Optional[int] = None,
         preferred_num_blocks: Optional[int] = None,
 ) -> xr.Dataset:
     """
@@ -843,11 +852,14 @@ def ensure_optimal_chunking(
     blocks_mem = max(1, int(np.ceil(total_planes / planes_per_chunk_mem)))
 
     # Parallelism Constraint: Workers * Buffer (Goal: keep pipeline full)
-    workers = os.cpu_count() or 4
+    if num_workers is None:
+        num_workers = get_current_worker_count()
+    else:
+        num_workers = max(1, int(num_workers))
 
     # Increase parallelism buffer from 4 to 10 (less memory aggressive)
-    PARALLEL_BUFFER = 10
-    target_parallel_blocks = preferred_num_blocks or (workers * PARALLEL_BUFFER)
+    PARALLEL_BUFFER = 8
+    target_parallel_blocks = preferred_num_blocks or (num_workers * PARALLEL_BUFFER)
     target_parallel_blocks = int(np.ceil(target_parallel_blocks))
 
     # Select Target Block Count: Use the largest count (smallest chunks) required by safety or parallelism.
@@ -901,9 +913,8 @@ def ensure_optimal_chunking(
         # Use get_num_blocks from the updated dask_utils.py
         blocks = get_num_blocks(out, ref_var_name=list(ds.data_vars)[0])
 
-        print(f"[chunking] Budget: {_fmt_bytes(worker_limit)} | "
-              f"Plan: {', '.join(msg_parts)} | "
-              f"Partitions: {blocks} | "
+        print(f"[chunking] Budget: {_fmt_bytes(worker_limit)} | workers: {num_workers} | "
+              f"Plan: {', '.join(msg_parts)} | Partitions: {blocks} | "
               f"Est. largest chunk: {_fmt_bytes(largest)}")
 
     return out
