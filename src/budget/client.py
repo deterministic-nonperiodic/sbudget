@@ -27,7 +27,7 @@ warnings.filterwarnings(
 
 # New constant for maximum file descriptors
 _MAX_FILE_DESCRIPTORS = 8192
-_THREAD_LIMIT = 64  # Arbitrary threshold for switching to distributed
+_MIN_WORKER_MEM_GB = 4.0  # Minimum memory per worker in GiB
 
 
 # --- Helper Function for SLURM Memory Detection ---
@@ -90,7 +90,7 @@ def _detect_resources() -> Dict[str, Union[int, float, bool]]:
     """Detects allocated resources, prioritizing SLURM environment variables."""
     is_slurm = "SLURM_JOB_ID" in os.environ
 
-    # 1. Thread/Worker Allocation
+    # Thread/Worker Allocation
     if is_slurm:
         n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
         cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
@@ -101,7 +101,7 @@ def _detect_resources() -> Dict[str, Union[int, float, bool]]:
         n_workers = total_cores
         n_threads = 1
 
-    # 2. Total Memory Allocation (in GiB)
+    # Total Memory Allocation (in GiB)
     slurm_mem = _parse_slurm_memory()
 
     if slurm_mem is not None:
@@ -138,7 +138,6 @@ def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
     dask.config.set({
         "array.chunk-size": f"{chunk_mb}MB",
         "array.slicing.split_large_chunks": False,
-        # Pass explicit memory limit to Dask config
         "distributed.worker.memory.limit": f'{TARGET_WORKER_MEM_GB:.2f}GB',
         "distributed.worker.memory.target": False,
         "distributed.worker.memory.spill": False,
@@ -153,35 +152,56 @@ def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
 
 def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Client:
     """
-    Create and return a Dask client, supporting 'threads' or 'distributed' modes.
+    Create and return a Dask client with adaptive memory configuration.
     """
-    _increase_fd_limit()  # Call the FD limit helper
 
+    # Ensure sufficient file descriptor limit
+    _increase_fd_limit()
+
+    # Scheduler type
     scheduler = getattr(cfg.compute, "scheduler", "threads")
 
+    # Get initial SLURM/Local core count and total memory pool
     num_workers_detected, threads_per_worker_detected = auto_configure_dask(cfg)
-
     total_mem_gb = _detect_resources()["total_mem_gb"]
 
-    # Calculate MAX workers allowed by the higher memory budget (3.0 GB)
-    max_workers_by_mem = int(total_mem_gb // TARGET_WORKER_MEM_GB)
+    # Calculate the maximum number of workers that can safely fit (N_stable)
+    # This determines the final worker count.
+    max_workers_by_mem = int(total_mem_gb // _MIN_WORKER_MEM_GB)
 
-    # The final worker count must be the minimum of the requested count and the memory allowed.
+    # Final worker count is the minimum of requested cores and memory capacity
     num_workers = min(num_workers_detected, max_workers_by_mem)
-    threads_per_worker = threads_per_worker_detected
 
     if num_workers == 0:
         raise MemoryError(f"Insufficient memory ({total_mem_gb:.2f}GB) to start even one worker "
-                          f"with required budget ({TARGET_WORKER_MEM_GB}GB).")
+                          f"with required minimum budget ({_MIN_WORKER_MEM_GB}GB).")
 
-    print(
-        f"[budget] Auto-Dask → workers={num_workers} | "
-        f"threads={threads_per_worker} | "
-        f"Total memory={total_mem_gb:.2f}GB ")
+    # Calculate the Actual Worker Memory Limit (R_actual)
+    actual_worker_mem_gb = total_mem_gb / num_workers
 
-    # Calculate the total cores allocated/detected
-    total_cores = num_workers * threads_per_worker
+    # Finalize Configuration
+    if scheduler == "distributed":
+        # Distributed mode: We use multiple processes, so threads per worker = 1
+        threads_per_worker = 1
+    else:
+        # Threads mode: We use one process, so threads per worker = total cores
+        # If running locally (non-SLURM), use all detected threads
+        # If running on HPC, use the SLURM-requested core count
+        threads_per_worker = num_workers_detected * threads_per_worker_detected  # Total cores
+        num_workers = 1  # Force single worker process for thread mode
 
+    # Override Dask config with the calculated actual limit
+    dask.config.set({
+        "distributed.worker.memory.limit": f'{actual_worker_mem_gb:.2f}GB',
+    })
+
+    total_concurrency = num_workers * threads_per_worker
+    print(f"[budget] Auto-Dask → processes={num_workers}, threads={threads_per_worker}")
+    print(f"[budget] Total Concurrency (Tasks): {total_concurrency}")
+    print(f"[budget] Total Memory Pool: {total_mem_gb:.2f} GiB")
+    print(f"[budget] Actual Worker Limit: {actual_worker_mem_gb:.2f} GiB (Maximized)")
+
+    # Configure cluster and return the Dask client
     if scheduler == "distributed":
         # MODE 1: DISTRIBUTED (HPC, large local scale-out)
         if scheduler_address:
@@ -191,31 +211,25 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
             n_workers=num_workers,
             threads_per_worker=threads_per_worker,
             processes=True,
-            memory_limit=f'{TARGET_WORKER_MEM_GB:.2f}GB'
+            scheduler_port=0,
+            # Pass the maximized actual limit
+            memory_limit=f'{actual_worker_mem_gb:.2f}GB'
         )
         return Client(cluster)
 
     elif scheduler == "threads":
-        # MODE 2: THREADS (Small local, minimal overhead)
-        if total_cores > _THREAD_LIMIT:
-            print(
-                f"[budget] WARNING: Total cores ({total_cores}) exceeds thread limit "
-                f"({_THREAD_LIMIT}).")
-            print(
-                f"[budget]         Using 'distributed' scheduler instead for multiprocessing stability.")
+        # MODE 2: THREADS (Single process, high concurrency)
 
-            # Note: cfg.compute.scheduler change is handled in the original code logic path
-            cfg.compute.scheduler = "distributed"
+        # This branch ensures the threads mode is run with 1 worker and max threads
+        if scheduler_address:
+            raise ValueError("External scheduler not supported in 'threads' mode.")
 
-            # Recursively call to run the distributed logic with updated worker count
-            return init_dask_client(cfg, scheduler_address)
-
-        # Single process, multi-thread
         cluster = LocalCluster(
-            n_workers=1,
-            threads_per_worker=total_cores,
+            n_workers=num_workers,  # Should be 1
+            threads_per_worker=threads_per_worker,  # Should be N_threads
             processes=False,
-            memory_limit=f'{TARGET_WORKER_MEM_GB:.2f}GB'
+            scheduler_port=0,
+            memory_limit=f'{actual_worker_mem_gb:.2f}GB'
         )
         return Client(cluster)
 
@@ -231,21 +245,23 @@ def _cmd_compute(args) -> None:
     # ==============================================
     # INITIALIZE DASK CLIENT
     # ==============================================
-    client = init_dask_client(cfg, scheduler_address=None)
+    use_client = not (getattr(args, 'client') is False)
 
-    if client is not None:
+    if use_client:
+        client = init_dask_client(cfg, scheduler_address=None)
         print(f"[sbudget] Dask Dashboard: {client.dashboard_link}")
         print(f"[sbudget] Using client: {client}")
+    else:
+        client = None
+        print(f"[sbudget] Running without Dask client (local threads).")
 
     # -------------------------------------------------------------------
     # Open dataset with normalized variable/dimension names
     ds = open_dataset(cfg, verbose=False)
 
     # Normalize/alias modes (backward compatibility)
-    _MODE_ALIASES = {
-        "spectral": "spectral_budget",
-        "physical": "scale_transfer",
-    }
+    _MODE_ALIASES = {"spectral": "spectral_budget", "physical": "scale_transfer"}
+
     mode_in = str(cfg.compute.mode).strip()
     mode = _MODE_ALIASES.get(mode_in, mode_in)
     if mode_in in _MODE_ALIASES:
@@ -271,6 +287,15 @@ def _cmd_compute(args) -> None:
         raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
                          f"Use 'spectral_budget' or 'scale_transfer'.")
 
+    # Testing dry run: skip computation and I/O
+    if getattr(args, 'dry_run', False):
+        print("\n[budget] DRY RUN COMPLETE: Skipping Dask computation and I/O.")
+        print(f"[budget] Graph for mode '{mode}' created successfully.")
+
+        # Clean up the local cluster if created
+        if client: client.close()
+        return
+
     # Write output to disk. Up to here, computations are lazy
     write_dataset(out, cfg, client=client)
 
@@ -287,10 +312,11 @@ def _cmd_compute(args) -> None:
 
 
 def _add_bool_pair(p, name, dest, help_true, help_false):
+    """Utility to create mutually exclusive tri-state boolean flags (True, False, None)."""
     g = p.add_mutually_exclusive_group()
-    g.add_argument(f"--{name}", dest=dest, action="store_true", help=help_true)
-    g.add_argument(f"--no-{name}", dest=dest, action="store_false", help=help_false)
-    p.set_defaults(**{dest: None})  # tri-state: None means "no override"
+    g.add_argument(f'--{name}', dest=dest, action='store_true', help=help_true)
+    g.add_argument(f'--no-{name}', dest=dest, action='store_false', help=help_false)
+    p.set_defaults(**{dest: None})
 
 
 def _csv_or_list(s):
@@ -342,15 +368,8 @@ def main(argv: list[str] | None = None) -> None:
                            help="FFT normalization (use 'none' to disable normalization).")
     p_compute.add_argument("--dx", type=float, help="Grid spacing in x-direction (meters).")
     p_compute.add_argument("--dy", type=float, help="Grid spacing in y-direction (meters).")
-
-    _add_bool_pair(p_compute, "cumulative", "cumulative",
-                   "Enable cumulative spectral sums.", "Disable cumulative spectral sums.")
     p_compute.add_argument("--transfer-form", choices=["invariant", "flux", "conservative"],
                            help="Formulation of transfer term to compute.")
-
-    _add_bool_pair(p_compute, "rechunk-spatial", "rechunk_spatial",
-                   "Force single spatial chunks for FFTs (recommended).",
-                   "Skip spatial rechunking (faster, less stable for FFT).")
 
     # user-exposed argument:
     p_compute.add_argument(
@@ -360,9 +379,23 @@ def main(argv: list[str] | None = None) -> None:
 
     p_compute.add_argument(
         "--scheduler",
-        choices=["threads", "processes", "distributed"],
+        choices=["threads", "distributed"],
         help="Execution backend for Dask computations."
     )
+
+    _add_bool_pair(p_compute, "cumulative", "cumulative",
+                   "Enable cumulative spectral sums.", "Disable cumulative spectral sums.")
+
+    _add_bool_pair(p_compute, "rechunk-spatial", "rechunk_spatial",
+                   "Force single spatial chunks for FFTs (recommended).",
+                   "Skip spatial rechunking (faster, less stable for FFT).")
+
+    _add_bool_pair(p_compute, "client", "client",
+                   "Execute local cluster with active dask client (default).",
+                   "Execute with local threads.")
+
+    p_compute.add_argument("--dry-run", action="store_true",
+                           help="Build Dask graph but skip final computation and I/O.")
 
     # Variable name overrides — added help for clarity
     var_help = "Override variable name in input dataset."

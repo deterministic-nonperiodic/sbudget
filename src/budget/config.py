@@ -25,10 +25,11 @@ class ComputeConfig:
     norm: str | None = None  # None or "ortho"
     dx: float | None = None
     dy: float | None = None
-    transfer_form: str | None = "flux"  # e.g. "invariant", "flux"
-    cumulative: bool = True  # default True per request
+    transfer_form: str | None = "flux"  # one of ["invariant", "flux"]
+    cumulative: bool = True  # Aggregate scale transfers cumulatively up to each scale
     rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
     scheduler: str | None = None
+    client: bool | None = True  # Run with dask client or local threads
     chunk_size: float | None = None  # approximate chunk size in MiB for non-spatial dimensions
 
 
@@ -93,8 +94,11 @@ def apply_overrides(cfg, args):
 
     # input
     _set_nested(cfg, ["input", "path"], _get(args, "input_path"))
+
     dims = _get(args, "dims")
-    if dims: _set_nested(cfg, ["input", "dims"], dims)
+    if dims:
+        _set_nested(cfg, ["input", "dims"], dims)
+
     _set_nested(cfg, ["input", "engine"], _get(args, "engine"))
 
     # output
@@ -127,19 +131,20 @@ def apply_overrides(cfg, args):
     cum = _get(args, "cumulative")
     if cum is not None:
         _set_nested(cfg, ["compute", "cumulative"], bool(cum))
+
     _set_nested(cfg, ["compute", "transfer_form"], _get(args, "transfer_form"))
 
     rs = _get(args, "rechunk_spatial")
     if rs is not None:
         _set_nested(cfg, ["compute", "rechunk_spatial"], bool(rs))
 
-    dar = _get(args, "dask_allow_rechunk")
-    if dar is not None:
-        _set_nested(cfg, ["compute", "dask_allow_rechunk"], bool(dar))
+    cl = _get(args, "client")
+    if cl is not None:
+        _set_nested(cfg, ["compute", "client"], bool(cl))
 
-    dar = _get(args, "chunk_size")
-    if dar is not None:
-        _set_nested(cfg, ["compute", "chunk_size"], float(dar))
+    chs = _get(args, "chunk_size")
+    if chs is not None:
+        _set_nested(cfg, ["compute", "chunk_size"], float(chs))
 
     _set_nested(cfg, ["compute", "scheduler"], _get(args, "scheduler"))
 

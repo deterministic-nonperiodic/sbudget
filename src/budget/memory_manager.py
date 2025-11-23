@@ -723,9 +723,9 @@ def get_current_worker_count() -> int:
     int
         Total number of threads (cores) ready for computation.
     """
-    # --- 1. SLURM authoritative override (Total Threads = Ntasks * Nthreads/task) ---
+    # --- SLURM authoritative override (Total Threads = Ntasks * Nthreads/task) ---
     if "SLURM_JOB_ID" in os.environ:
-        print("[chunking] SLURM environment detected.")
+        print("[chunking] SLURM environment detected: using SLURM_NTASKS for worker count.")
         try:
             n_tasks = int(os.environ["SLURM_NTASKS"])
             # Default to 1 thread per task if SLURM_CPUS_PER_TASK is not set
@@ -735,20 +735,21 @@ def get_current_worker_count() -> int:
         except ValueError:
             pass  # Continue to Dask check if variable is corrupted
 
-    # --- 2. Dask client check (Total Threads = Sum of nthreads across all workers) ---
+    # --- Dask client check (Total Threads = Sum of threads across all workers) ---
     try:
         client = get_client()
         workers = client.scheduler_info().get("workers", {})
 
-        # Sum the 'nthreads' value for all workers
+        # Sum the number of threads value for all workers
         total_threads = sum(w.get("nthreads", 1) for w in workers.values())
 
         # Ensure at least one thread is assumed if client is active
+        print("[chunking] Client detected: using Dask worker thread count.")
         return max(1, total_threads)
 
     except Exception:
-        print("[chunking] Fallback to local CPU count.")
-        # --- 3. Fallback to local machine resources (Total logical CPUs) ---
+        # --- Fallback to local machine resources (Total logical CPUs) ---
+        print("[chunking] No client detected: fallback to local CPU count.")
         return os.cpu_count() or 4
 
 
@@ -803,7 +804,7 @@ def ensure_optimal_chunking(
         # Ensure non-spatial dims are also chunked as -1 if they exist
         return ds.compute()
 
-    # ---- 1. Check whether full spatial plane fits ----
+    # ---- Check whether full spatial plane fits ----
     exclude = [str(d) for d in ds.dims if d not in spatial_dims]
     fits, plane_bytes, worker_limit = fits_in_memory(
         ds, exclude_dims=exclude,
@@ -814,12 +815,13 @@ def ensure_optimal_chunking(
 
     plan: Dict[str, Any] = {}
 
-    # ---- 2. Spatial chunking decision ----
+    # ---- Spatial chunking decision ----
     if fits and not rechunk_spatial:
         plan[y_dim] = -1
         plan[x_dim] = -1
         if verbose:
-            print(f"[chunking] Full spatial slices fit in memory.")
+            print(f"[chunking] Full spatial slices fit in worker memory "
+                  f"{_fmt_bytes(plane_bytes)} / {_fmt_bytes(worker_limit)}.")
     else:
         # Must tile spatial dims (logic remains correct for memory safety)
         reduction = max(1.0, plane_bytes / max(1, worker_limit))
@@ -831,7 +833,7 @@ def ensure_optimal_chunking(
         if verbose:
             print(f"[chunking] Spatial tiling → ({n_tiles}×{n_tiles}) → {cy}×{cx}")
 
-    # ---- 3. Non‑spatial dims (time & vertical) ----
+    # ---- Non‑spatial dims (time & vertical) ----
     needs_t = "time" in ds.dims
     needs_z = vertical_dim in ds.dims
     t_size = ds.sizes.get("time", 1)
@@ -869,7 +871,7 @@ def ensure_optimal_chunking(
     # Calculate final planes per chunk based on the target block count
     planes_final = max(1, int(np.ceil(total_planes / blocks_target)))
 
-    # ---- 4. Choose chunking for time/Z ----
+    # ---- Choose chunking for time/Z ----
     # Aim for a square chunk in the t-z plane if possible for easier access/caching.
     z_target = int(np.ceil(np.sqrt(planes_final)))
     min_z = deriv_edge_order + 1
@@ -891,7 +893,7 @@ def ensure_optimal_chunking(
     elif needs_t:
         plan["time"] = _balanced_chunks(t_size, planes_final, min_size=1)
 
-    # ---- 5. Final rechunk ----
+    # ---- Final rechunk ----
     out = ds.unify_chunks().chunk(plan)
 
     if verbose:
@@ -909,7 +911,9 @@ def ensure_optimal_chunking(
         if output_scale_mult > 1:
             msg_parts.append(f"Scale=x{output_scale_mult}")
 
+        # Estimate largest chunk size after scaling
         largest = estimate_dataset_bytes(out, mode="largest_chunk") * output_scale_mult
+
         # Use get_num_blocks from the updated dask_utils.py
         blocks = get_num_blocks(out, ref_var_name=list(ds.data_vars)[0])
 
