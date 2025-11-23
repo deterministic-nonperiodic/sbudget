@@ -666,6 +666,55 @@ def estimate_dataset_bytes(
         raise TypeError("Input must be an xarray Dataset or DataArray.")
 
 
+def get_current_worker_count(verbose=True) -> int:
+    """
+    Return the total number of threads available for computation
+    (workers * threads_per_worker).
+
+    Logic:
+    ------
+    1. If SLURM_NTASKS is set → authoritative total thread count.
+    2. Otherwise, check active Dask client for total threads used.
+    3. Fall back to os.cpu_count() if client missing.
+
+    Returns
+    -------
+    int
+        Total number of threads (cores) ready for computation.
+    """
+    # --- SLURM authoritative override (Total Threads = Ntasks * Nthreads/task) ---
+    if "SLURM_JOB_ID" in os.environ:
+        if verbose:
+            print("[chunking] SLURM environment detected: using SLURM_NTASKS for worker count.")
+        try:
+            n_tasks = int(os.environ["SLURM_NTASKS"])
+            # Default to 1 thread per task if SLURM_CPUS_PER_TASK is not set
+            threads_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+            total_threads = n_tasks * threads_per_task
+            return max(1, total_threads)
+        except ValueError:
+            pass  # Continue to Dask check if variable is corrupted
+
+    # --- Dask client check (Total Threads = Sum of threads across all workers) ---
+    try:
+        client = get_client()
+        workers = client.scheduler_info().get("workers", {})
+
+        # Sum the number of threads value for all workers
+        total_threads = sum(w.get("nthreads", 1) for w in workers.values())
+
+        # Ensure at least one thread is assumed if client is active
+        if verbose:
+            print("[chunking] Client detected: using Dask worker thread count.")
+        return max(1, total_threads)
+
+    except Exception:
+        # --- Fallback to local machine resources (Total logical CPUs) ---
+        if verbose:
+            print("[chunking] No client detected: fallback to local CPU count.")
+        return os.cpu_count() or 4
+
+
 def fits_in_memory(
         obj: xr.Dataset | xr.DataArray,
         expansion_factor: int = 1,
@@ -696,7 +745,8 @@ def fits_in_memory(
             available = min(w["memory_limit"] for w in workers.values()) if workers else None
             # print(f"[chunking] Detected Dask worker memory limit: {_fmt_bytes(available)}")
         except Exception:
-            available = psutil.virtual_memory().available
+            n_workers = get_current_worker_count(verbose=False)
+            available = psutil.virtual_memory().available / n_workers
             # print(f"[chunking] Defaulting to system available memory: {_fmt_bytes(available)}")
     else:
         available = psutil.virtual_memory().available
@@ -705,52 +755,6 @@ def fits_in_memory(
     limit = int(ratio_to_use * available)
 
     return size_bytes < limit, size_bytes, limit
-
-
-def get_current_worker_count() -> int:
-    """
-    Return the total number of threads available for computation
-    (workers * threads_per_worker).
-
-    Logic:
-    ------
-    1. If SLURM_NTASKS is set → authoritative total thread count.
-    2. Otherwise, check active Dask client for total threads used.
-    3. Fall back to os.cpu_count() if client missing.
-
-    Returns
-    -------
-    int
-        Total number of threads (cores) ready for computation.
-    """
-    # --- SLURM authoritative override (Total Threads = Ntasks * Nthreads/task) ---
-    if "SLURM_JOB_ID" in os.environ:
-        print("[chunking] SLURM environment detected: using SLURM_NTASKS for worker count.")
-        try:
-            n_tasks = int(os.environ["SLURM_NTASKS"])
-            # Default to 1 thread per task if SLURM_CPUS_PER_TASK is not set
-            threads_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-            total_threads = n_tasks * threads_per_task
-            return max(1, total_threads)
-        except ValueError:
-            pass  # Continue to Dask check if variable is corrupted
-
-    # --- Dask client check (Total Threads = Sum of threads across all workers) ---
-    try:
-        client = get_client()
-        workers = client.scheduler_info().get("workers", {})
-
-        # Sum the number of threads value for all workers
-        total_threads = sum(w.get("nthreads", 1) for w in workers.values())
-
-        # Ensure at least one thread is assumed if client is active
-        print("[chunking] Client detected: using Dask worker thread count.")
-        return max(1, total_threads)
-
-    except Exception:
-        # --- Fallback to local machine resources (Total logical CPUs) ---
-        print("[chunking] No client detected: fallback to local CPU count.")
-        return os.cpu_count() or 4
 
 
 def _balanced_chunks(n: int, target: int, min_size: int) -> Tuple[int, ...]:
