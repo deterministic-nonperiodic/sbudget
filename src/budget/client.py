@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import dask
+import asyncio
 import psutil
 from dask.distributed import Client, LocalCluster
 
@@ -15,7 +16,6 @@ from .budget import compute_budget
 from .config import load_config, apply_overrides
 from .inter_scale_transfers import inter_scale_kinetic_energy_transfer
 from .io_utils import open_dataset, write_dataset
-from .memory_manager import TARGET_WORKER_MEM_GB
 
 # Suppress Dask warnings about large graphs
 warnings.filterwarnings(
@@ -31,7 +31,7 @@ _MIN_WORKER_MEM_GB = 4.0  # Minimum memory per worker in GiB
 
 
 # --- Helper Function for SLURM Memory Detection ---
-def _parse_slurm_memory() -> Optional[float]:
+def _parse_total_memory() -> Optional[float]:
     """
     Parses SLURM memory variables (SLURM_MEM_PER_NODE, SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU)
     to determine the total memory allocated to the job, in GiB.
@@ -70,7 +70,8 @@ def _parse_slurm_memory() -> Optional[float]:
         except ValueError:
             pass
 
-    return None
+    # Local Machine: Total system memory (Fallback)
+    return psutil.virtual_memory().total / (1024 ** 3)
 
 
 # --- Helper function definitions (omitted for brevity) ---
@@ -86,66 +87,63 @@ def _increase_fd_limit():
         print(f"[FD] Warning: Could not increase FD limit: {e}")
 
 
-def _detect_resources() -> Dict[str, Union[int, float, bool]]:
+def _detect_resources(cfg: Optional[Any] = None) -> Dict[str, Union[int, float, bool]]:
     """Detects allocated resources, prioritizing SLURM environment variables."""
-    is_slurm = "SLURM_JOB_ID" in os.environ
+
+    is_slurm = any(k in os.environ for k in ["SLURM_JOB_ID", "SLURM_NTASKS", "SLURM_CPUS_PER_TASK"])
 
     # Thread/Worker Allocation
     if is_slurm:
-        n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
-        cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-        n_threads = cpus_per_task
-        n_workers = n_tasks
+        n_workers = int(os.environ.get("SLURM_NTASKS", 1))
+        n_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
     else:
-        total_cores = psutil.cpu_count(logical=True) or 4
-        n_workers = total_cores
+        # Local machine: Use physical cores to avoid oversubscription
+        # Default to 1 thread per worker for GIL-bound workloads, but maximize workers
+        physical_cores = psutil.cpu_count(logical=False) or 4
+        n_workers = physical_cores
         n_threads = 1
 
+    # Override with config if provided
+    if cfg is not None:
+        if getattr(cfg.compute, "n_workers", None) is not None:
+            n_workers = cfg.compute.n_workers
+        if getattr(cfg.compute, "threads_per_worker", None) is not None:
+            n_threads = cfg.compute.threads_per_worker
+
     # Total Memory Allocation (in GiB)
-    slurm_mem = _parse_slurm_memory()
+    total_mem_gb = _parse_total_memory()
 
-    if slurm_mem is not None:
-        # Use SLURM detected memory pool
-        total_mem_gb = slurm_mem
-        if is_slurm:
-            print(f"[budget] Detected SLURM Memory Pool: {total_mem_gb:.2f} GiB")
-    else:
-        # Local Machine: Total system memory (Fallback)
-        total_mem_gb = psutil.virtual_memory().total / (1024 ** 3)
-
-    return {
-        "n_workers": n_workers,
-        "threads_per_worker": n_threads,
-        "total_mem_gb": total_mem_gb,
-        "is_slurm": is_slurm,
-    }
+    return {"n_workers": n_workers, "threads_per_worker": n_threads, "total_mem_gb": total_mem_gb}
 
 
 def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
     """HPC-aware configuration of Dask global settings and cluster parameters."""
-    resources = _detect_resources()
+    resources = _detect_resources(cfg)
 
-    # --- Chunk Size Heuristic ---
-    total_mem_gb = resources["total_mem_gb"]
-    if total_mem_gb < 64:
-        default_chunk_mb = 512
-    else:
-        default_chunk_mb = 2048
+    # --- Chunk Size Configuration ---
+    # Only override Dask's default chunk size (usually 128MiB) if explicitly requested.
+    # The previous heuristic (512MB/2048MB) was often too aggressive for 'auto' chunking.
+    chunk_mb = getattr(cfg.compute, "chunk_size", None)
+    
+    dask_config = {
+        "array.slicing.split_large_chunks": False,
 
-    chunk_mb = float(getattr(cfg.compute, "chunk_size", None) or default_chunk_mb)
+        # Worker spilling ENABLED for stability
+        "distributed.worker.memory.target": 0.60,  # Start spilling to disk
+        "distributed.worker.memory.spill": 0.70,   # Spill more aggressively
+        "distributed.worker.memory.pause": 0.80,   # Pause worker
+        "distributed.worker.memory.terminate": 0.95, # Kill worker
+
+        # DAG fusion optimizations
+        "optimization.fuse.ave-width": 24,
+        "optimization.fuse.max-width": 256,
+    }
+
+    if chunk_mb:
+        dask_config["array.chunk-size"] = f"{chunk_mb}MB"
 
     # --- Configure Dask Global Settings (Memory Discipline) ---
-    dask.config.set({
-        "array.chunk-size": f"{chunk_mb}MB",
-        "array.slicing.split_large_chunks": False,
-        "distributed.worker.memory.limit": f'{TARGET_WORKER_MEM_GB:.2f}GB',
-        "distributed.worker.memory.target": False,
-        "distributed.worker.memory.spill": False,
-        "distributed.worker.memory.pause": 0.95,
-        "distributed.worker.memory.terminate": 0.985,
-        "optimization.fuse.ave-width": 16,
-        "optimization.fuse.max-width": 128,
-    })
+    dask.config.set(dask_config)
 
     return int(resources["n_workers"]), int(resources["threads_per_worker"])
 
@@ -154,6 +152,8 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
     """
     Create and return a Dask client with adaptive memory configuration.
     """
+    # Set glibc memory trimming threshold to release memory back to OS more aggressively
+    os.environ["MALLOC_TRIM_THRESHOLD_"] = "65536"
 
     # Ensure sufficient file descriptor limit
     _increase_fd_limit()
@@ -161,81 +161,77 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
     # Scheduler type
     scheduler = getattr(cfg.compute, "scheduler", "threads")
 
+    if scheduler not in {"distributed", "threads"}:
+        raise ValueError(f"Unknown scheduler type: {scheduler}. Use 'threads' or 'distributed'.")
+
     # Get initial SLURM/Local core count and total memory pool
+    # Note: auto_configure_dask now handles config overrides via cfg
     num_workers_detected, threads_per_worker_detected = auto_configure_dask(cfg)
-    total_mem_gb = _detect_resources()["total_mem_gb"]
+    
+    # Set threading environment variables to avoid oversubscription
+    # This is critical when using numpy/scipy with Dask
+    for env_var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"]:
+        os.environ[env_var] = str(threads_per_worker_detected)
+
+    total_mem_gb = _detect_resources(cfg)["total_mem_gb"]
+
+    # Reserve memory for OS/Scheduler (e.g. 4GB or 10%, whichever is larger)
+    # This prevents the cluster from consuming 100% of RAM and triggering OOM kills.
+    reserved_mem = max(4.0, total_mem_gb * 0.10)
+    available_mem_gb = max(0, total_mem_gb - reserved_mem)
 
     # Calculate the maximum number of workers that can safely fit (N_stable)
     # This determines the final worker count.
-    max_workers_by_mem = int(total_mem_gb // _MIN_WORKER_MEM_GB)
+    max_workers_by_mem = int(available_mem_gb // _MIN_WORKER_MEM_GB)
 
     # Final worker count is the minimum of requested cores and memory capacity
     num_workers = min(num_workers_detected, max_workers_by_mem)
 
     if num_workers == 0:
-        raise MemoryError(f"Insufficient memory ({total_mem_gb:.2f}GB) to start even one worker "
-                          f"with required minimum budget ({_MIN_WORKER_MEM_GB}GB).")
-
-    # Calculate the Actual Worker Memory Limit (R_actual)
-    actual_worker_mem_gb = total_mem_gb / num_workers
-
+        raise MemoryError(f"Insufficient memory ({available_mem_gb:.2f}GB available after reservation) "
+                          f"to start even one worker with required minimum budget ({_MIN_WORKER_MEM_GB}GB).")
     # Finalize Configuration
     if scheduler == "distributed":
-        # Distributed mode: We use multiple processes, so threads per worker = 1
-        threads_per_worker = 1
+        # Distributed mode: We use multiple processes, so threads per worker is respected
+        threads_per_worker = threads_per_worker_detected
+        processes = True
     else:
         # Threads mode: We use one process, so threads per worker = total cores
-        # If running locally (non-SLURM), use all detected threads
-        # If running on HPC, use the SLURM-requested core count
-        threads_per_worker = num_workers_detected * threads_per_worker_detected  # Total cores
+        threads_per_worker = num_workers * threads_per_worker_detected
         num_workers = 1  # Force single worker process for thread mode
+        processes = False
+
+    # Calculate the Actual Worker Memory Limit. Distributing the *available* memory among workers
+    actual_worker_mem_gb = available_mem_gb / num_workers
 
     # Override Dask config with the calculated actual limit
-    dask.config.set({
-        "distributed.worker.memory.limit": f'{actual_worker_mem_gb:.2f}GB',
-    })
+    dask.config.set({"distributed.worker.memory.limit": f'{actual_worker_mem_gb:.2f}GB'})
 
-    total_concurrency = num_workers * threads_per_worker
     print(f"[budget] Auto-Dask → processes={num_workers}, threads={threads_per_worker}")
-    print(f"[budget] Total Concurrency (Tasks): {total_concurrency}")
-    print(f"[budget] Total Memory Pool: {total_mem_gb:.2f} GiB")
+    print(f"[budget] Available Memory Pool: {available_mem_gb:.2f} GiB")
     print(f"[budget] Actual Worker Limit: {actual_worker_mem_gb:.2f} GiB (Maximized)")
 
     # Configure cluster and return the Dask client
-    if scheduler == "distributed":
-        # MODE 1: DISTRIBUTED (HPC, large local scale-out)
-        if scheduler_address:
-            return Client(scheduler_address)
+    if scheduler == "distributed" and scheduler_address:
+        return Client(scheduler_address)
 
-        cluster = LocalCluster(
-            n_workers=num_workers,
-            threads_per_worker=threads_per_worker,
-            processes=True,
-            scheduler_port=0,
-            # Pass the maximized actual limit
-            memory_limit=f'{actual_worker_mem_gb:.2f}GB'
-        )
-        return Client(cluster)
+    cluster = LocalCluster(
+        n_workers=num_workers,
+        threads_per_worker=threads_per_worker,
+        processes=processes,
+        memory_limit=f'{actual_worker_mem_gb:.2f}GB',
+        dashboard_address=":8787"  # Always enable dashboard
+    )
+    client = Client(cluster)
 
-    elif scheduler == "threads":
-        # MODE 2: THREADS (Single process, high concurrency)
+    if processes:
+        # Wait for all workers to be ready to avoid race conditions in resource detection
+        print(f"[budget] Waiting for {num_workers} workers to register...")
+        client.wait_for_workers(n_workers=num_workers)
 
-        # This branch ensures the threads mode is run with 1 worker and max threads
-        if scheduler_address:
-            raise ValueError("External scheduler not supported in 'threads' mode.")
+    print(f"[budget] Dask cluster: workers={num_workers}, threads/worker={threads_per_worker}")
 
-        cluster = LocalCluster(
-            n_workers=num_workers,  # Should be 1
-            threads_per_worker=threads_per_worker,  # Should be N_threads
-            processes=False,
-            scheduler_port=0,
-            memory_limit=f'{actual_worker_mem_gb:.2f}GB'
-        )
-        return Client(cluster)
-
-    else:
-        raise ValueError(
-            f"Unknown or unsupported scheduler type: {scheduler}. Use 'threads' or 'distributed'.")
+    return client
 
 
 def _cmd_compute(args) -> None:
@@ -272,37 +268,47 @@ def _cmd_compute(args) -> None:
     # store start time for profiling
     start_time = time.monotonic()
 
-    if mode == "spectral_budget":
-        print("[sbudget] Starting spectral budget calculation...")
-        out = compute_budget(ds, cfg)
-        print("[sbudget] Constructed dask graph for spectral budget calculation")
-    elif mode == "scale_transfer":
-        print("[sbudget] Starting inter-scale transfer calculation...")
+    try:
+        if mode == "spectral_budget":
+            print("[sbudget] Starting spectral budget calculation...")
+            out = compute_budget(ds, cfg)
+            print("[sbudget] Constructed dask graph for spectral budget calculation")
+        elif mode == "scale_transfer":
+            print("[sbudget] Starting inter-scale transfer calculation...")
 
-        # Extract kwargs for scale_increments
-        kwargs = {"scales": getattr(cfg.compute, "scales", None), "verbose": True}
-        # Compute scale-transfers
-        out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
-    else:
-        raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
-                         f"Use 'spectral_budget' or 'scale_transfer'.")
+            # Extract kwargs for scale_increments
+            kwargs = {"scales": getattr(cfg.compute, "scales", None), "verbose": True}
+            # Compute scale-transfers
+            out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
+        else:
+            raise ValueError(f"Unknown compute.mode='{cfg.compute.mode}'. "
+                             f"Use 'spectral_budget' or 'scale_transfer'.")
 
-    # Testing dry run: skip computation and I/O
-    if getattr(args, 'dry_run', False):
-        print("\n[budget] DRY RUN COMPLETE: Skipping Dask computation and I/O.")
-        print(f"[budget] Graph for mode '{mode}' created successfully.")
+        # Testing dry run: skip computation and I/O
+        if getattr(args, 'dry_run', False):
+            print("\n[budget] DRY RUN COMPLETE: Skipping Dask computation and I/O.")
+            print(f"[budget] Graph for mode '{mode}' created successfully.")
 
+            # Clean up the local cluster if created
+            if client: client.close()
+            return
+
+        # Write output to disk. Up to here, computations are lazy
+        write_dataset(out, cfg, client=client)
+
+    except Exception:
+        raise
+    finally:
         # Clean up the local cluster if created
-        if client: client.close()
-        return
-
-    # Write output to disk. Up to here, computations are lazy
-    write_dataset(out, cfg, client=client)
-
-    # Clean up the local cluster if created
-    if client and hasattr(client, 'cluster') and client.cluster:
-        client.close()
-        client.cluster.close()
+        if client:
+            try:
+                cluster = getattr(client, 'cluster', None)
+                client.close()
+                
+                if cluster:
+                    cluster.close()
+            except (asyncio.CancelledError, Exception):
+                pass  # Suppress shutdown noise
 
     # --- End Main Computation Block and Profiling ---
     end_time = time.monotonic()
@@ -381,6 +387,16 @@ def main(argv: list[str] | None = None) -> None:
         "--scheduler",
         choices=["threads", "distributed"],
         help="Execution backend for Dask computations."
+    )
+    
+    p_compute.add_argument(
+        "--n-workers", type=int,
+        help="Number of Dask workers (overrides auto-detection)."
+    )
+    
+    p_compute.add_argument(
+        "--threads-per-worker", type=int,
+        help="Number of threads per Dask worker (overrides auto-detection)."
     )
 
     _add_bool_pair(p_compute, "cumulative", "cumulative",

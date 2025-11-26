@@ -302,6 +302,7 @@ def process_single_r_for_field_chunk(
     weighted_shifts: list[xr.DataArray] = []
 
     for phi, weight, nx, ny in angle_parameters:
+        # Roll the field to the angle grid
         rolled_ds = roll_with_boundary_handling(
             field_chunk_ds, nx, ny, x_dim, y_dim,
             x_boundary_type, y_boundary_type
@@ -366,7 +367,7 @@ def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
 
 def _block_space_scale_integral(
         field_chunk: xr.Dataset,
-        increments: xr.Dataset | Future,
+        increments: Dict | Future,
         x_dim: str,
         y_dim: str,
         transform_type: str,
@@ -379,7 +380,7 @@ def _block_space_scale_integral(
     ----------
     field_chunk : xr.Dataset
         A spatially-chunked block of the full wind field dataset.
-    increments : xr.Dataset | Future
+    increments : Dict | Future
         Grid information containing precomputed scale increments and angle grids.
     x_dim, y_dim : str
         Names of spatial dimensions.
@@ -406,8 +407,13 @@ def _block_space_scale_integral(
     cache_manager = CacheManager.for_current_worker(verbose=False, force_threshold=0.70)
 
     # Run the indexing loop ONLY once per block to get the dictionary.
-    increments_data = _resolve_increments_data(increments)
-    radial_distance = increments_data.pop("r_values")  # Pop r_values list for iteration
+    # increments is now either the precomputed dictionary or a Future pointing to it.
+    if isinstance(increments, Future):
+        increments_data = increments.result()
+    else:
+        increments_data = increments
+
+    radial_distance = increments_data["r_values"]  # Access without modifying the shared dict
 
     # ------------------------------------------------------------------------------------
     # Compute cubed velocity differences for all radial distances: Dask main graph
@@ -458,7 +464,7 @@ def _block_space_scale_integral(
 
 def scale_transfer(
         field: xr.Dataset,
-        increments: xr.Dataset | Future,
+        increments: Dict | Future,
         radial_distance: xr.DataArray,
         length_scale: xr.DataArray,
         x_dim: str,
@@ -479,7 +485,7 @@ def scale_transfer(
     ----------
     field : xr.Dataset
         Input dataset containing the 3D wind field (u, v, w).
-    increments: xr.Dataset, Dask Future
+    increments: dict, Dask Future
         Grid information containing precomputed scale increments and angle grids.
     radial_distance : xr.DataArray
         1D array of radial distances r.
@@ -585,6 +591,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # ----------------------------------------------------------------------------
     # Scatter the large geometry payload if a client is present
     # ----------------------------------------------------------------------------
+    increments_data = _resolve_increments_data(increments)
+
     try:
         client = get_client()
     except ValueError:
@@ -592,8 +600,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
     if client:
         # Scatter increments to workers
-        increments = client.scatter(increments, broadcast=True)
-        print(f"[transfer] Geometry scattered to workers ({increments.key}).")
+        increments_data = client.scatter([increments_data], broadcast=True)[0]
+        print(f"[transfer] Preprocessed geometry scattered to workers.")
 
     # ----------------------------------------------------------------------------
     # Ensure 'optimal' chunks along non-spatial dimensions for high parallelism
@@ -612,7 +620,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # ----------------------------------------------------------------------------
     energy_transfer_rate = scale_transfer(
         field=wind.fillna(0.0),
-        increments=increments,
+        increments=increments_data,
         radial_distance=radial_distance,
         length_scale=length_scale,
         name="energy_transfer",

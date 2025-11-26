@@ -95,11 +95,21 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
           vorticity: vor   # optional, else computed
     """
     p = cfg.input.path
+    
+    # Optimize chunking: Request full spatial slices immediately to avoid expensive rechunking later.
+    # We hint standard spatial names. If they don't exist, xarray ignores them.
+    # Non-spatial dims (time, z) are left to 'auto' or default.
+    initial_chunks = {
+        "lat": -1, "lon": -1,   # Standard geographical
+        "x": -1, "y": -1,       # Cartesian
+        "latitude": -1, "longitude": -1 # Long form
+    }
+    
     if str(p).endswith(".zarr"):
-        ds = xr.open_zarr(p, chunks="auto")
+        ds = xr.open_zarr(p, chunks=initial_chunks)
     else:
         engine = getattr(cfg.input, "engine", None)
-        ds = xr.open_mfdataset(p, chunks="auto", engine=engine)
+        ds = xr.open_mfdataset(p, chunks=initial_chunks, engine=engine)
 
     # unify data type
     ds = ds.astype("float32")

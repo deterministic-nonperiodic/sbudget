@@ -34,7 +34,7 @@ from numcodecs import Blosc
 # ======================================================================
 _MEMORY_RESERVE_RATIO = 0.60
 _SMALL_DATA_THRESHOLD_MB = 200.0  # skip chunking for small datasets
-DEFAULT_CHUNK_SIZE_MB = 3072.0  # MB
+DEFAULT_CHUNK_SIZE_MB = 4096.0  # MB
 
 # --- CONFIGURATION CONSTANT ---
 TARGET_WORKER_MEM_GB = DEFAULT_CHUNK_SIZE_MB / 1024
@@ -666,7 +666,7 @@ def estimate_dataset_bytes(
         raise TypeError("Input must be an xarray Dataset or DataArray.")
 
 
-def get_current_worker_count(verbose=True) -> int:
+def get_current_worker_count(verbose=True, total=True) -> int:
     """
     Return the total number of threads available for computation
     (workers * threads_per_worker).
@@ -688,10 +688,14 @@ def get_current_worker_count(verbose=True) -> int:
             print("[chunking] SLURM environment detected: using SLURM_NTASKS for worker count.")
         try:
             n_tasks = int(os.environ["SLURM_NTASKS"])
-            # Default to 1 thread per task if SLURM_CPUS_PER_TASK is not set
-            threads_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-            total_threads = n_tasks * threads_per_task
-            return max(1, total_threads)
+
+            if total:
+                # Default to 1 thread per task if SLURM_CPUS_PER_TASK is not set
+                threads_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+                n_tasks = n_tasks * threads_per_task
+
+            return max(1, n_tasks)
+
         except ValueError:
             pass  # Continue to Dask check if variable is corrupted
 
@@ -701,12 +705,15 @@ def get_current_worker_count(verbose=True) -> int:
         workers = client.scheduler_info().get("workers", {})
 
         # Sum the number of threads value for all workers
-        total_threads = sum(w.get("nthreads", 1) for w in workers.values())
+        if total:
+            n_tasks = sum(w.get("nthreads", 1) for w in workers.values())
+        else:
+            n_tasks = len(workers)
 
         # Ensure at least one thread is assumed if client is active
         if verbose:
             print("[chunking] Client detected: using Dask worker thread count.")
-        return max(1, total_threads)
+        return max(1, n_tasks)
 
     except Exception:
         # --- Fallback to local machine resources (Total logical CPUs) ---
@@ -745,7 +752,7 @@ def fits_in_memory(
             available = min(w["memory_limit"] for w in workers.values()) if workers else None
             # print(f"[chunking] Detected Dask worker memory limit: {_fmt_bytes(available)}")
         except Exception:
-            n_workers = get_current_worker_count(verbose=False)
+            n_workers = get_current_worker_count(verbose=False, total=False)
             available = psutil.virtual_memory().available / n_workers
             # print(f"[chunking] Defaulting to system available memory: {_fmt_bytes(available)}")
     else:
@@ -824,8 +831,13 @@ def ensure_optimal_chunking(
         plan[y_dim] = -1
         plan[x_dim] = -1
         if verbose:
+            # Check if they were already full
+            y_chunks = ds.chunks.get(ds.get_index(y_dim).name, None) if ds.chunks else None
+            # Heuristic check: if we have 1 chunk in y/x, we are good
             print(f"[chunking] Full spatial slices fit in worker memory "
                   f"{_fmt_bytes(plane_bytes)} / {_fmt_bytes(worker_limit)}.")
+            if y_chunks and len(y_chunks) == 1:
+                print(f"[chunking] Optimization: Spatial dims already contiguous. Rechunking skipped.")
     else:
         # Must tile spatial dims (logic remains correct for memory safety)
         reduction = max(1.0, plane_bytes / max(1, worker_limit))
@@ -859,12 +871,12 @@ def ensure_optimal_chunking(
 
     # Parallelism Constraint: Workers * Buffer (Goal: keep pipeline full)
     if num_workers is None:
-        num_workers = get_current_worker_count()
+        num_workers = get_current_worker_count(total=False)
     else:
         num_workers = max(1, int(num_workers))
 
     # Increase parallelism buffer from 4 to 10 (less memory aggressive)
-    PARALLEL_BUFFER = 8
+    PARALLEL_BUFFER = 4
     target_parallel_blocks = preferred_num_blocks or (num_workers * PARALLEL_BUFFER)
     target_parallel_blocks = int(np.ceil(target_parallel_blocks))
 
@@ -900,6 +912,9 @@ def ensure_optimal_chunking(
     # ---- Final rechunk ----
     out = ds.unify_chunks().chunk(plan)
 
+    n_blocks = get_num_blocks(out, ref_var_name="u")
+
+    # ---- Summary ----
     if verbose:
         msg_parts: List[str] = []
         for d, c in plan.items():
@@ -918,11 +933,8 @@ def ensure_optimal_chunking(
         # Estimate largest chunk size after scaling
         largest = estimate_dataset_bytes(out, mode="largest_chunk") * output_scale_mult
 
-        # Use get_num_blocks from the updated dask_utils.py
-        blocks = get_num_blocks(out, ref_var_name=list(ds.data_vars)[0])
-
         print(f"[chunking] Budget: {_fmt_bytes(worker_limit)} | workers: {num_workers} | "
-              f"Plan: {', '.join(msg_parts)} | Partitions: {blocks} | "
+              f"Plan: {', '.join(msg_parts)} | Partitions: {n_blocks} | "
               f"Est. largest chunk: {_fmt_bytes(largest)}")
 
     return out

@@ -31,6 +31,8 @@ class ComputeConfig:
     scheduler: str | None = None
     client: bool | None = True  # Run with dask client or local threads
     chunk_size: float | None = None  # approximate chunk size in MiB for non-spatial dimensions
+    n_workers: int | None = None
+    threads_per_worker: int | None = None
 
 
 @dataclass
@@ -147,6 +149,14 @@ def apply_overrides(cfg, args):
         _set_nested(cfg, ["compute", "chunk_size"], float(chs))
 
     _set_nested(cfg, ["compute", "scheduler"], _get(args, "scheduler"))
+
+    nw = _get(args, "n_workers")
+    if nw is not None:
+        _set_nested(cfg, ["compute", "n_workers"], int(nw))
+
+    tpw = _get(args, "threads_per_worker")
+    if tpw is not None:
+        _set_nested(cfg, ["compute", "threads_per_worker"], int(tpw))
 
     # variables
     _set_nested(cfg, ["variables", "u"], _get(args, "var_u"))
