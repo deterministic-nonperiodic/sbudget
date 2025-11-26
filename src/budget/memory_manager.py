@@ -766,25 +766,61 @@ def fits_in_memory(
 
 def _balanced_chunks(n: int, target: int, min_size: int) -> Tuple[int, ...]:
     """
-    Split length n into m nearly-equal chunks, all >= min_size,
-    with average size near `target`.
+    Split length n into chunks suitable for Zarr storage.
+    
+    Produces uniform chunks with a final chunk that may be different.
+    Ensures:
+    1. All chunks are >= min_size
+    2. Final chunk <= first chunk (Zarr requirement)
+    3. All non-final chunks are equal (Zarr requirement)
+    
+    Parameters
+    ----------
+    n : int
+        Total length to split
+    target : int
+        Target chunk size
+    min_size : int
+        Minimum allowed chunk size (e.g., derivative_order + 1)
+        
+    Returns
+    -------
+    tuple of int
+        Chunk sizes suitable for Zarr storage
     """
-    # m_target: Maximum m desired to keep the chunk size AT LEAST target.
-    m_target = int(np.ceil(n / max(1, target)))
+    # Start with target as the uniform chunk size
+    chunk_size = max(min_size, target)
 
-    # m_max: Maximum m allowed by the hard floor min_size.
-    m_max_allowed_by_min = n // max(1, min_size)
+    # Calculate how many full chunks and remainder
+    num_full_chunks = n // chunk_size
+    remainder = n % chunk_size
 
-    # Choose the final number of chunks (m).
-    m = max(1, min(m_target, m_max_allowed_by_min))
+    # Divides evenly - all chunks are uniform
+    if remainder == 0:
+        return (chunk_size,) * num_full_chunks
 
-    # Compute base distribution (standard integer division and remainder)
-    base, rem = n // m, n % m
+    # Remainder is valid (>= min_size and <= chunk_size)
+    # This satisfies both constraints
+    if remainder >= min_size:
+        return (chunk_size,) * num_full_chunks + (remainder,)
 
-    # Create chunks: 'rem' chunks of size (base + 1), and (m - rem) chunks of size 'base'
-    chunks = (base + 1,) * rem + (base,) * (m - rem)
+    # Remainder < min_size
+    # We need to increase chunk_size so that the final chunk is valid
+    # Strategy: increase chunk_size until remainder >= min_size
+    while remainder < min_size and remainder != 0:
+        chunk_size += 1
+        num_full_chunks = n // chunk_size
+        remainder = n % chunk_size
 
-    return tuple(chunks)
+        # Safety check: if chunk_size gets too large, just return single chunk
+        if chunk_size >= n:
+            return (n,)
+
+    # After adjustment, remainder should be valid or zero
+    if remainder == 0:
+        return (chunk_size,) * num_full_chunks
+    else:
+        return (chunk_size,) * num_full_chunks + (remainder,)
 
 
 def ensure_optimal_chunking(

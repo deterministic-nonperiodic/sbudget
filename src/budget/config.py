@@ -28,7 +28,7 @@ class ComputeConfig:
     transfer_form: str | None = "flux"  # one of ["invariant", "flux"]
     cumulative: bool = True  # Aggregate scale transfers cumulatively up to each scale
     rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
-    scheduler: str | None = None
+    scheduler: str | None = "distributed"  # dask scheduler type: "distributed" or "threads"
     client: bool | None = True  # Run with dask client or local threads
     chunk_size: float | None = None  # approximate chunk size in MiB for non-spatial dimensions
     n_workers: int | None = None

@@ -515,7 +515,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     # Filter out None and assemble into Dataset
     fluxes = xr.Dataset({da.name: da for da in fluxes if da is not None})
-
+    
     # wavenumber coord attrs (unchanged, but placed after assembly)
     fluxes.wavenumber.attrs.update({'standard_name': 'wavenumber',
                                     'long_name': 'horizontal wavenumber',

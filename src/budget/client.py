@@ -159,7 +159,7 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
     _increase_fd_limit()
 
     # Scheduler type
-    scheduler = getattr(cfg.compute, "scheduler", "threads")
+    scheduler = getattr(cfg.compute, "scheduler", "distributed")
 
     if scheduler not in {"distributed", "threads"}:
         raise ValueError(f"Unknown scheduler type: {scheduler}. Use 'threads' or 'distributed'.")
