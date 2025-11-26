@@ -815,6 +815,9 @@ def ensure_optimal_chunking(
         # Ensure non-spatial dims are also chunked as -1 if they exist
         return ds.compute()
 
+    # ---- Unify chunks to prevent inconsistencies ----
+    ds = ds.unify_chunks()
+
     # ---- Check whether full spatial plane fits ----
     exclude = [str(d) for d in ds.dims if d not in spatial_dims]
     fits, plane_bytes, worker_limit = fits_in_memory(
@@ -830,14 +833,11 @@ def ensure_optimal_chunking(
     if fits and not rechunk_spatial:
         plan[y_dim] = -1
         plan[x_dim] = -1
+
         if verbose:
-            # Check if they were already full
-            y_chunks = ds.chunks.get(ds.get_index(y_dim).name, None) if ds.chunks else None
             # Heuristic check: if we have 1 chunk in y/x, we are good
             print(f"[chunking] Full spatial slices fit in worker memory "
                   f"{_fmt_bytes(plane_bytes)} / {_fmt_bytes(worker_limit)}.")
-            if y_chunks and len(y_chunks) == 1:
-                print(f"[chunking] Optimization: Spatial dims already contiguous. Rechunking skipped.")
     else:
         # Must tile spatial dims (logic remains correct for memory safety)
         reduction = max(1.0, plane_bytes / max(1, worker_limit))
