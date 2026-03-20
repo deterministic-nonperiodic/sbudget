@@ -629,7 +629,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     theta_mean = domain_mean(theta)
     theta_prime = theta - theta_mean
-    gamma = lorenz_parameter(theta)
+    gamma = lorenz_parameter(theta_mean)
 
     # ----------------------------------------------------------------------------------------------
     # Spectral energy budget terms
