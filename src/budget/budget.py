@@ -108,6 +108,7 @@ def budget_metadata(func: Callable) -> Callable:
 
     return wrapper
 
+
 # --------------------------------------------------------------------------------------------------
 # Energy budget terms
 # --------------------------------------------------------------------------------------------------
@@ -118,11 +119,13 @@ def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, name="hke") -> xr.D
 
     return hke.rename(name)
 
+
 @budget_metadata
 def vertical_kinetic_energy_spectra(w: xr.DataArray, name="vke") -> xr.DataArray:
     """Vertical kinetic energy per unit mass spectrum: VKE = ½ |Ŵ|²."""
     vke = 0.5 * scalar_spectrum(w)
     return vke.rename(name)
+
 
 @budget_metadata
 def available_potential_energy_spectra(theta_prime: xr.DataArray, gamma: xr.DataArray,
@@ -131,6 +134,7 @@ def available_potential_energy_spectra(theta_prime: xr.DataArray, gamma: xr.Data
 
     ape = 0.5 * gamma * scalar_spectrum(theta_prime)
     return ape.rename(name)
+
 
 @budget_metadata
 def divergent_kinetic_energy_spectra(divergence: xr.DataArray, dx: float, dy: float,
@@ -336,7 +340,8 @@ def nonlinear_ape_transfer(
         divergence = horizontal_divergence(u, v)
 
     # Advection-like vector A and transport vector wU
-    advection_theta = horizontal_advection(theta_prime, u, v) + 0.5 * (divergence * theta_prime) + 0.5 * (w * dztheta)
+    advection_theta = horizontal_advection(theta_prime, u, v) + 0.5 * (
+                divergence * theta_prime) + 0.5 * (w * dztheta)
 
     # Spectral vector inner products (sum over components)
     t_adv = - scalar_cross_spectrum(theta_prime, advection_theta)  # -⟨theta, At⟩
@@ -368,10 +373,10 @@ def turbulent_vke_flux(w: xr.DataArray, name="vf_vke") -> xr.DataArray:
 
 
 @budget_metadata
-def turbulent_ape_flux(w: xr.DataArray, theta_prime: xr.DataArray, gamma: xr.DataArray, 
+def turbulent_ape_flux(w: xr.DataArray, theta_prime: xr.DataArray, gamma: xr.DataArray,
                        name="vf_ape") -> xr.DataArray:
     """Vertical flux of APE: -½ γ ⟨theta, w theta⟩ in spectral space."""
-    
+
     vf_ape = -0.5 * gamma * scalar_cross_spectrum(theta_prime, w * theta_prime)
     return vf_ape.rename(name)
 
@@ -397,28 +402,28 @@ def conversion_ape_to_dke(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataAr
 
 
 @budget_metadata
-def conversion_ape_to_vke(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray, 
+def conversion_ape_to_vke(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray,
                           exner: xr.DataArray, name="caz") -> xr.DataArray:
     """APE to VKE conversion term: (g / θ_bar) * ⟨w, θ'⟩ - cp * θ_bar * ⟨w, ∂z π'⟩ - g * ⟨w, q_t⟩"""
 
     dz_exner = exner.differentiate('z', edge_order=2)
 
-    term1 = (g / domain_mean(theta)) * scalar_cross_spectrum(w,theta_prime)
+    term1 = (g / domain_mean(theta)) * scalar_cross_spectrum(w, theta_prime)
     term2 = -cp * domain_mean(theta) * scalar_cross_spectrum(w, dz_exner)
-    
+
     caz = term1 + term2
 
     return caz.rename(name)
 
 
 @budget_metadata
-def conversion_ape(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray, 
+def conversion_ape(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray,
                    name="ca") -> xr.DataArray:
     """APE  conversion term: (g / θ_bar) * ⟨w, θ'⟩"""
-    
-    ca = (g / domain_mean(theta)) * scalar_cross_spectrum(w,theta_prime)
 
-    return ca.rename(name) 
+    ca = (g / domain_mean(theta)) * scalar_cross_spectrum(w, theta_prime)
+
+    return ca.rename(name)
 
 
 @budget_metadata
@@ -466,8 +471,8 @@ def divergence_ape(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray, theta_prim
 
 @budget_metadata
 def nonconservative_adiabatic_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
-                              rho: xr.DataArray, vf_hke: xr.DataArray = None,
-                              name="j_hke") -> xr.DataArray:
+                                  rho: xr.DataArray, vf_hke: xr.DataArray = None,
+                                  name="j_hke") -> xr.DataArray:
     """Nonconservative adiabatic contribution to the HKE budget."""
 
     # Vertical flux of HKE (compute if absent)
@@ -488,7 +493,7 @@ def nonconservative_adiabatic_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataAr
 
 @budget_metadata
 def nonconservative_adiabatic_vke(w: xr.DataArray, rho: xr.DataArray, vf_vke: xr.DataArray = None,
-                              name="j_vke") -> xr.DataArray:
+                                  name="j_vke") -> xr.DataArray:
     """Nonconservative adiabatic contribution to the VKE budget."""
 
     # Vertical flux of VKE (compute if absent)
@@ -508,7 +513,7 @@ def nonconservative_adiabatic_vke(w: xr.DataArray, rho: xr.DataArray, vf_vke: xr
 
 
 @budget_metadata
-def nonconservative_adiabatic_ape(theta_prime: xr.DataArray, gamma: xr.DataArray, rho: xr.DataArray, 
+def nonconservative_adiabatic_ape(theta_prime: xr.DataArray, gamma: xr.DataArray, rho: xr.DataArray,
                                   vf_ape: xr.DataArray = None, name="j_ape") -> xr.DataArray:
     """Nonconservative adiabatic contribution to the APE budget."""
 
@@ -621,7 +626,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     if divergence is None or vorticity is None:
         divergence = horizontal_divergence(u, v)
         vorticity = relative_vorticity(u, v)
-    
+
     theta_prime = theta - domain_mean(theta)
     gamma = lorenz_parameter(theta)
 
@@ -697,7 +702,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     # --- ADIABATIC NON-CONSERVATIVE (j_hke, j_vke, j_ape) ---
     # Note: nonconservative_adiabatic uses vf_hke_2d (or calculates it if not passed)
-    j_hke_2d = nonconservative_adiabatic(u, v, w, rho, vf_hke=vf_hke_2d, name="j_hke")
+    j_hke_2d = nonconservative_adiabatic_hke(u, v, w, rho, vf_hke=vf_hke_2d, name="j_hke")
     j_hke = isotropize(j_hke_2d, dx, dy, cumulative=cumulative)
 
     # Note: nonconservative_adiabatic uses vf_vke_2d (or calculates it if not passed)
@@ -705,7 +710,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     j_vke = isotropize(j_vke_2d, dx, dy, cumulative=cumulative)
 
     # Note: nonconservative_adiabatic uses vf_ape_2d (or calculates it if not passed)
-    j_ape_2d = nonconservative_adiabatic_ape(theta_prime, gamma, rho, vf_ape=vf_ape_2d, name="j_ape")
+    j_ape_2d = nonconservative_adiabatic_ape(theta_prime, gamma, rho, vf_ape=vf_ape_2d,
+                                             name="j_ape")
     j_ape = isotropize(j_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE WORK & CONVERSION (vf_pres, vfd_pres, cad) ---
@@ -747,7 +753,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
 
     # Filter out None and assemble into Dataset
     fluxes = xr.Dataset({da.name: da for da in fluxes if da is not None})
-    
+
     # wavenumber coord attrs (unchanged, but placed after assembly)
     fluxes.wavenumber.attrs.update({'standard_name': 'wavenumber',
                                     'long_name': 'horizontal wavenumber',
