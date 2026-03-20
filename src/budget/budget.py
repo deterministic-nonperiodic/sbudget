@@ -4,14 +4,14 @@ import numpy as np
 import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
-from .constants import cp, Omega, epsilon
+from .constants import cp, Omega, epsilon, g
 from .memory_manager import ensure_optimal_chunking
 from .numeric_tools import domain_mean, stack_vector, rotate_vector
 from .numeric_tools import horizontal_advection, horizontal_gradient
 from .numeric_tools import horizontal_divergence, relative_vorticity
 from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize
 from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
-from .thermodynamics import potential_temperature, exner_function, density
+from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
 
 # --------------------------------------------------------------------------------------------------
 # Global spectral options
@@ -26,25 +26,51 @@ _BUDGET_META = {
             "spectrum of rotational kinetic energy per unit mass", "m**2 / s**2"),
     "dke": ("divergent_kinetic_energy_spectrum",
             "spectrum of divergent kinetic energy per unit mass", "m**2 / s**2"),
+    "vke": ("vertical_kinetic_energy_spectrum",
+            "spectrum of vertical kinetic energy per unit mass", "m**2 / s**2"),
+    "ape": ("available_potential_energy_spectrum",
+            "spectrum of available potential energy per unit mass", "m**2 / s**2"),
     "cad": ("conversion_ape_dke",
             "conversion from available potential energy to kinetic energy", _BUDGET_UNITS),
+    "caz": ("conversion_ape_vke",
+            "conversion from available potential energy to vertical kinetic energy", _BUDGET_UNITS),
     "pi_nke": ("nonlinear_hke_transfer",
                "Nonlinear spectral transfer of horizontal kinetic energy", _BUDGET_UNITS),
     "pi_lke": ("linear_hke_transfer",
                "Linear spectral transfer of horizontal kinetic energy due to Coriolis",
                _BUDGET_UNITS),
+    "pi_vke": ("nonlinear_vke_transfer",
+               "Nonlinear spectral transfer of vertical kinetic energy", _BUDGET_UNITS),
+    "pi_ape": ("nonlinear_ape_transfer",
+               "Nonlinear spectral transfer of available potential energy", _BUDGET_UNITS),
     "vfd_dke": ("vertical_dke_flux_divergence",
                 "vertical flux divergence of horizontal kinetic energy", _BUDGET_UNITS),
+    "vfd_vke": ("vertical_vke_flux_divergence",
+                "vertical flux divergence of vertical kinetic energy", _BUDGET_UNITS),
+    "vfd_ape": ("vertical_ape_flux_divergence",
+                "vertical flux divergence of available potential energy", _BUDGET_UNITS),
     "vf_hke": ("vertical_dke_flux",
                "vertical flux of horizontal kinetic energy", _BUDGET_UNITS),
+    "vf_vke": ("vertical_vke_flux",
+               "vertical flux of vertical kinetic energy", _BUDGET_UNITS),
+    "vf_ape": ("vertical_ape_flux",
+               "vertical flux of available potential energy", _BUDGET_UNITS),
     "vfd_pres": ("pressure_flux_divergence",
                  "vertical divergence of pressure work", _BUDGET_UNITS),
     "vf_pres": ("hke_pressure_vertical_flux",
                 "vertical flux of horizontal kinetic energy (pressure work)", _BUDGET_UNITS),
     "div_hke": ("hke_divergence",
                 "divergence contribution to HKE budget", _BUDGET_UNITS),
+    "div_vke": ("vke_divergence",
+                "divergence contribution to VKE budget", _BUDGET_UNITS),
+    "div_ape": ("ape_divergence",
+                "divergence contribution to APE budget", _BUDGET_UNITS),
     "j_hke": ("adiabatic_nonconservative",
               "adiabatic nonconservative contribution to HKE budget", _BUDGET_UNITS),
+    "j_vke": ("adiabatic_nonconservative_vke",
+              "adiabatic nonconservative contribution to VKE budget", _BUDGET_UNITS),
+    "j_ape": ("adiabatic_nonconservative_ape",
+              "adiabatic nonconservative contribution to APE budget", _BUDGET_UNITS),
 }
 
 
@@ -82,7 +108,6 @@ def budget_metadata(func: Callable) -> Callable:
 
     return wrapper
 
-
 # --------------------------------------------------------------------------------------------------
 # Energy budget terms
 # --------------------------------------------------------------------------------------------------
@@ -93,6 +118,19 @@ def kinetic_energy_spectra(u: xr.DataArray, v: xr.DataArray, name="hke") -> xr.D
 
     return hke.rename(name)
 
+@budget_metadata
+def vertical_kinetic_energy_spectra(w: xr.DataArray, name="vke") -> xr.DataArray:
+    """Vertical kinetic energy per unit mass spectrum: VKE = ½ |Ŵ|²."""
+    vke = 0.5 * scalar_spectrum(w)
+    return vke.rename(name)
+
+@budget_metadata
+def available_potential_energy_spectra(theta_prime: xr.DataArray, gamma: xr.DataArray,
+                                       name="ape") -> xr.DataArray:
+    """Available Potential Energy per unit mass spectrum: APE = ½ γ |θ'|²."""
+
+    ape = 0.5 * gamma * scalar_spectrum(theta_prime)
+    return ape.rename(name)
 
 @budget_metadata
 def divergent_kinetic_energy_spectra(divergence: xr.DataArray, dx: float, dy: float,
@@ -250,7 +288,7 @@ def nonlinear_vke_transfer(
     Uses the compact form:
         T = -⟨w, Aw⟩ + ⟨∂z w, w^2⟩
     where U = (u, v),
-          A = (u ∂x w + v ∂y w + ½ div·w + ½ w ∂z w) / 2
+          Aw = (u ∂x w + v ∂y w + ½ div·w + ½ w ∂z w) / 2
     """
 
     # Horizontal & vertical derivatives
@@ -267,9 +305,46 @@ def nonlinear_vke_transfer(
     t_adv = - scalar_cross_spectrum(w, advection_w)  # -⟨w, Aw⟩
     t_shear = scalar_cross_spectrum(dzw, w * w)  # ⟨∂z w, w^2⟩
 
-    pi_nke = t_adv + t_shear
+    pi_vke = t_adv + t_shear
 
-    return pi_nke.rename(name)
+    return pi_vke.rename(name)
+
+
+@budget_metadata
+def nonlinear_ape_transfer(
+        u: xr.DataArray,
+        v: xr.DataArray,
+        w: xr.DataArray,
+        theta_prime: xr.DataArray,
+        gamma: xr.DataArray,
+        divergence: Union[xr.DataArray | None] = None,
+        name="pi_ape"
+) -> xr.DataArray:
+    """Nonlinear transfer term for available potential energy (APE), vectorized.
+
+    Uses the compact form:
+        T = γ (-⟨theta, At⟩ + ⟨∂z theta, w.theta⟩)
+    where U = (u, v),
+          At = (u ∂x theta + v ∂y theta + ½ div·theta + ½ w ∂z theta)
+    """
+
+    # Horizontal & vertical derivatives
+    dztheta = theta_prime.differentiate("z", edge_order=2)
+
+    # Divergence (compute if absent)
+    if divergence is None:
+        divergence = horizontal_divergence(u, v)
+
+    # Advection-like vector A and transport vector wU
+    advection_theta = horizontal_advection(theta_prime, u, v) + 0.5 * (divergence * theta_prime) + 0.5 * (w * dztheta)
+
+    # Spectral vector inner products (sum over components)
+    t_adv = - scalar_cross_spectrum(theta_prime, advection_theta)  # -⟨theta, At⟩
+    t_shear = scalar_cross_spectrum(dztheta, w * theta_prime)  # ⟨∂z theta, w.theta⟩
+
+    pi_ape = gamma * (t_adv + t_shear)
+
+    return pi_ape.rename(name)
 
 
 @budget_metadata
@@ -286,10 +361,19 @@ def turbulent_hke_flux(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
 
 @budget_metadata
 def turbulent_vke_flux(w: xr.DataArray, name="vf_vke") -> xr.DataArray:
-    """Vertical flux of HKE: -½⟨u, w u⟩ - ½⟨v, w v⟩ in spectral space."""
+    """Vertical flux of VKE: -½⟨w, w w⟩ in spectral space."""
 
     vf_vke = -0.5 * scalar_cross_spectrum(w, w * w)
     return vf_vke.rename(name)
+
+
+@budget_metadata
+def turbulent_ape_flux(w: xr.DataArray, theta_prime: xr.DataArray, gamma: xr.DataArray, 
+                       name="vf_ape") -> xr.DataArray:
+    """Vertical flux of APE: -½ γ ⟨theta, w theta⟩ in spectral space."""
+    
+    vf_ape = -0.5 * gamma * scalar_cross_spectrum(theta_prime, w * theta_prime)
+    return vf_ape.rename(name)
 
 
 @budget_metadata
@@ -313,6 +397,31 @@ def conversion_ape_to_dke(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataAr
 
 
 @budget_metadata
+def conversion_ape_to_vke(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray, 
+                          exner: xr.DataArray, name="caz") -> xr.DataArray:
+    """APE to VKE conversion term: (g / θ_bar) * ⟨w, θ'⟩ - cp * θ_bar * ⟨w, ∂z π'⟩ - g * ⟨w, q_t⟩"""
+
+    dz_exner = exner.differentiate('z', edge_order=2)
+
+    term1 = (g / domain_mean(theta)) * scalar_cross_spectrum(w,theta_prime)
+    term2 = -cp * domain_mean(theta) * scalar_cross_spectrum(w, dz_exner)
+    
+    caz = term1 + term2
+
+    return caz.rename(name)
+
+
+@budget_metadata
+def conversion_ape(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray, 
+                   name="ca") -> xr.DataArray:
+    """APE  conversion term: (g / θ_bar) * ⟨w, θ'⟩"""
+    
+    ca = (g / domain_mean(theta)) * scalar_cross_spectrum(w,theta_prime)
+
+    return ca.rename(name) 
+
+
+@budget_metadata
 def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                    divergence: xr.DataArray, name="div_hke") -> xr.DataArray:
     """Horizontal divergence contribution to the HKE budget."""
@@ -328,7 +437,35 @@ def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
 
 
 @budget_metadata
-def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+def divergence_vke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                   divergence: xr.DataArray, name="div_vke") -> xr.DataArray:
+    """Horizontal divergence contribution to the VKE budget."""
+    if divergence is None:
+        divergence = horizontal_divergence(u, v)
+
+    divergence_3d = divergence + w.differentiate("z", edge_order=2)
+
+    div_vke = 0.5 * scalar_cross_spectrum(w, w * divergence_3d)
+
+    return div_vke.rename(name)
+
+
+@budget_metadata
+def divergence_ape(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray, theta_prime: xr.DataArray,
+                   gamma: xr.DataArray, divergence: xr.DataArray, name="div_ape") -> xr.DataArray:
+    """Horizontal divergence contribution to the APE budget."""
+    if divergence is None:
+        divergence = horizontal_divergence(u, v)
+
+    divergence_3d = divergence + w.differentiate("z", edge_order=2)
+
+    div_ape = 0.5 * gamma * scalar_cross_spectrum(theta_prime, theta_prime * divergence_3d)
+
+    return div_ape.rename(name)
+
+
+@budget_metadata
+def nonconservative_adiabatic_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                               rho: xr.DataArray, vf_hke: xr.DataArray = None,
                               name="j_hke") -> xr.DataArray:
     """Nonconservative adiabatic contribution to the HKE budget."""
@@ -347,6 +484,48 @@ def nonconservative_adiabatic(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
     anc_hke = - vf_hke * ddz_ln_rho
 
     return anc_hke.rename(name)
+
+
+@budget_metadata
+def nonconservative_adiabatic_vke(w: xr.DataArray, rho: xr.DataArray, vf_vke: xr.DataArray = None,
+                              name="j_vke") -> xr.DataArray:
+    """Nonconservative adiabatic contribution to the VKE budget."""
+
+    # Vertical flux of VKE (compute if absent)
+    if vf_vke is None:
+        vf_vke = turbulent_vke_flux(w)
+
+    # Calculate the spatially averaged density at each height (z)
+    rho_mean = domain_mean(rho)
+
+    # Calculate the vertical derivative of the log of the mean density: ∂z( ln(rho_mean) )
+    ddz_ln_rho = np.log(rho_mean).differentiate("z", edge_order=2)
+
+    # Compute the budget term: - vf_vke * [∂z( ln(rho_mean) )]
+    anc_vke = - vf_vke * ddz_ln_rho
+
+    return anc_vke.rename(name)
+
+
+@budget_metadata
+def nonconservative_adiabatic_ape(theta_prime: xr.DataArray, gamma: xr.DataArray, rho: xr.DataArray, 
+                                  vf_ape: xr.DataArray = None, name="j_ape") -> xr.DataArray:
+    """Nonconservative adiabatic contribution to the APE budget."""
+
+    # Vertical flux of APE (compute if absent)
+    if vf_ape is None:
+        vf_ape = turbulent_ape_flux(theta_prime, gamma)
+
+    # Calculate the spatially averaged density at each height (z)
+    rho_mean = domain_mean(rho)
+
+    # Calculate the vertical derivative of the log of the mean density: ∂z( ln(rho_mean) )
+    ddz_ln_gamma_rho = np.log(rho_mean * gamma).differentiate("z", edge_order=2)
+
+    # Compute the budget term: - vf_ape * [∂z( ln(gamma * rho_mean) )]
+    anc_ape = - vf_ape * ddz_ln_gamma_rho
+
+    return anc_ape.rename(name)
 
 
 @budget_metadata
@@ -442,6 +621,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     if divergence is None or vorticity is None:
         divergence = horizontal_divergence(u, v)
         vorticity = relative_vorticity(u, v)
+    
+    theta_prime = theta - domain_mean(theta)
+    gamma = lorenz_parameter(theta)
 
     # ----------------------------------------------------------------------------------------------
     # Spectral energy budget terms
@@ -461,10 +643,18 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     dke_2d = divergent_kinetic_energy_spectra(divergence, dx, dy)
     dke_1d = isotropize(dke_2d, dx, dy, cumulative=False)
 
+    # --- spectra: 2D VKE and isotropic 1D ---
+    vke_2d = vertical_kinetic_energy_spectra(w, name="vke")
+    vke_1d = isotropize(vke_2d, dx, dy, cumulative=False)  # non-cumulative VKE spectra
+
+    # --- spectra: 2D APE and isotropic 1D ---
+    ape_2d = available_potential_energy_spectra(theta_prime, gamma, name="ape")
+    ape_1d = isotropize(ape_2d, dx, dy, cumulative=False)  # non-cumulative APE spectra
+
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
     transfer_mode = getattr(cfg.compute, "transfer_form", "flux")  # "invariant" | "flux"
 
-    # --- NONLINEAR SPECTRAL TRANSFER (pi_nke) ---
+    # --- NONLINEAR SPECTRAL TRANSFER (pi_nke, pi_vke, pi_ape) ---
     if transfer_mode == "invariant":
         pi_nke_2d = nonlinear_hke_transfer_invariant(u, v, w, divergence, vorticity, name="pi_nke")
     else:
@@ -475,6 +665,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     pi_lke_2d = coriolis_linear_transfer(u, v, name="pi_lke")
     pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
 
+    pi_vke_2d = nonlinear_vke_transfer(u, v, w, divergence, name="pi_vke")
+    pi_vke = isotropize(pi_vke_2d, dx, dy, cumulative=cumulative)
+
+    pi_ape_2d = nonlinear_ape_transfer(u, v, w, theta_prime, gamma, divergence, name="pi_ape")
+    pi_ape = isotropize(pi_ape_2d, dx, dy, cumulative=cumulative)
+
     # --- VERTICAL HKE FLUX (vf_hke) and its DIVERGENCE (vfd_dke) ---
     vf_hke_2d = turbulent_hke_flux(u, v, w, name="vf_hke")
     vf_hke = isotropize(vf_hke_2d, dx, dy, cumulative=cumulative)
@@ -483,10 +679,34 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     vfd_dke_2d = vertical_gradient_flux(vf_hke_2d, name="vfd_dke")
     vfd_dke = isotropize(vfd_dke_2d, dx, dy, cumulative=cumulative)
 
-    # --- ADIABATIC NON-CONSERVATIVE (j_hke) ---
+    # --- VERTICAL VKE FLUX (vf_vke) and its DIVERGENCE (vfd_vke) ---
+    vf_vke_2d = turbulent_vke_flux(w, name="vf_vke")
+    vf_vke = isotropize(vf_vke_2d, dx, dy, cumulative=cumulative)
+
+    # Calculate divergence of the 2D flux, then isotropize
+    vfd_vke_2d = vertical_gradient_flux(vf_vke_2d, name="vfd_vke")
+    vfd_vke = isotropize(vfd_vke_2d, dx, dy, cumulative=cumulative)
+
+    # --- VERTICAL APE FLUX (vf_ape) and its DIVERGENCE (vfd_ape) ---
+    vf_ape_2d = turbulent_ape_flux(w, theta_prime, gamma, name="vf_ape")
+    vf_ape = isotropize(vf_ape_2d, dx, dy, cumulative=cumulative)
+
+    # Calculate divergence of the 2D flux, then isotropize
+    vfd_ape_2d = vertical_gradient_flux(vf_ape_2d, name="vfd_ape")
+    vfd_ape = isotropize(vfd_ape_2d, dx, dy, cumulative=cumulative)
+
+    # --- ADIABATIC NON-CONSERVATIVE (j_hke, j_vke, j_ape) ---
     # Note: nonconservative_adiabatic uses vf_hke_2d (or calculates it if not passed)
     j_hke_2d = nonconservative_adiabatic(u, v, w, rho, vf_hke=vf_hke_2d, name="j_hke")
     j_hke = isotropize(j_hke_2d, dx, dy, cumulative=cumulative)
+
+    # Note: nonconservative_adiabatic uses vf_vke_2d (or calculates it if not passed)
+    j_vke_2d = nonconservative_adiabatic_vke(w, rho, vf_vke=vf_vke_2d, name="j_vke")
+    j_vke = isotropize(j_vke_2d, dx, dy, cumulative=cumulative)
+
+    # Note: nonconservative_adiabatic uses vf_ape_2d (or calculates it if not passed)
+    j_ape_2d = nonconservative_adiabatic_ape(theta_prime, gamma, rho, vf_ape=vf_ape_2d, name="j_ape")
+    j_ape = isotropize(j_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE WORK & CONVERSION (vf_pres, vfd_pres, cad) ---
     # Assuming Exner function and domain_mean are available
@@ -500,18 +720,30 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     vfd_pres_2d = vertical_gradient_flux(vf_pres_2d, name="vfd_pres")
     vfd_pres = isotropize(vfd_pres_2d, dx, dy, cumulative=cumulative)
 
-    # Conversion (cad)
+    # Conversion (cad, caz)
     cad_2d = conversion_ape_to_dke(theta, w, exner, name="cad")
     cad = isotropize(cad_2d, dx, dy, cumulative=cumulative)
+
+    caz_2d = conversion_ape_to_vke(theta, w, exner, name="caz")
+    caz = isotropize(caz_2d, dx, dy, cumulative=cumulative)
 
     # --- HORIZONTAL KE DIVERGENCE (div_hke) ---
     div_hke_2d = divergence_hke(u, v, w, divergence, name="div_hke")
     div_hke = isotropize(div_hke_2d, dx, dy, cumulative=cumulative)
 
+    # --- VERTICAL KE DIVERGENCE (div_vke) ---
+    div_vke_2d = divergence_vke(u, v, w, divergence, name="div_vke")
+    div_vke = isotropize(div_vke_2d, dx, dy, cumulative=cumulative)
+
+    # --- APE DIVERGENCE (div_ape) ---
+    div_ape_2d = divergence_ape(u, v, w, theta_prime, gamma, divergence, name="div_ape")
+    div_ape = isotropize(div_ape_2d, dx, dy, cumulative=cumulative)
+
     # --- ASSEMBLE ---
-    fluxes = [hke_1d, rke_1d, dke_1d,
-              pi_nke, pi_lke, vfd_dke, j_hke, vf_hke,
-              vf_pres, vfd_pres, cad, div_hke]
+    fluxes = [hke_1d, rke_1d, dke_1d, vke_1d, ape_1d,
+              pi_nke, pi_lke, pi_vke, pi_ape, vfd_dke, vfd_vke, vfd_ape,
+              j_hke, j_vke, j_ape, vf_hke, vf_vke, vf_ape, cad, caz,
+              vf_pres, vfd_pres, div_hke, div_vke, div_ape]
 
     # Filter out None and assemble into Dataset
     fluxes = xr.Dataset({da.name: da for da in fluxes if da is not None})

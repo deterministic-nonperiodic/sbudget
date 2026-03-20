@@ -147,32 +147,29 @@ def pressure_vertical_velocity(w: xr.DataArray, temperature: xr.DataArray,
     return - cn.g * rho * w
 
 
-def lorenz_parameter(
-        pressure: xr.DataArray,
+def brunt_vaisala_squared(
         theta: xr.DataArray,
-        vertical_dim: str | None = None,
+        vertical_dim: str = "z",
+        edge_order: Literal[1, 2] = 2,
+) -> xr.DataArray:
+    """
+    N^2 = g d(ln θ)/dz
+    """
+    ddz_ln_theta = np.log(theta).differentiate(vertical_dim, edge_order=edge_order)
+    return cn.g * ddz_ln_theta
+
+
+def lorenz_parameter(
+        theta: xr.DataArray,
+        N2: xr.DataArray = None,
+        vertical_dim: str = "z",
         edge_order: Literal[1, 2] = 2,
 ) -> xr.DataArray:
     """
     Lorenz static stability parameter γ:
-      γ = - R_d Π / (p ∂θ/∂p)
+      γ = g^2 / (N^2 θ^2)
     """
-    vertical_dim = _infer_vertical_dim(pressure, theta, vertical_dim)
-
-    ddp_theta = nh_pressure_derivative(theta, pressure, zdim=vertical_dim, edge_order=edge_order)
-
-    return - cn.Rd * exner_function(pressure) / (pressure * ddp_theta)
-
-
-def brunt_vaisala_squared(
-        pressure: xr.DataArray,
-        temperature: xr.DataArray,
-        vertical_dim: str | None = None,
-        edge_order: Literal[1, 2] = 2,
-) -> xr.DataArray:
-    """
-    N^2 = (g/θ)^2 / γ   (using Lorenz parameter γ)
-    """
-    theta = potential_temperature(pressure, temperature)
-    gamma = lorenz_parameter(pressure, theta, vertical_dim=vertical_dim, edge_order=edge_order)
-    return (cn.g / theta) ** 2 / gamma
+    if N2 is None:
+        N2 = brunt_vaisala_squared(theta, vertical_dim=vertical_dim, edge_order=edge_order)
+    
+    return cn.g**2 / (N2 * theta**2)
