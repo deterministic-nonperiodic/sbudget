@@ -8,7 +8,7 @@ from dask.distributed import get_client
 from .cf_coords import get_spatial_dims
 from .constants import earth_radius, epsilon
 from .grid_utils import scale_increments
-from .memory_manager import CacheManager, ensure_optimal_chunking
+from .memory_manager import CacheManager, ensure_optimal_chunking, optimal_batch_size
 
 
 # --------------------------------------------------------------------------------------------------
@@ -299,7 +299,7 @@ def process_single_r_for_field_chunk(
     # ------------------------------------------------------------
     # Weighted sum over all discrete angles for this r
     # ------------------------------------------------------------
-    weighted_shifts: list[xr.DataArray] = []
+    integrand = xr.zeros_like(field_chunk_ds["u"])
 
     for phi, weight, nx, ny in angle_parameters:
         # Roll the field to the angle grid
@@ -308,17 +308,81 @@ def process_single_r_for_field_chunk(
             x_boundary_type, y_boundary_type
         )
 
-        # Spill to memory/disk depending on avail RAM
-        if cache_manager is not None:
-            rolled_ds = cache_manager.persist(rolled_ds, key=f"{nx:+04d}_{ny:+04d}")
-
         delta_u_cubed = delta_u_cubed_geographic(field_chunk_ds, rolled_ds, phi)
-        weighted_shifts.append(delta_u_cubed * weight)
+        integrand = integrand + (delta_u_cubed * weight)
 
-    integrand = sum(weighted_shifts).rename(transform_type)
-
-    # Attach the r-value dimension
+    integrand = integrand.rename(transform_type)
     return integrand.expand_dims(r=[r_value])
+
+
+def _vectorized_scale_integration(
+    integrand: xr.DataArray,
+    kernel_derivative: xr.DataArray
+) -> xr.DataArray:
+    """
+    Compute integral over scales using highly-optimized matrix multiplication (GEMM).
+    Returns an xarray DataArray with the 'scale' dimension replacing the 'r' dimension.
+    """
+    r_coords = integrand.r.values
+    scale_coords = kernel_derivative.scale.values
+
+    # Pre-calculate trapezoidal rule integration weights for r
+    dr = np.zeros_like(r_coords)
+    if len(r_coords) > 1:
+        dr[0] = (r_coords[1] - r_coords[0]) / 2.0
+        dr[-1] = (r_coords[-1] - r_coords[-2]) / 2.0
+        dr[1:-1] = (r_coords[2:] - r_coords[:-2]) / 2.0
+    else:
+        dr[0] = 1.0
+
+    kd_s_np = kernel_derivative.values  # shape: (scale, r)
+    
+    # Create masking matrix (1 where r <= 2 * scale, 0 otherwise)
+    r_grid = r_coords[None, :]          # shape: (1, r)
+    scale_grid = scale_coords[:, None]  # shape: (scale, 1)
+    mask_matrix = r_grid <= 2 * scale_grid
+    
+    kd_s_masked = np.where(mask_matrix, kd_s_np, 0.0)
+
+    integrand_np = integrand.values     # shape: (r, ...)
+    shape = integrand_np.shape
+    r_dim = shape[0]
+    spatial_shape = shape[1:]
+    
+    # Flatten spatial dimensions for matrix multiplication: (r, N)
+    integrand_flat = integrand_np.reshape(r_dim, -1)
+    
+    # den = sum_r( kd_s * integrand ) -> shape: (scale, N)
+    den_flat = kd_s_np @ integrand_flat
+    
+    # num = sum_r_masked( kd_s * integrand ) -> shape: (scale, N)
+    num_flat = kd_s_masked @ integrand_flat
+    
+    # Retention fraction handles the integral over unbounded domains
+    retention_fraction_flat = np.where(den_flat > epsilon, num_flat / den_flat, 1.0)
+    
+    # integration_matrix applies trapz step width scaling to masked mollifiers
+    integration_matrix = kd_s_masked * dr[None, :]  # shape: (scale, r)
+    
+    # integral = int_r_masked( kd_s * integrand ) -> shape: (scale, N)
+    integral_flat = integration_matrix @ integrand_flat
+    
+    # Adjust for retention fraction
+    integral_corrected_flat = integral_flat / retention_fraction_flat
+    
+    # Reshape back to exactly match our spatial chunk (scale, ...)
+    integral_corrected = integral_corrected_flat.reshape(len(scale_coords), *spatial_shape)
+
+    out_dims = ["scale"] + list(integrand.dims)[1:]
+    out_coords = {"scale": scale_coords}
+    for d in out_dims[1:]:
+        out_coords[d] = integrand.coords[d]
+
+    return xr.DataArray(
+        integral_corrected,
+        dims=out_dims,
+        coords=out_coords
+    )
 
 
 def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
@@ -341,7 +405,7 @@ def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
     increments_data = dict()
 
     # r_values are needed for the outer loop in _block_space_scale_integral
-    increments_data["r_values"] = r_values
+    increments_data["r"] = r_values
 
     # Store boundary types once, as they are used repeatedly
     increments_data["x_boundary_type"] = increments_ds.attrs.get("x_boundary_type", "periodic")
@@ -401,11 +465,6 @@ def _block_space_scale_integral(
         5. return final (scale, ...) DataArray
     """
 
-    # ------------------------------------------------------------------------------------
-    # CacheManager: per block per worker
-    # ------------------------------------------------------------------------------------
-    cache_manager = CacheManager.for_current_worker(verbose=False, force_threshold=0.70)
-
     # Run the indexing loop ONLY once per block to get the dictionary.
     # increments is now either the precomputed dictionary or a Future pointing to it.
     if isinstance(increments, Future):
@@ -413,51 +472,38 @@ def _block_space_scale_integral(
     else:
         increments_data = increments
 
-    radial_distance = increments_data["r_values"]  # Access without modifying the shared dict
+    radial_distance = increments_data["r"]  # Access without modifying the shared dict
 
     # ------------------------------------------------------------------------------------
-    # Compute cubed velocity differences for all radial distances: Dask main graph
+    # Compute cubed velocity differences for all radial distances: strictly in-memory
     # ------------------------------------------------------------------------------------
-    integrand_blocks = [
-        process_single_r_for_field_chunk(
+    integrand_list = []
+    
+    for r_value in radial_distance:
+        da_r = process_single_r_for_field_chunk(
             field_chunk_ds=field_chunk,
             r_value=float(r_value),
             increments_data=increments_data,
-            x_dim=x_dim, y_dim=y_dim,
+            x_dim=x_dim, 
+            y_dim=y_dim,
             transform_type=transform_type,
-            cache_manager=cache_manager
+            cache_manager=None
         )
-        for r_value in radial_distance
-    ]
+        integrand_list.append(da_r)
+        
+    if not integrand_list:
+        raise ValueError("No radial distances to process.")
 
     # ------------------------------------------------------------------------------------
-    # Merge integrand and rechunk to have all r-values in one chunk
+    # Merge integrand into a single NumPy-backed array 
     # ------------------------------------------------------------------------------------
-    integrand = xr.concat(integrand_blocks, dim="r").chunk(r=-1)
-
-    # --------   Adaptatively cache the large integrand array to RAM or Disk   -----------
-    integrand = cache_manager.persist(integrand)
+    integrand = xr.concat(integrand_list, dim="r")
 
     # ------------------------------------------------------------------------------------
-    # Kernel-weighting / masking (Kernel support r ≤ 2ℓ is guaranteed by construction)
+    # Kernel-weighting / masking (Kernel support r <= 2 * scale is guaranteed by construction)
+    # Compute integral over scales using highly-optimized matrix multiplication (GEMM)
     # ------------------------------------------------------------------------------------
-    weighted = kernel_derivative * integrand
-    masked = weighted.where(weighted.r <= 2 * kernel_derivative.scale, 0.0)
-
-    num = masked.sum("r")
-    den = weighted.sum("r")
-    retention_fraction = xr.where(den > epsilon, num / den, 1.0)
-
-    # Integral correction due to the truncated kernel
-    integral = masked.integrate("r") / retention_fraction
-
-    # ------------------------------------------------------------------------------------
-    # Add scale coordinate
-    # ------------------------------------------------------------------------------------
-    integral = integral.assign_coords(scale=kernel_derivative.scale)
-
-    # --- enforce one-scale-at-a-time tasks for reductions/writes ---
-    integral = integral.chunk(scale=1)
+    integral = _vectorized_scale_integration(integrand, kernel_derivative)
 
     return integral
 
@@ -607,13 +653,15 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Ensure 'optimal' chunks along non-spatial dimensions for high parallelism
     # ----------------------------------------------------------------------------
     num_workers = kwargs.get("num_workers", None)
+    allow_rechunk = kwargs.get("allow_rechunk", True)
 
-    wind = ensure_optimal_chunking(wind,
-                                   spatial_dims=(y_name, x_name), vertical_dim="z",
-                                   # Data size increases by the number of scales
-                                   output_scale_mult=radial_distance.size,
-                                   # Limit number of workers to avoid overheads
-                                   num_workers=num_workers)
+    if allow_rechunk:
+        wind = ensure_optimal_chunking(wind,
+                                       spatial_dims=(y_name, x_name), vertical_dim="z",
+                                       # Data size increases by the number of scales, but we batch it
+                                       output_scale_mult=radial_distance.size,
+                                       # Limit number of workers to avoid overheads
+                                       num_workers=num_workers)
 
     # ----------------------------------------------------------------------------
     # Compute third-order structure functions for each radial distance

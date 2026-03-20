@@ -509,15 +509,14 @@ def optimal_batch_size(
     per_item_bytes = max(1, per_item_bytes)
 
     # --- Worker-aware memory budget ---
-    usable_mem, n_workers = get_worker_memory_budget(reserve_ratio)
+    worker_limit = get_worker_memory_limit(mode="worker")
+    usable_mem = int(worker_limit * reserve_ratio)
+    n_workers = get_current_worker_count(verbose=False, total=False)
 
     # --- Compute max safe items ---
     max_items_fit = max(1, int(min(usable_mem, target_size_bytes) // per_item_bytes))
 
-    if items_total == 1:
-        batch_size = 1
-    else:
-        batch_size = max(2, min(items_total, max_items_fit))
+    batch_size = max(1, min(items_total, max_items_fit))
 
     n_batches = min(items_total, int(np.ceil(items_total / batch_size)))
 
@@ -593,6 +592,95 @@ def get_worker_memory_budget(reserve_ratio: float = 0.7) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 # 1. Memory / Worker Utilities
 # ---------------------------------------------------------------------------
+
+def _parse_slurm_memory() -> Optional[float]:
+    """
+    Parses SLURM memory variables to determine total memory in GiB.
+    """
+    n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
+
+    # 1. SLURM_MEM_PER_NODE (Total memory for the whole job/node)
+    if "SLURM_MEM_PER_NODE" in os.environ:
+        return int(os.environ["SLURM_MEM_PER_NODE"]) / 1024.0
+
+    # 2. SLURM_MEM_PER_CPU (Memory per task/CPU)
+    if "SLURM_MEM_PER_CPU" in os.environ:
+        mem_per_task = int(os.environ["SLURM_MEM_PER_CPU"]) / 1024.0
+        return n_tasks * mem_per_task
+
+    # 3. SLURM_MEM (General total memory request)
+    if "SLURM_MEM" in os.environ:
+        mem_str = os.environ["SLURM_MEM"].upper()
+        # Handle units like 256G, 1000M
+        import re
+        match = re.search(r'(\d+)([MG])', mem_str)
+        if match:
+            value = float(match.group(1))
+            unit = match.group(2)
+            if unit == 'G':
+                return value
+            elif unit == 'M':
+                return value / 1024.0
+        try:
+            return float(os.environ["SLURM_MEM"]) / 1024.0
+        except ValueError:
+            pass
+            
+    return None
+
+
+def get_worker_memory_limit(mode: str = "worker") -> int:
+    """
+    Robustly determine the memory limit for the current process/worker in bytes.
+    
+    Priority:
+    1. Dask worker limit (if running on a worker)
+    2. SLURM allocation (if in SLURM job)
+    3. System RAM / N_workers (fallback)
+    
+    Parameters
+    ----------
+    mode : str
+        "worker" (check Dask worker context) or "client" (global estimation)
+        
+    Returns
+    -------
+    int
+        Memory limit in bytes
+    """
+    # 1. Check Dask Worker Context
+    if mode == "worker":
+        try:
+            worker = get_worker()
+            # Handle Dask deprecation: memory_limit moved to memory_manager.memory_limit
+            if hasattr(worker, "memory_manager") and hasattr(worker.memory_manager, "memory_limit"):
+                 return int(worker.memory_manager.memory_limit)
+            elif hasattr(worker, "memory_limit") and worker.memory_limit:
+                return int(worker.memory_limit)
+        except (ValueError, ImportError):
+            pass
+
+    # 2. Check SLURM Allocation
+    slurm_mem_gb = _parse_slurm_memory()
+    if slurm_mem_gb is not None:
+        # If we are in a worker context but couldn't get the worker object,
+        # we need to divide the total SLURM memory by the number of tasks
+        if mode == "worker":
+             n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
+             return int((slurm_mem_gb * 1024**3) / n_tasks)
+        return int(slurm_mem_gb * 1024**3)
+
+    # 3. Fallback: System RAM / N_workers
+    total_mem = psutil.virtual_memory().total
+    n_workers = get_current_worker_count(verbose=False, total=False)
+    
+    # If we are just checking global capacity (mode="client"), return total
+    if mode == "client":
+        return total_mem
+        
+    return int(total_mem / n_workers)
+
+
 def estimate_dataset_bytes(
         obj: Union[xr.Dataset, xr.Dataset],
         exclude_dims: Iterable[str] | str | None = None,
@@ -687,7 +775,7 @@ def get_current_worker_count(verbose=True, total=True) -> int:
         if verbose:
             print("[chunking] SLURM environment detected: using SLURM_NTASKS for worker count.")
         try:
-            n_tasks = int(os.environ["SLURM_NTASKS"])
+            n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
 
             if total:
                 # Default to 1 thread per task if SLURM_CPUS_PER_TASK is not set
@@ -744,22 +832,11 @@ def fits_in_memory(
     """
     size_bytes = estimate_dataset_bytes(obj, exclude_dims) * max(1, expansion_factor)
 
-    # Obtain memory limit from Dask workers if available
-    if mode == "worker":
-        try:
-            client = get_client()
-            workers = client.scheduler_info().get("workers", {})
-            available = min(w["memory_limit"] for w in workers.values()) if workers else None
-            # print(f"[chunking] Detected Dask worker memory limit: {_fmt_bytes(available)}")
-        except Exception:
-            n_workers = get_current_worker_count(verbose=False, total=False)
-            available = psutil.virtual_memory().available / n_workers
-            # print(f"[chunking] Defaulting to system available memory: {_fmt_bytes(available)}")
-    else:
-        available = psutil.virtual_memory().available
-
-    # Fall back to system memory
-    limit = int(ratio_to_use * available)
+    # Use robust memory limit detection
+    worker_limit = get_worker_memory_limit(mode=mode)
+    
+    # Apply safety ratio
+    limit = int(worker_limit * ratio_to_use)
 
     return size_bytes < limit, size_bytes, limit
 
@@ -834,6 +911,7 @@ def ensure_optimal_chunking(
         output_scale_mult: int = 1,
         num_workers: Optional[int] = None,
         preferred_num_blocks: Optional[int] = None,
+        min_chunk_mb: float = 128.0,
 ) -> xr.Dataset:
     """
     Adaptive, HPC‑aware multi‑dimensional chunking for Xarray+Dask datasets.
@@ -891,18 +969,24 @@ def ensure_optimal_chunking(
     t_size = ds.sizes.get("time", 1)
     z_size = ds.sizes.get(vertical_dim, 1)
 
-    # Estimate bytes per spatial tile
-    tile = ds.isel(
-        {
-            x_dim: slice(0, plan[x_dim] if plan[x_dim] != -1 else ds.sizes[x_dim]),
-            y_dim: slice(0, plan[y_dim] if plan[y_dim] != -1 else ds.sizes[y_dim])
-        }, drop=True)
+    # Estimate bytes per spatial tile (single plane)
+    isel_dict = {
+        x_dim: slice(0, plan[x_dim] if plan[x_dim] != -1 else ds.sizes[x_dim]),
+        y_dim: slice(0, plan[y_dim] if plan[y_dim] != -1 else ds.sizes[y_dim])
+    }
+    # Ensure we estimate for a single plane (t=1, z=1)
+    if needs_t: isel_dict["time"] = slice(0, 1)
+    if needs_z: isel_dict[vertical_dim] = slice(0, 1)
+
+    tile = ds.isel(isel_dict, drop=True)
     tile_bytes = estimate_dataset_bytes(tile, mode="total")
 
     total_planes = t_size * z_size
 
     # Memory Constraint: Minimum blocks needed for safety (blocks_mem)
-    planes_per_chunk_mem = max(1, int(worker_limit // max(1, tile_bytes)))
+    # We must account for the expansion factor (output_scale_mult) when checking fit
+    expanded_tile_bytes = tile_bytes * output_scale_mult
+    planes_per_chunk_mem = max(1, int(worker_limit // max(1, expanded_tile_bytes)))
     blocks_mem = max(1, int(np.ceil(total_planes / planes_per_chunk_mem)))
 
     # Parallelism Constraint: Workers * Buffer (Goal: keep pipeline full)
@@ -911,14 +995,24 @@ def ensure_optimal_chunking(
     else:
         num_workers = max(1, int(num_workers))
 
-    # Increase parallelism buffer from 4 to 10 (less memory aggressive)
+    # Set parallelism buffer to 4. 2 caused Out-Of-Memory reboots in distributed workers 
+    # operating under 7.5GB constraints, and 8 created far too many schedule tasks.
     PARALLEL_BUFFER = 4
     target_parallel_blocks = preferred_num_blocks or (num_workers * PARALLEL_BUFFER)
     target_parallel_blocks = int(np.ceil(target_parallel_blocks))
 
+    # Efficiency Constraint: Don't create chunks smaller than min_chunk_mb just for parallelism
+    # unless required by memory constraints.
+    total_bytes_est = estimate_dataset_bytes(ds, mode="total") * output_scale_mult
+    max_blocks_efficiency = max(1, int(total_bytes_est / (min_chunk_mb * 1024**2)))
+    
+    # Cap the parallelism target by efficiency
+    # We want parallelism, but not if it makes chunks tiny.
+    effective_parallel_target = min(target_parallel_blocks, max_blocks_efficiency)
+
     # Select Target Block Count: Use the largest count (smallest chunks) required by safety or parallelism.
-    # We still use max() because we MUST satisfy the memory constraint.
-    blocks_target = max(blocks_mem, target_parallel_blocks)
+    # We still use max() because we MUST satisfy the memory constraint (blocks_mem).
+    blocks_target = max(blocks_mem, effective_parallel_target)
 
     # Calculate final planes per chunk based on the target block count
     planes_final = max(1, int(np.ceil(total_planes / blocks_target)))

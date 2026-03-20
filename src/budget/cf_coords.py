@@ -372,6 +372,11 @@ def _coord_is_degrees(
 
     return False
 
+def _coord_is_meter(c: xr.DataArray) -> bool:
+    """Checks if the coordinate units are meter-like."""
+    u = _get_units_str(c)
+    return (u in _METER_UNITS) or any(tok in u for tok in ("metre", "meter"))
+
 
 def _is_z(cname: str, coords: Union[xr.Dataset, xr.DataArray, Any]) -> bool:
     """
@@ -664,11 +669,6 @@ def get_spatial_dims(obj: Union[xr.Dataset, xr.DataArray]) -> Tuple[str, str]:
 # ----------------------
 # Resolution inference
 # ----------------------
-def _coord_is_meter(c: xr.DataArray) -> bool:
-    """Checks if the coordinate units are meter-like."""
-    u = _get_units_str(c)
-    return (u in _METER_UNITS) or any(tok in u for tok in ("metre", "meter"))
-
 
 def infer_grid_resolution(ds: xr.Dataset) -> tuple[float, float]:
     """

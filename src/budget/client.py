@@ -30,49 +30,6 @@ _MAX_FILE_DESCRIPTORS = 8192
 _MIN_WORKER_MEM_GB = 4.0  # Minimum memory per worker in GiB
 
 
-# --- Helper Function for SLURM Memory Detection ---
-def _parse_total_memory() -> Optional[float]:
-    """
-    Parses SLURM memory variables (SLURM_MEM_PER_NODE, SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU)
-    to determine the total memory allocated to the job, in GiB.
-
-    Returns the total allocated memory in GiB, or None if no SLURM memory variable is found.
-    """
-    n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
-
-    # 1. SLURM_MEM_PER_NODE (Total memory for the whole job/node)
-    if "SLURM_MEM_PER_NODE" in os.environ:
-        # Value is usually in MiB
-        return int(os.environ["SLURM_MEM_PER_NODE"]) / 1024.0
-
-    # 2. SLURM_MEM_PER_CPU (Memory per task/CPU)
-    if "SLURM_MEM_PER_CPU" in os.environ:
-        # Value is usually in MiB
-        mem_per_task = int(os.environ["SLURM_MEM_PER_CPU"]) / 1024.0
-        return n_tasks * mem_per_task
-
-    # 3. SLUM_MEM (General total memory request, typically in GB or MB)
-    # This captures the --mem=256G request
-    if "SLURM_MEM" in os.environ:
-        mem_str = os.environ["SLURM_MEM"].upper()
-        match = re.search(r'(\d+)([MG])', mem_str)
-        if match:
-            value = float(match.group(1))
-            unit = match.group(2)
-            if unit == 'G':
-                return value
-            elif unit == 'M':
-                return value / 1024.0
-        # If it's a simple number (usually MB on some clusters)
-        try:
-            # Assume MB if no unit is given
-            return float(os.environ["SLURM_MEM"]) / 1024.0
-        except ValueError:
-            pass
-
-    # Local Machine: Total system memory (Fallback)
-    return psutil.virtual_memory().total / (1024 ** 3)
-
 
 # --- Helper function definitions (omitted for brevity) ---
 def _increase_fd_limit():
@@ -89,18 +46,17 @@ def _increase_fd_limit():
 
 def _detect_resources(cfg: Optional[Any] = None) -> Dict[str, Union[int, float, bool]]:
     """Detects allocated resources, prioritizing SLURM environment variables."""
-
-    is_slurm = any(k in os.environ for k in ["SLURM_JOB_ID", "SLURM_NTASKS", "SLURM_CPUS_PER_TASK"])
+    from .memory_manager import get_current_worker_count, _parse_slurm_memory
 
     # Thread/Worker Allocation
-    if is_slurm:
-        n_workers = int(os.environ.get("SLURM_NTASKS", 1))
-        n_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+    # Use centralized logic from memory_manager
+    n_workers = get_current_worker_count(verbose=False, total=False)
+    
+    # Determine threads per worker
+    if "SLURM_CPUS_PER_TASK" in os.environ:
+        n_threads = int(os.environ["SLURM_CPUS_PER_TASK"])
     else:
-        # Local machine: Use physical cores to avoid oversubscription
-        # Default to 1 thread per worker for GIL-bound workloads, but maximize workers
-        physical_cores = psutil.cpu_count(logical=False) or 4
-        n_workers = physical_cores
+        # Default to 1 thread per worker for GIL-bound workloads
         n_threads = 1
 
     # Override with config if provided
@@ -111,7 +67,13 @@ def _detect_resources(cfg: Optional[Any] = None) -> Dict[str, Union[int, float, 
             n_threads = cfg.compute.threads_per_worker
 
     # Total Memory Allocation (in GiB)
-    total_mem_gb = _parse_total_memory()
+    # Use centralized logic from memory_manager
+    slurm_mem = _parse_slurm_memory()
+    if slurm_mem is not None:
+        total_mem_gb = slurm_mem
+    else:
+        # Fallback to system memory
+        total_mem_gb = psutil.virtual_memory().total / (1024 ** 3)
 
     return {"n_workers": n_workers, "threads_per_worker": n_threads, "total_mem_gb": total_mem_gb}
 
@@ -129,10 +91,10 @@ def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
         "array.slicing.split_large_chunks": False,
 
         # Worker spilling ENABLED for stability
-        "distributed.worker.memory.target": 0.60,  # Start spilling to disk
-        "distributed.worker.memory.spill": 0.70,   # Spill more aggressively
-        "distributed.worker.memory.pause": 0.80,   # Pause worker
-        "distributed.worker.memory.terminate": 0.95, # Kill worker
+        "distributed.worker.memory.target": 0.65,  # Start garbage collection
+        "distributed.worker.memory.spill": 0.85,   # Spilling to disk
+        "distributed.worker.memory.pause": 0.95,   # Pause worker
+        "distributed.worker.memory.terminate": 0.98, # Kill worker
 
         # DAG fusion optimizations
         "optimization.fuse.ave-width": 24,
