@@ -341,7 +341,7 @@ def nonlinear_ape_transfer(
 
     # Advection-like vector A and transport vector wU
     advection_theta = horizontal_advection(theta_prime, u, v) + 0.5 * (
-                divergence * theta_prime) + 0.5 * (w * dztheta)
+            divergence * theta_prime) + 0.5 * (w * dztheta)
 
     # Spectral vector inner products (sum over components)
     t_adv = - scalar_cross_spectrum(theta_prime, advection_theta)  # -⟨theta, At⟩
@@ -382,46 +382,46 @@ def turbulent_ape_flux(w: xr.DataArray, theta_prime: xr.DataArray, gamma: xr.Dat
 
 
 @budget_metadata
-def pressure_flux(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
+def pressure_flux(theta_mean: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
                   name="vf_pres") -> xr.DataArray:
-    """Vertical pressure work flux term: -cp·θ·⟨w, exner⟩."""
-    p_flux = -cp * domain_mean(theta) * scalar_cross_spectrum(w, exner)
+    """Vertical pressure work flux term: -cp·θ_mean·⟨w, exner⟩."""
+    p_flux = -cp * theta_mean * scalar_cross_spectrum(w, exner)
 
     return p_flux.rename(name)
 
 
 @budget_metadata
-def conversion_ape_to_dke(theta: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
+def conversion_ape_to_dke(theta_mean: xr.DataArray, w: xr.DataArray, exner: xr.DataArray,
                           name="cad") -> xr.DataArray:
-    """APE to DKE conversion term: cp·θ·⟨w, ∂z exner⟩."""
+    """APE to DKE conversion term: cp·θ_mean·⟨w, ∂z exner⟩."""
     dz_exner = exner.differentiate('z', edge_order=2)
 
-    cad = cp * domain_mean(theta) * scalar_cross_spectrum(w, dz_exner)
+    cad = cp * theta_mean * scalar_cross_spectrum(w, dz_exner)
 
     return cad.rename(name)
 
 
 @budget_metadata
-def conversion_ape_to_vke(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray,
+def conversion_ape_to_vke(theta_mean: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray,
                           exner: xr.DataArray, name="caz") -> xr.DataArray:
     """APE to VKE conversion term: (g / θ_bar) * ⟨w, θ'⟩ - cp * θ_bar * ⟨w, ∂z π'⟩ - g * ⟨w, q_t⟩"""
 
     dz_exner = exner.differentiate('z', edge_order=2)
 
-    term1 = (g / domain_mean(theta)) * scalar_cross_spectrum(w, theta_prime)
-    term2 = -cp * domain_mean(theta) * scalar_cross_spectrum(w, dz_exner)
+    theta_transport = (g / theta_mean) * scalar_cross_spectrum(w, theta_prime)
+    exner_transport = -cp * theta_mean * scalar_cross_spectrum(w, dz_exner)
 
-    caz = term1 + term2
+    caz = theta_transport + exner_transport
 
     return caz.rename(name)
 
 
 @budget_metadata
-def conversion_ape(theta: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray,
+def conversion_ape(theta_mean: xr.DataArray, theta_prime: xr.DataArray, w: xr.DataArray,
                    name="ca") -> xr.DataArray:
     """APE  conversion term: (g / θ_bar) * ⟨w, θ'⟩"""
 
-    ca = (g / domain_mean(theta)) * scalar_cross_spectrum(w, theta_prime)
+    ca = (g / theta_mean) * scalar_cross_spectrum(w, theta_prime)
 
     return ca.rename(name)
 
@@ -627,7 +627,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         divergence = horizontal_divergence(u, v)
         vorticity = relative_vorticity(u, v)
 
-    theta_prime = theta - domain_mean(theta)
+    theta_mean = domain_mean(theta)
+    theta_prime = theta - theta_mean
     gamma = lorenz_parameter(theta)
 
     # ----------------------------------------------------------------------------------------------
@@ -719,7 +720,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     exner = exner_function(pressure) - exner_function(domain_mean(pressure))
 
     # Pressure Flux (vf_pres)
-    vf_pres_2d = pressure_flux(theta, w, exner, name="vf_pres")
+    vf_pres_2d = pressure_flux(theta_mean, w, exner, name="vf_pres")
     vf_pres = isotropize(vf_pres_2d, dx, dy, cumulative=cumulative)
 
     # Pressure Flux Divergence (vfd_pres)
@@ -727,10 +728,10 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     vfd_pres = isotropize(vfd_pres_2d, dx, dy, cumulative=cumulative)
 
     # Conversion (cad, caz)
-    cad_2d = conversion_ape_to_dke(theta, w, exner, name="cad")
+    cad_2d = conversion_ape_to_dke(theta_mean, w, exner, name="cad")
     cad = isotropize(cad_2d, dx, dy, cumulative=cumulative)
 
-    caz_2d = conversion_ape_to_vke(theta, w, exner, name="caz")
+    caz_2d = conversion_ape_to_vke(theta_mean, theta_prime, w, exner, name="caz")
     caz = isotropize(caz_2d, dx, dy, cumulative=cumulative)
 
     # --- HORIZONTAL KE DIVERGENCE (div_hke) ---
