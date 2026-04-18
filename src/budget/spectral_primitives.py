@@ -5,7 +5,7 @@ import numpy.linalg as npl
 import xarray as xr
 from scipy.signal.windows import dpss as _dpss
 
-from .cf_coords import get_spatial_dims, _coord_is_degrees
+from .cf_coords import get_spatial_dims, _coord_is_degrees, _is_geographic
 from .constants import epsilon
 from .numeric_tools import domain_mean
 
@@ -116,12 +116,16 @@ def _sqrt_area_weight(field: xr.DataArray) -> xr.DataArray:
     s(phi) = sqrt( cos(phi) / <cos(phi)> )  (if enabled)
     """
     y_dim, _ = get_spatial_dims(field)
-    y_coord = field.coords.get(y_dim)
+    y_coord = field.coords.get(y_dim, "")
 
-    if not SPECTRAL_CFG.get("area_weighting", {}).get("enabled", True):
+    geographic = _is_geographic(y_coord, "lat")
+    enabled = SPECTRAL_CFG.get("area_weighting", {}).get("enabled", True)
+
+    if not geographic or not enabled:
         return xr.DataArray(np.ones((field.sizes[y_dim],), dtype=np.float64),
                             dims=(y_dim,), coords={y_dim: field[y_dim]})
 
+    # Apply area weighting on geographic grids
     phi = np.deg2rad(y_coord) if _coord_is_degrees(y_coord) else y_coord
     cos_phi = np.cos(phi).clip(min=epsilon)
 

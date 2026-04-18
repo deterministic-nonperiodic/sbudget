@@ -13,20 +13,24 @@ suitable for studying spectral energy transfers across scales. The budget is for
 [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1),
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
-$$\partial_t E_h(k)=C_{A\to h}(k)+T_h(k)+L_h(k)+\partial_z F_{\uparrow}(k)+\mathrm{Div}_h(k)+H_h
-(k)+J_h(k)+D_h(k).$$
+$$\partial_t E_h(k)=C_{A\to h}(k)+T_h(k)+L_h(k)+\partial_z F_{K\uparrow}(k)+\mathrm{Div}_h(k)+H_h
+(k)+J_h(k)+D_h(k),$$
+and the budget of available potential energy (APE) as:
+$$\partial_t E_A(k)=-C_{A\to h}(k)+T_A(k)+\partial_z F_{A\uparrow}(k)+\mathrm{Div}_A(k)+H_A
+(k)+J_A(k)+D_A(k).$$
 
-* $E_h(k)$ — isotropic spectrum of HKE at wavenumber $k$.
-* $C_{A\to h}(k)$ — **conversion** from available potential energy (APE) to HKE.
-* $T_h(k)$ — nonlinear **spectral transfer** of HKE (across scales).
+Where subscripts $h$ and $A$ denote terms for HKE and APE, respectively:
+* $E_h(k), E_A(k)$ — isotropic spectrum of energy at wavenumber $k$.
+* $C_{A\to h}(k)$ — **conversion** from APE to HKE.
+* $T_h(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales).
 * $L_h(k)$ — linear **spectral transfer** of HKE due to Coriolis.
-* $F_{\uparrow}(k)$ — net **vertical flux** of HKE + pressure **pressure-work** flux
-* $\mathrm{Div}_h(k)$ — tendency from **3-D divergence** processes.
-* $H_h(k)$ — **diabatic** tendency (heating/cooling).
-* $J_h(k)$ — **adiabatic nonconservative** tendency.
-* $D_h(k)$ — **diffusive/dissipative** tendency (viscosity, filters).
+* $F_{K\uparrow}(k), F_{A\uparrow}(k)$ — net **vertical flux** of energy (includes pressure-work for HKE).
+* $\mathrm{Div}_h(k), \mathrm{Div}_A(k)$ — tendency from **3-D divergence** processes.
+* $H_h(k), H_A(k)$ — **diabatic** tendency (heating/cooling).
+* $J_h(k), J_A(k)$ — **adiabatic nonconservative** tendency.
+* $D_h(k), D_A(k)$ — **diffusive/dissipative** tendency (viscosity, filters).
 
-Terms $H_h(k)$ and $D_h(k)$ are model-physics dependent and therefore omitted here.
+Terms $H_{h,A}(k)$ and $D_{h,A}(k)$ are model-physics dependent and therefore omitted here.
 
 #### Features
 
