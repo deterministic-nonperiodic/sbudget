@@ -8,7 +8,7 @@ from dask.distributed import get_client
 from .cf_coords import get_spatial_dims
 from .constants import earth_radius, epsilon
 from .grid_utils import scale_increments
-from .memory_manager import CacheManager, ensure_optimal_chunking, optimal_batch_size
+from .memory_manager import CacheManager, ensure_optimal_chunking
 
 
 # --------------------------------------------------------------------------------------------------
@@ -226,6 +226,7 @@ def delta_u_cubed_geographic(
 ) -> xr.DataArray:
     """
     Compute (δu ⋅ r̂) |δu|² using angle and distance from geographic scale increments.
+    TODO: investigate w contribution
     """
     ds_increment = ds_shifted - ds
     delta_u = ds_increment["u"]
@@ -316,8 +317,8 @@ def process_single_r_for_field_chunk(
 
 
 def _vectorized_scale_integration(
-    integrand: xr.DataArray,
-    kernel_derivative: xr.DataArray
+        integrand: xr.DataArray,
+        kernel_derivative: xr.DataArray | xr.Dataset
 ) -> xr.DataArray:
     """
     Compute integral over scales using highly-optimized matrix multiplication (GEMM).
@@ -336,47 +337,47 @@ def _vectorized_scale_integration(
         dr[0] = 1.0
 
     kd_s_np = kernel_derivative.values  # shape: (scale, r)
-    
+
     # Create masking matrix (1 where r <= 2 * scale, 0 otherwise)
-    r_grid = r_coords[None, :]          # shape: (1, r)
+    r_grid = r_coords[None, :]  # shape: (1, r)
     scale_grid = scale_coords[:, None]  # shape: (scale, 1)
     mask_matrix = r_grid <= 2 * scale_grid
-    
+
     kd_s_masked = np.where(mask_matrix, kd_s_np, 0.0)
 
-    integrand_np = integrand.values     # shape: (r, ...)
+    integrand_np = integrand.values  # shape: (r, ...)
     shape = integrand_np.shape
     r_dim = shape[0]
     spatial_shape = shape[1:]
-    
+
     # Flatten spatial dimensions for matrix multiplication: (r, N)
     integrand_flat = integrand_np.reshape(r_dim, -1)
-    
+
     # den = sum_r( kd_s * integrand ) -> shape: (scale, N)
     den_flat = kd_s_np @ integrand_flat
-    
+
     # num = sum_r_masked( kd_s * integrand ) -> shape: (scale, N)
     num_flat = kd_s_masked @ integrand_flat
-    
+
     # Retention fraction handles the integral over unbounded domains
     retention_fraction_flat = np.where(den_flat > epsilon, num_flat / den_flat, 1.0)
-    
+
     # integration_matrix applies trapz step width scaling to masked mollifiers
     integration_matrix = kd_s_masked * dr[None, :]  # shape: (scale, r)
-    
+
     # integral = int_r_masked( kd_s * integrand ) -> shape: (scale, N)
     integral_flat = integration_matrix @ integrand_flat
-    
+
     # Adjust for retention fraction
     integral_corrected_flat = integral_flat / retention_fraction_flat
-    
+
     # Reshape back to exactly match our spatial chunk (scale, ...)
     integral_corrected = integral_corrected_flat.reshape(len(scale_coords), *spatial_shape)
 
     out_dims = ["scale"] + list(integrand.dims)[1:]
     out_coords = {"scale": scale_coords}
     for d in out_dims[1:]:
-        out_coords[d] = integrand.coords[d]
+        out_coords[str(d)] = integrand.coords[d]
 
     return xr.DataArray(
         integral_corrected,
@@ -478,19 +479,19 @@ def _block_space_scale_integral(
     # Compute cubed velocity differences for all radial distances: strictly in-memory
     # ------------------------------------------------------------------------------------
     integrand_list = []
-    
+
     for r_value in radial_distance:
         da_r = process_single_r_for_field_chunk(
             field_chunk_ds=field_chunk,
             r_value=float(r_value),
             increments_data=increments_data,
-            x_dim=x_dim, 
+            x_dim=x_dim,
             y_dim=y_dim,
             transform_type=transform_type,
             cache_manager=None
         )
         integrand_list.append(da_r)
-        
+
     if not integrand_list:
         raise ValueError("No radial distances to process.")
 
@@ -503,9 +504,9 @@ def _block_space_scale_integral(
     # Kernel-weighting / masking (Kernel support r <= 2 * scale is guaranteed by construction)
     # Compute integral over scales using highly-optimized matrix multiplication (GEMM)
     # ------------------------------------------------------------------------------------
-    integral = _vectorized_scale_integration(integrand, kernel_derivative)
+    weighted_integral = _vectorized_scale_integration(integrand, kernel_derivative)
 
-    return integral
+    return weighted_integral
 
 
 def scale_transfer(
@@ -593,7 +594,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     ----------
     wind : xr.Dataset
         Dataset containing 3D velocity components (u, v, w).
-    **kwargs : dict
+    **kwargs
         Additional keyword arguments passed to scale_increments and scale_transfer functions.
     Returns
     -------
@@ -611,13 +612,9 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     verbose = kwargs.get("verbose", False)
 
     # Determine spatial coordinate names (legacy support)
-    x_name = kwargs.get("x_coord_name", None)
-    y_name = kwargs.get("y_coord_name", None)
-
-    # Attempt to retrieve coordinates by name
-    if x_name is None and y_name is None:
-        # Infer coordinates using helper (assumes CF compliance)
-        y_name, x_name = get_spatial_dims(wind)
+    y_infer, x_infer = get_spatial_dims(wind)
+    x_name: str = kwargs.get("x_coord_name", x_infer)
+    y_name: str = kwargs.get("y_coord_name", y_infer)
 
     if x_name in wind and y_name in wind:
         x_coord = wind[x_name]
@@ -687,7 +684,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     })
 
     # reassign coordinates from input data
-    energy_transfer_rate = energy_transfer_rate.assign_coords(**{x_name: x_coord, y_name: y_coord})
+    coord_dict = {x_name: x_coord, y_name: y_coord}
+    energy_transfer_rate = energy_transfer_rate.assign_coords(**coord_dict)
 
     # Promote to dataset and transpose to have 'scale' as the last dimension
     energy_transfer_rate = energy_transfer_rate.to_dataset().transpose(..., "scale")
