@@ -625,7 +625,7 @@ def _parse_slurm_memory() -> Optional[float]:
             return float(os.environ["SLURM_MEM"]) / 1024.0
         except ValueError:
             pass
-            
+
     return None
 
 
@@ -654,7 +654,7 @@ def get_worker_memory_limit(mode: str = "worker") -> int:
             worker = get_worker()
             # Handle Dask deprecation: memory_limit moved to memory_manager.memory_limit
             if hasattr(worker, "memory_manager") and hasattr(worker.memory_manager, "memory_limit"):
-                 return int(worker.memory_manager.memory_limit)
+                return int(worker.memory_manager.memory_limit)
             elif hasattr(worker, "memory_limit") and worker.memory_limit:
                 return int(worker.memory_limit)
         except (ValueError, ImportError):
@@ -666,23 +666,23 @@ def get_worker_memory_limit(mode: str = "worker") -> int:
         # If we are in a worker context but couldn't get the worker object,
         # we need to divide the total SLURM memory by the number of tasks
         if mode == "worker":
-             n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
-             return int((slurm_mem_gb * 1024**3) / n_tasks)
-        return int(slurm_mem_gb * 1024**3)
+            n_tasks = int(os.environ.get("SLURM_NTASKS", 1))
+            return int((slurm_mem_gb * 1024 ** 3) / n_tasks)
+        return int(slurm_mem_gb * 1024 ** 3)
 
     # 3. Fallback: System RAM / N_workers
     total_mem = psutil.virtual_memory().total
     n_workers = get_current_worker_count(verbose=False, total=False)
-    
+
     # If we are just checking global capacity (mode="client"), return total
     if mode == "client":
         return total_mem
-        
+
     return int(total_mem / n_workers)
 
 
 def estimate_dataset_bytes(
-        obj: Union[xr.Dataset, xr.Dataset],
+        obj: xr.Dataset | xr.DataArray,
         exclude_dims: Iterable[str] | str | None = None,
         mode: str = "largest_chunk",
 ) -> int:
@@ -834,7 +834,7 @@ def fits_in_memory(
 
     # Use robust memory limit detection
     worker_limit = get_worker_memory_limit(mode=mode)
-    
+
     # Apply safety ratio
     limit = int(worker_limit * ratio_to_use)
 
@@ -1004,8 +1004,8 @@ def ensure_optimal_chunking(
     # Efficiency Constraint: Don't create chunks smaller than min_chunk_mb just for parallelism
     # unless required by memory constraints.
     total_bytes_est = estimate_dataset_bytes(ds, mode="total") * output_scale_mult
-    max_blocks_efficiency = max(1, int(total_bytes_est / (min_chunk_mb * 1024**2)))
-    
+    max_blocks_efficiency = max(1, int(total_bytes_est / (min_chunk_mb * 1024 ** 2)))
+
     # Cap the parallelism target by efficiency
     # We want parallelism, but not if it makes chunks tiny.
     effective_parallel_target = min(target_parallel_blocks, max_blocks_efficiency)
@@ -1056,7 +1056,7 @@ def ensure_optimal_chunking(
                 msg_parts.append(f"{d}={out.sizes.get(d, 'N/A')} (full)")
             else:
                 # Should not happen if _balanced_chunks is used correctly, but keep for robustness
-                msg_parts.append(f"{d}={c}")
+                msg_parts.append(f"{d}={c} ({out.sizes.get(d, 'N/A')})")
         if output_scale_mult > 1:
             msg_parts.append(f"Scale=x{output_scale_mult}")
 

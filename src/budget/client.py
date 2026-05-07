@@ -238,8 +238,12 @@ def _cmd_compute(args) -> None:
         elif mode == "scale_transfer":
             print("[sbudget] Starting inter-scale transfer calculation...")
 
-            # Extract kwargs for scale_increments
-            kwargs = {"scales": getattr(cfg.compute, "scales", None), "verbose": True}
+            # Extract kwargs for scale_increments and scale_transfer
+            kwargs = {
+                "scales": getattr(cfg.compute, "scales", None), 
+                "verbose": True,
+                "p": getattr(cfg.compute, "shape_parameter", 1)
+            }
             # Compute scale-transfers
             out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
         else:
@@ -338,6 +342,9 @@ def main(argv: list[str] | None = None) -> None:
     p_compute.add_argument("--dy", type=float, help="Grid spacing in y-direction (meters).")
     p_compute.add_argument("--transfer-form", choices=["invariant", "flux", "conservative"],
                            help="Formulation of transfer term to compute.")
+                           
+    p_compute.add_argument("--shape-parameter", type=float,
+                           help="Shape parameter p for the mollifier filter. Default is 1.")
 
     # user-exposed argument:
     p_compute.add_argument(

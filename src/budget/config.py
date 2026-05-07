@@ -26,6 +26,7 @@ class ComputeConfig:
     dx: float | None = None
     dy: float | None = None
     transfer_form: str | None = "flux"  # one of ["invariant", "flux"]
+    shape_parameter: float = 1.0  # Shape parameter p for the mollifier filter
     cumulative: bool = True  # Aggregate scale transfers cumulatively up to each scale
     rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
     scheduler: str | None = "distributed"  # dask scheduler type: "distributed" or "threads"
@@ -135,6 +136,10 @@ def apply_overrides(cfg, args):
         _set_nested(cfg, ["compute", "cumulative"], bool(cum))
 
     _set_nested(cfg, ["compute", "transfer_form"], _get(args, "transfer_form"))
+
+    sp = _get(args, "shape_parameter")
+    if sp is not None:
+        _set_nested(cfg, ["compute", "shape_parameter"], float(sp))
 
     rs = _get(args, "rechunk_spatial")
     if rs is not None:
