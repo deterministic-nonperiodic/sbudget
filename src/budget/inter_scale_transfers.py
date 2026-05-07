@@ -14,10 +14,11 @@ from .memory_manager import CacheManager, ensure_optimal_chunking
 # --------------------------------------------------------------------------------------------------
 # -----------------------          Kernel Implementation           ---------------------------------
 # --------------------------------------------------------------------------------------------------
-def _evaluate_mollifier(radial_positions: np.ndarray, length_scales: np.ndarray) -> np.ndarray:
+def _evaluate_mollifier(radial_positions: np.ndarray, length_scales: np.ndarray,
+                        p: float = 1.0) -> np.ndarray:
     """
     Evaluate the standard mollifier kernel for all combinations of
-    radial distances and filter length scales.
+    radial distances and filter length scales, generalized with a shape parameter p.
 
     Returns
     -------
@@ -25,8 +26,10 @@ def _evaluate_mollifier(radial_positions: np.ndarray, length_scales: np.ndarray)
     """
     r_grid, ell_grid = np.meshgrid(radial_positions, length_scales, indexing="ij")
     ratio_squared = (r_grid / (2 * ell_grid)) ** 2
+
+    ratio_2p = ratio_squared ** p if p != 1 else ratio_squared
     inside_support = ratio_squared < 1
-    denominator = 1 - ratio_squared
+    denominator = 1 - ratio_2p
 
     mollifier = np.zeros_like(denominator)
     mollifier[inside_support] = np.exp(-1.0 / denominator[inside_support])
@@ -35,28 +38,59 @@ def _evaluate_mollifier(radial_positions: np.ndarray, length_scales: np.ndarray)
 
 
 def _evaluate_mollifier_derivative(radial_positions: np.ndarray,
-                                   length_scales: np.ndarray) -> np.ndarray:
+                                   length_scales: np.ndarray,
+                                   p: float = 1.0) -> np.ndarray:
     """
     Evaluate the radial derivative of the standard mollifier for all combinations of
-    radial distances and filter length scales.
+    radial distances and filter length scales, generalized with a shape parameter p.
 
     Returns
     -------
     derivative : np.ndarray of shape (n_scales, n_r)
     """
     r_grid, ell_grid = np.meshgrid(radial_positions, length_scales, indexing="ij")
-    ratio_squared = (r_grid / (2 * ell_grid)) ** 2
+    ratio = r_grid / (2 * ell_grid)
+    ratio_squared = ratio ** 2
+
+    ratio_2p = ratio_squared ** p if p != 1 else ratio_squared
     inside_support = ratio_squared < 1
-    denominator = 1 - ratio_squared
+    denominator = 1 - ratio_2p
+
+    f_prime = -2 * p * (ratio ** (2 * p - 1)) / (2 * ell_grid)
 
     derivative = np.zeros_like(denominator)
     derivative[inside_support] = (
-            -r_grid[inside_support] / (2 * ell_grid[inside_support] ** 2)
+            f_prime[inside_support]
             * np.exp(-1.0 / denominator[inside_support])
             / denominator[inside_support] ** 2
     )
 
     return derivative.T  # final shape: (n_scales, n_r)
+
+
+def _compute_half_power_cutoff(p_val: float) -> float:
+    """Dynamically compute the normalized half-power cutoff wavenumber (kc * ell)."""
+    import scipy.integrate as integrate
+    from scipy.special import j0
+    from scipy.optimize import root_scalar
+
+    # Use normalized ell=1 for calculation
+    r = np.linspace(0, 2.0, 5000)
+    
+    # Get spatial kernel using the production function
+    G = _evaluate_mollifier(r, np.array([1.0]), p=p_val)[0, :]
+    
+    # Normalize
+    norm = np.trapz(G * 2 * np.pi * r, r)
+    G /= norm
+    
+    # Function to find root of: |G_hat(k)|^2 - 0.5 = 0
+    def power_diff(k):
+        integrand = G * j0(k * r) * 2 * np.pi * r
+        return np.trapz(integrand, r)**2 - 0.5
+        
+    res = root_scalar(power_diff, bracket=[0.1, 5.0], method='brentq')
+    return float(res.root)
 
 
 def _get_mollifier_norm(mollifier: xr.DataArray, method: str, r_name: str = "r") -> xr.DataArray:
@@ -84,7 +118,7 @@ def _get_mollifier_norm(mollifier: xr.DataArray, method: str, r_name: str = "r")
 
 def get_integration_kernels(r_da: xr.DataArray, scales: xr.DataArray,
                             normalization="2D", scaled=False,
-                            return_derivative=True) -> xr.DataArray:
+                            return_derivative=True, p: int = 2) -> xr.DataArray:
     """
     Compute mollifier kernels and optionally their derivatives over a set of radial distances
     and filter length scales. Uses a fully vectorized implementation.
@@ -101,6 +135,8 @@ def get_integration_kernels(r_da: xr.DataArray, scales: xr.DataArray,
         Whether to scale the kernel by r for integration
     return_derivative : bool
         Whether to compute the derivative dG/dr
+    p : int
+        Shape parameter for the mollifier kernel. Default is 1.
 
     Returns
     -------
@@ -119,7 +155,7 @@ def get_integration_kernels(r_da: xr.DataArray, scales: xr.DataArray,
     kernel_name = "G_kernel"
 
     kernel = xr.DataArray(
-        _evaluate_mollifier(radial_positions, length_scales),
+        _evaluate_mollifier(radial_positions, length_scales, p=p),
         dims=[s_name, r_name], coords={s_name: scales, r_name: r_da}
     )
 
@@ -130,7 +166,7 @@ def get_integration_kernels(r_da: xr.DataArray, scales: xr.DataArray,
         kernel_name = "dG_dr_kernel"
         # Get the mollifier kernel's derivative
         kernel = xr.DataArray(
-            _evaluate_mollifier_derivative(radial_positions, length_scales),
+            _evaluate_mollifier_derivative(radial_positions, length_scales, p=p),
             dims=[s_name, r_name], coords={s_name: scales, r_name: r_da}
         )
 
@@ -519,6 +555,7 @@ def scale_transfer(
         name: str = "energy_transfer",
         transform_type: str = "delta_u_cubed",
         weighting: str = "sphere",
+        p: int = 1,
         verbose: bool = False
 ) -> xr.DataArray:
     """
@@ -564,6 +601,7 @@ def scale_transfer(
         radial_distance, length_scale,
         normalization=weighting,
         scaled=True, return_derivative=True,
+        p=p
     ).compute()
 
     # ------------------------------------------------------------
@@ -671,6 +709,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         name="energy_transfer",
         x_dim=x_name, y_dim=y_name,
         weighting="sphere",
+        p=kwargs.get("p", 1),
         verbose=verbose
     )
 
@@ -686,6 +725,36 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # reassign coordinates from input data
     coord_dict = {x_name: x_coord, y_name: y_coord}
     energy_transfer_rate = energy_transfer_rate.assign_coords(**coord_dict)
+
+    # ----------------------------------------------------------------------------
+    # Add equivalent spectral coordinates to allow direct comparison with spectral budgets
+    # The 2D Hankel transform of the mollifier kernel drops to half-power at a
+    # normalized wavenumber k_c * ell that depends on the kernel's shape parameter p.
+    # ----------------------------------------------------------------------------
+    p_val = float(kwargs.get("p", 1.0))
+    kc_ell = _compute_half_power_cutoff(p_val)
+    
+    lambda_factor = 2 * np.pi / kc_ell
+
+    equivalent_wavelength = lambda_factor * length_scale
+    equivalent_wavenumber = 2 * np.pi / equivalent_wavelength
+
+    energy_transfer_rate = energy_transfer_rate.assign_coords(
+        equivalent_wavelength=("scale", equivalent_wavelength.data),
+        equivalent_wavenumber=("scale", equivalent_wavenumber.data)
+    )
+
+    energy_transfer_rate["equivalent_wavenumber"].attrs.update({
+        "units": "rad / m",
+        "long_name": "Equivalent Spectral Cutoff Wavenumber",
+        "description": f"Estimated half-power spectral cutoff wavenumber (k_c = {kc_ell} / scale) for the 2D mollifier (p={p_val})."
+    })
+
+    energy_transfer_rate["equivalent_wavelength"].attrs.update({
+        "units": "m",
+        "long_name": "Equivalent Spectral Wavelength",
+        "description": "Equivalent spectral wavelength calculated as 2*pi / equivalent_wavenumber."
+    })
 
     # Promote to dataset and transpose to have 'scale' as the last dimension
     energy_transfer_rate = energy_transfer_rate.to_dataset().transpose(..., "scale")
