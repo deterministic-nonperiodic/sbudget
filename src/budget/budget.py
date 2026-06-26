@@ -12,6 +12,7 @@ from .numeric_tools import horizontal_divergence, relative_vorticity
 from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize
 from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
 from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
+from .thermodynamics import hydrostatic_exner_function
 
 # --------------------------------------------------------------------------------------------------
 # Global spectral options
@@ -716,11 +717,10 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     j_ape = isotropize(j_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE WORK & CONVERSION (vf_pres, vfd_pres, cad) ---
-    # Assuming Exner function and domain_mean are available
-    exner = exner_function(pressure) - exner_function(domain_mean(pressure))
+    exner_prime = exner_function(pressure) - hydrostatic_exner_function(theta_mean)
 
     # Pressure Flux (vf_pres)
-    vf_pres_2d = pressure_flux(theta_mean, w, exner, name="vf_pres")
+    vf_pres_2d = pressure_flux(theta_mean, w, exner_prime, name="vf_pres")
     vf_pres = isotropize(vf_pres_2d, dx, dy, cumulative=cumulative)
 
     # Pressure Flux Divergence (vfd_pres)
@@ -728,10 +728,10 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     vfd_pres = isotropize(vfd_pres_2d, dx, dy, cumulative=cumulative)
 
     # Conversion (cad, caz)
-    cad_2d = conversion_ape_to_dke(theta_mean, w, exner, name="cad")
+    cad_2d = conversion_ape_to_dke(theta_mean, w, exner_prime, name="cad")
     cad = isotropize(cad_2d, dx, dy, cumulative=cumulative)
 
-    caz_2d = conversion_ape_to_vke(theta_mean, theta_prime, w, exner, name="caz")
+    caz_2d = conversion_ape_to_vke(theta_mean, theta_prime, w, exner_prime, name="caz")
     caz = isotropize(caz_2d, dx, dy, cumulative=cumulative)
 
     # --- HORIZONTAL KE DIVERGENCE (div_hke) ---

@@ -1,0 +1,39 @@
+# IDE / editors
+.idea/
+.vscode/
+
+# Tests (scripts, not a package)
+tests/
+
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data and logs (large / generated files)
+data/
+logs/
+
+# Development scratch
+dev/
+docs/
+
+# Config files with local paths
+origin_config.yaml
+vortex_config.yaml
+
+# Misc
+*.DS_Store

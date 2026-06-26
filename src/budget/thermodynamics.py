@@ -2,6 +2,7 @@ from typing import Union, Literal
 
 import numpy as np
 import xarray as xr
+from scipy.integrate import cumulative_trapezoid
 
 from . import constants as cn
 from .cf_coords import _is_z
@@ -173,3 +174,68 @@ def lorenz_parameter(
         N2 = brunt_vaisala_squared(theta, vertical_dim=vertical_dim, edge_order=edge_order)
     
     return cn.g**2 / (N2 * theta**2)
+
+
+def hydrostatic_exner_function(
+    theta: xr.DataArray,
+    pi_sfc: xr.DataArray,
+    vertical_dim: str = "z",
+    name: str = "exner_hydrostatic",
+) -> xr.DataArray:
+    """
+    Compute the hydrostatic Exner pressure Π(z) by upward integration.
+
+    Uses the hydrostatic relation
+
+        ∂Π/∂z = -g / (c_p · θ)
+
+    integrated from the surface upward with the boundary condition Π(z=0) = pi_sfc.
+
+    Parameters
+    ----------
+    theta : xr.DataArray
+        Potential temperature [K].  May be chunked with Dask.
+    pi_sfc : xr.DataArray
+        Surface Exner pressure (dimensionless), broadcast-compatible with theta.
+    vertical_dim : str
+        Name of the height coordinate (default ``"z"``).  Coordinates may be
+        in either ascending or descending order; orientation is handled internally.
+    name : str
+        Name assigned to the returned DataArray.
+
+    Returns
+    -------
+    xr.DataArray
+        Hydrostatic Exner pressure on the same grid as *theta*.
+    """
+    # Sort to ascending so integration always proceeds from surface upward;
+    # remember the original coordinate order to restore it afterwards.
+    original_order = theta[vertical_dim]
+    theta_sorted = theta.sortby(vertical_dim)
+
+    # Cumulative integration requires a single contiguous chunk along the vertical
+    if hasattr(theta_sorted.data, "chunks"):
+        theta_sorted = theta_sorted.chunk({vertical_dim: -1})
+
+    # Integrand: ∂Π/∂z = -g / (c_p · θ)
+    integrand = -(cn.g / cn.cp) / theta_sorted
+
+    # Named inner function closes over z; apply_ufunc operates on the last axis
+    z = theta_sorted[vertical_dim].values
+
+    def _integrate(f: np.ndarray) -> np.ndarray:
+        return cumulative_trapezoid(f, x=z, axis=-1, initial=0)
+
+    cum_integral = xr.apply_ufunc(
+        _integrate,
+        integrand,
+        input_core_dims=[[vertical_dim]],
+        output_core_dims=[[vertical_dim]],
+        dask="parallelized",
+        output_dtypes=[float],
+    )
+
+    # Apply surface boundary condition, then label-reindex to the original order
+    pi = (pi_sfc + cum_integral).sel({vertical_dim: original_order})
+
+    return pi.rename(name)
