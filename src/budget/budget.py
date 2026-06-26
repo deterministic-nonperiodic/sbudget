@@ -717,7 +717,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     j_ape = isotropize(j_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE WORK & CONVERSION (vf_pres, vfd_pres, cad) ---
-    exner_prime = exner_function(pressure) - hydrostatic_exner_function(theta_mean)
+    exner = exner_function(pressure)
+    exner_surface = domain_mean(exner.sel(z=exner.z.min()))
+    exner_prime = exner - hydrostatic_exner_function(theta_mean, pi_sfc=exner_surface)
 
     # Pressure Flux (vf_pres)
     vf_pres_2d = pressure_flux(theta_mean, w, exner_prime, name="vf_pres")
