@@ -20,7 +20,7 @@ _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git
                  'references': '', 'Conventions': 'CF-1.6'}
 
 
-def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
+def ensure_vertical_consistent(ds: xr.Dataset | xr.DataArray, target_name="z") -> xr.Dataset:
     """Interpolate to common vertical levels"""
 
     if target_name not in ds.coords:
@@ -49,34 +49,63 @@ def ensure_vertical_consistent(ds: xr.Dataset, target_name="z") -> xr.Dataset:
     return ds
 
 
-def _report_var_existence(raw: xr.Dataset, cfg) -> str:
-    """Create a plain-text report showing whether configured variables exist in the raw dataset.
+# Variables required in the dataset (after logical renaming) for each compute mode.
+# For spectral_budget the thermodynamic variables are needed; for scale_transfer only
+# the velocity components are required.
+_REQUIRED_VARS: dict[str, list[str]] = {
+    "spectral_budget": ["u", "v", "w", "pressure"],
+    "scale_transfer": ["u", "v", "w"],
+}
 
-    Checks both the *actual* names provided under cfg.variables and, after renaming,
-    validates the presence of the *logical* names our code expects.
+# Variables that satisfy an OR-group: at least one must be present.
+# key → tuple of logical names where any one is sufficient.
+_REQUIRED_ANY: dict[str, tuple[str, ...]] = {
+    "spectral_budget": ("theta", "temperature"),
+}
+
+
+def _check_required_variables(ds: xr.Dataset, cfg) -> None:
+    """Raise *ValueError* if variables required for *cfg.compute.mode* are absent.
+
+    Called after variable renaming so ``ds`` already uses logical names.
+    Always enforced (not gated on *verbose*).
     """
-    lines = []
+    mode = str(getattr(cfg.compute, "mode", "spectral_budget")).strip()
+
+    required = _REQUIRED_VARS.get(mode, [])
+    missing = [v for v in required if v not in ds]
+    if missing:
+        raise ValueError(
+            f"[I/O] Mode '{mode}' requires variable(s) {missing} but they are absent "
+            f"from the dataset.  Check cfg.variables mapping."
+        )
+
+    # OR-group: at least one of the alternatives must be present
+    or_group = _REQUIRED_ANY.get(mode)
+    if or_group and not any(v in ds for v in or_group):
+        raise ValueError(
+            f"[I/O] Mode '{mode}' requires at least one of {list(or_group)} "
+            f"but none are present.  Provide 'theta' or both 'pressure' and 'temperature'."
+        )
+
+
+def _report_var_existence(ds: xr.Dataset, cfg) -> str:
+    """Return a plain-text table of configured variables and their presence in *ds*.
+
+    *ds* should already have variables renamed to logical names.
+    """
     mapping = cfg.variables or {}
-    # 1) Check actual names against the raw dataset
-    lines.append("[I/O] Configured variables (actual names) in file:\n")
+    lines = ["[I/O] Variable mapping (logical ← configured actual):\n"]
     for logical, actual in mapping.items():
-        exists = (actual in raw.data_vars) or (actual in raw.coords)
-        status = "OK" if exists else "MISSING"
+        present = logical in ds
+        status = "OK" if present else "MISSING"
         hint = ""
-        if not exists:
-            guess = _cf_guess(raw, logical)
+        if not present:
+            guess = _cf_guess(ds, logical)
             if guess:
-                hint = f"  (hint: possible '{logical}' → '{guess}' by CF)"
+                hint = f"  (hint: '{logical}' may correspond to '{guess}' by CF convention)"
         lines.append(f"[I/O]  - {logical:11s} ← {actual:20s} : {status}{hint}\n")
-
-    # 2) Minimal logical requirements after renaming
-    required = ["u", "v", "w"]
-    lines.append("[I/O] Logical requirements: ")
-    for key in required:
-        lines.append(f"  - {key} : required")
-    lines.append("  - theta : preferred (else need pressure + temperature)")
-
-    return " ".join(lines)
+    return "".join(lines)
 
 
 def open_dataset(cfg, verbose=False) -> xr.Dataset:
@@ -95,16 +124,16 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
           vorticity: vor   # optional, else computed
     """
     p = cfg.input.path
-    
+
     # Optimize chunking: Request full spatial slices immediately to avoid expensive rechunking later.
     # We hint standard spatial names. If they don't exist, xarray ignores them.
     # Non-spatial dims (time, z) are left to 'auto' or default.
     initial_chunks = {
-        "lat": -1, "lon": -1,   # Standard geographical
-        "x": -1, "y": -1,       # Cartesian
-        "latitude": -1, "longitude": -1 # Long form
+        "lat": -1, "lon": -1,  # Standard geographical
+        "x": -1, "y": -1,  # Cartesian
+        "latitude": -1, "longitude": -1  # Long form
     }
-    
+
     if str(p).endswith(".zarr"):
         ds = xr.open_zarr(p, chunks=initial_chunks)
     else:
@@ -114,10 +143,6 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
     # unify data type
     ds = ds.astype("float32")
 
-    if verbose:
-        report = _report_var_existence(ds, cfg)
-        print(report)
-
     # Rename dataset variables to logical names used by the code
     rename = {}
     for logical, actual in (cfg.variables or {}).items():
@@ -125,6 +150,13 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
             rename[actual] = logical
     if rename:
         ds = ds.rename(rename)
+
+    # Always validate required variables for the requested mode (operates on logical names)
+    _check_required_variables(ds, cfg)
+
+    if verbose:
+        report = _report_var_existence(ds, cfg)
+        print(report)
 
     # Normalize coordinate names to standard ones
     z_name, y_name, x_name = cfg.input.dims

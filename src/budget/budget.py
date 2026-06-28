@@ -11,8 +11,8 @@ from .numeric_tools import horizontal_advection, horizontal_gradient
 from .numeric_tools import horizontal_divergence, relative_vorticity
 from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize
 from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
-from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
 from .thermodynamics import hydrostatic_exner_function
+from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
 
 # --------------------------------------------------------------------------------------------------
 # Global spectral options
@@ -605,20 +605,19 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # ----------------------------------------------------------------------------
     # --- Thermodynamics computations ---
     # ----------------------------------------------------------------------------
+    # pressure is guaranteed present by open_dataset's mode validation
+    pressure = ds["pressure"]
+    rho = ds.get("density")
     theta = ds.get("theta")
-    pressure = ds.get("pressure")
-    temperature = ds.get("temperature")
-    rho = ds.get("density", None)
+    exner = exner_function(pressure)
 
-    if theta is None and pressure is not None:
-        if temperature is None:
-            raise ValueError("Provide either 'theta' or both 'pressure' and 'temperature'.")
-        # compute potential temperature
-        theta = potential_temperature(pressure, temperature)
+    if theta is None:
+        # temperature must be present (validated upstream)
+        theta = potential_temperature(pressure, ds["temperature"])
 
     if rho is None:
-        # Assuming density function takes pressure and temperature inputs
-        rho = density(pressure, temperature)
+        # density() needs temperature; recover it from theta if not directly available
+        rho = density(pressure, ds["temperature"] if "temperature" in ds else theta * exner)
 
     divergence = ds.get("divergence", None)
     vorticity = ds.get("vorticity", None)
@@ -628,6 +627,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         divergence = horizontal_divergence(u, v)
         vorticity = relative_vorticity(u, v)
 
+    # Split into mean and fluctuations
     theta_mean = domain_mean(theta)
     theta_prime = theta - theta_mean
     gamma = lorenz_parameter(theta_mean)
@@ -717,7 +717,6 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     j_ape = isotropize(j_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE WORK & CONVERSION (vf_pres, vfd_pres, cad) ---
-    exner = exner_function(pressure)
     exner_surface = domain_mean(exner.sel(z=exner.z.min()))
     exner_prime = exner - hydrostatic_exner_function(theta_mean, pi_sfc=exner_surface)
 
