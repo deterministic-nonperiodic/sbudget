@@ -125,33 +125,60 @@ of $O(N_{\rm shifts}\, N)$ for a direct sum over shifts. Measured on UA-ICON nes
 better than $10^{-5}$) for periodic, reflect, mixed and edge/symmetric boundaries. A
 `constant` (NaN-filled) boundary falls back to a direct sum over shift-distance bins.
 
-#### Divergent flow: $\mathcal{T}^c_\ell$ (`--divergence-correction`)
+#### Counterpart of the spectral transfer: $\mathcal{T}^*_\ell$ (`--divergence-correction`, `--vertical-advection`)
 
 $\mathcal{T}_\ell$ closes the local budget of the mixed energy $\tfrac12\mathbf{u}\cdot\bar{\mathbf{u}}$
-only for non-divergent horizontal flow. With $\delta = \partial_x u + \partial_y v \neq 0$ and the
-skew-symmetric (energy-conserving) advection $N_j = (\mathbf{U}\cdot\nabla_h)u_j + \tfrac12\delta u_j$,
-whose spectrum is the flux-form $\Pi_h$ of the spectral budget, the exact local identity is
+only for non-divergent flow advected horizontally. The spectral budget's nonlinear transfer uses
+the flux (skew-symmetric) form of the advection,
 
-$$-\tfrac12\left[\bar{\mathbf{u}}\cdot\mathbf{N} + \mathbf{u}\cdot\bar{\mathbf{N}}\right]
-= -\nabla_h\cdot\mathbf{J}_\ell - \mathcal{T}^c_\ell, \qquad
-\mathcal{T}^c_\ell = \mathcal{T}_\ell - C_\ell,$$
+$$\mathbf{N} = (\mathbf{U}\cdot\nabla_h)\mathbf{u} + \tfrac12\,\delta\,\mathbf{u}
++ \tfrac12\left[w\,\partial_z\mathbf{u} + \partial_z(w\,\mathbf{u})\right], \qquad
+\delta = \partial_x u + \partial_y v,$$
+
+and its physical-space counterpart is $\mathcal{T}^*_\ell = \mathcal{T}_\ell - C_\ell + V_\ell$ with
 
 $$C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}}
-- \tfrac14\,|\mathbf{u}|^2\,\bar\delta - \tfrac14\,\delta\,\overline{|\mathbf{u}|^2}
-= -\tfrac18\int G_\ell(\mathbf{r})\left[(\delta(\mathbf{x})+\delta(\mathbf{x}+\mathbf{r}))\,|\delta\mathbf{u}|^2
-- \delta[\delta]\,\delta[|\mathbf{u}|^2]\right]\mathrm{d}^2\mathbf{r},$$
+- \tfrac14\,|\mathbf{u}|^2\,\bar\delta - \tfrac14\,\delta\,\overline{|\mathbf{u}|^2}, \qquad
+V_\ell = \tfrac12\,w\left(\bar{\mathbf{U}}\cdot\partial_z\mathbf{U} - \mathbf{U}\cdot\partial_z\bar{\mathbf{U}}\right),$$
 
-with $\mathbf{J}_\ell$ the Duchon–Robert flux and the bar the same lattice filter. The domain mean
-of $\mathcal{T}^c_\ell$ is therefore the kernel-weighted flux-form spectral transfer
-$\sum_k T(k)\,[1-\hat G(k\ell)]$. $C_\ell$ (the dilatational exchange) vanishes for $\delta = 0$;
-unlike $\mathcal{T}_\ell$, it depends on a uniform background velocity when $\delta \neq 0$, as the
-flux-form $\Pi_h$ does. The option adds `energy_transfer_divergent` ($\mathcal{T}^c_\ell$) to the
-output; `energy_transfer` is unchanged. $\delta$ is computed from $(u, v)$ with the same finite
-differences as the spectral budget. Cost: $2n+2$ extra inverse FFTs per plane and scale ($n$
-velocity components). Tests: the FFT evaluation of $C_\ell$ equals its increment form to
-$10^{-4}$ (any boundary), and the local identity above closes to $4\times10^{-4}$ of
-$\max|\mathcal{T}_\ell|$ (lattice quadrature) for strongly divergent periodic fields, where plain
-$\mathcal{T}_\ell$ leaves a residual of order one.
+(bar: the same lattice filter as $\mathcal{T}_\ell$; $\mathbf{U} = (u, v)$). $C_\ell$, the dilatational
+exchange, follows from the Duchon–Robert derivation without $\delta = 0$; locally
+$-\tfrac12[\bar{\mathbf{u}}\cdot\mathbf{N}_h + \mathbf{u}\cdot\bar{\mathbf{N}}_h] = -\nabla_h\cdot\mathbf{J}_\ell
+- (\mathcal{T}_\ell - C_\ell)$ exactly. $V_\ell$, the vertical exchange, is what remains of the
+vertical advection after the vertical flux $\tfrac12 w\,\mathbf{U}\cdot\bar{\mathbf{U}}$. On a periodic
+domain the domain mean of $\mathcal{T}^*_\ell$ equals the kernel-weighted spectral transfer
+$\sum_k T(k)\,[1-\hat G(k\ell)]$. Use `--increment-components u,v` for the counterpart of the HKE
+transfer $\Pi_h$. The output gains `energy_transfer_corrected`; `energy_transfer` is unchanged.
+$\delta$ and $\partial_z\mathbf{u}$ use the finite differences of the spectral budget ($\partial_z$
+on the full column, before `--levels` is applied).
+
+`--perturbation` removes the level-mean horizontal wind first. $\mathcal{T}_\ell$ does not change,
+but $C_\ell$, $V_\ell$ and the flux-form spectral transfer are not Galilean invariant: a mean wind
+$\mathbf{c}$ couples to every wavenumber through $\tfrac12\delta\,\mathbf{c}$ and $w\,\partial_z\mathbf{c}$
+(exchange with the mean flow, not between scales), so the transfer itself depends on the frame.
+Compare $\mathcal{T}^*_\ell$ with a spectral transfer computed from the same fields. On an open
+limited-area domain the mean of the mixed-energy tendency $\langle\bar{\mathbf{u}}\cdot\mathbf{N}\rangle$
+contains the boundary flux $\langle\nabla_h\cdot\mathbf{J}_\ell\rangle$ of the mean wind, but neither
+$\langle\mathcal{T}^*_\ell\rangle$ nor the FFT-based spectral transfer does, so they still agree.
+
+Derivation in brief: (i) expanding $(\mathbf{b}-\mathbf{a})|\mathbf{b}-\mathbf{a}|^2$ with
+$\int\nabla G = 0$ gives $4\mathcal{T}_\ell = -\nabla_h\cdot\overline{\mathbf{u}|\mathbf{u}|^2}
++ 2u_j\partial_i\overline{u_iu_j} - |\mathbf{u}|^2\bar\delta + \mathbf{u}\cdot\nabla_h\overline{|\mathbf{u}|^2}
+- 2u_iu_j\partial_i\bar u_j$ for any $\delta$; eliminating the same combination from the advective
+tendency of $E_\ell$ written with $(\mathbf{u}\cdot\nabla_h)\mathbf{u} = \nabla_h\cdot(\mathbf{u}\otimes\mathbf{u})
+- \delta\mathbf{u}$ leaves $C_\ell$. (ii) $t_h + \partial_z F_h = -(\mathbf{u},\mathbf{N})_k$ with
+$F_h = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, and $\langle\mathbf{a}\cdot\bar{\mathbf{b}}\rangle =
+\sum_k(\mathbf{a},\mathbf{b})_k\hat G_\ell(k)$, give $\sum_k t_h[1-\hat G_\ell] =
+\langle\bar{\mathbf{u}}\cdot\mathbf{N}\rangle - \tfrac12\partial_z\langle w\,\mathbf{u}\cdot\bar{\mathbf{u}}\rangle$.
+(iii) $\bar{\mathbf{u}}\cdot\mathbf{N}_v = \partial_z(\tfrac12 w\,\mathbf{u}\cdot\bar{\mathbf{u}}) + V_\ell$.
+
+Tests (`tests/test_synthetic_budget.py`): the FFT evaluation of $C_\ell$ equals its increment form
+to $10^{-4}$ (reflect, periodic, edge/symmetric boundaries); the local identity above closes to
+$4\times10^{-4}$ of $\max|\mathcal{T}_\ell|$; with divergent flow, vertical advection and a
+background wind, the domain mean of $\mathcal{T}^*_\ell$ equals an independent Fourier-space
+computation of the kernel-weighted transfer to $2\times10^{-4}$ ($\ell = 5\,\Delta x$),
+$10^{-5}$ ($8\,\Delta x$) and $2\times10^{-6}$ ($12\,\Delta x$), where $\mathcal{T}_\ell$ alone
+gives 0–12% of it. Cost: up to $2n+4$ extra inverse FFTs per plane and scale.
 
 ### References:
 

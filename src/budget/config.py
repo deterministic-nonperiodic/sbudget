@@ -147,6 +147,18 @@ def apply_overrides(cfg, args):
     if dc is not None:
         _set_nested(cfg, ["compute", "divergence_correction"], bool(dc))
 
+    pt = _get(args, "perturbation")
+    if pt is not None:
+        _set_nested(cfg, ["compute", "perturbation"], bool(pt))
+
+    va = _get(args, "vertical_advection")
+    if va is not None:
+        _set_nested(cfg, ["compute", "vertical_advection"], bool(va))
+
+    ic = _get(args, "increment_components")
+    if ic:
+        _set_nested(cfg, ["compute", "increment_components"], [str(c) for c in ic])
+
     rs = _get(args, "rechunk_spatial")
     if rs is not None:
         _set_nested(cfg, ["compute", "rechunk_spatial"], bool(rs))

@@ -282,6 +282,10 @@ def _cmd_compute(args) -> None:
                 "p": getattr(cfg.compute, "shape_parameter", 1),
                 "divergence_correction": bool(getattr(cfg.compute, "divergence_correction",
                                                       False)),
+                "vertical_advection": bool(getattr(cfg.compute, "vertical_advection", False)),
+                "increment_components": getattr(cfg.compute, "increment_components", None),
+                # the reader has already removed the level mean (see io_utils.open_dataset)
+                "perturbation": False,
             }
             # Compute scale-transfers
             out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
@@ -415,9 +419,23 @@ def main(argv: list[str] | None = None) -> None:
                    "Skip spatial rechunking (faster, less stable for FFT).")
 
     _add_bool_pair(p_compute, "divergence-correction", "divergence_correction",
-                   "scale_transfer: also output the divergence-corrected transfer "
-                   "(energy_transfer_divergent).",
-                   "scale_transfer: Duchon-Robert transfer only (default).")
+                   "scale_transfer: subtract the dilatational exchange C_ell of horizontally "
+                   "divergent flow (output energy_transfer_corrected).",
+                   "scale_transfer: no divergence correction (default).")
+
+    _add_bool_pair(p_compute, "vertical-advection", "vertical_advection",
+                   "scale_transfer: add the vertical exchange V_ell of vertical advection "
+                   "(output energy_transfer_corrected; needs w).",
+                   "scale_transfer: no vertical-advection term (default).")
+
+    _add_bool_pair(p_compute, "perturbation", "perturbation",
+                   "scale_transfer: remove the level-mean horizontal wind before computing "
+                   "(transfer among perturbations; D_ell is unchanged, its corrections are not).",
+                   "scale_transfer: use the full wind (default).")
+
+    p_compute.add_argument("--increment-components", type=_csv_or_list,
+                           help="scale_transfer: velocity components in the increments, e.g. "
+                                "'u,v' for the counterpart of the HKE transfer (default: all).")
 
     _add_bool_pair(p_compute, "client", "client",
                    "Execute local cluster with active dask client (default).",

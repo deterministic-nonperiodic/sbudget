@@ -11,7 +11,7 @@ from dask.diagnostics import ProgressBar
 from dask.distributed import progress
 
 from .cf_coords import _cf_guess
-from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter
+from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter, get_spatial_dims
 from .cf_coords import convert_units, check_convert_units
 from .memory_manager import CacheManager
 
@@ -235,6 +235,19 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
     # spectral budget also keeps the native half-level w for the staggered vertical operators.
     ds = ensure_vertical_consistent(ds, target_name='z',
                                     keep_native_w=(mode == "spectral_budget"))
+
+    # Perturbation frame for scale_transfer: remove the level-mean horizontal wind first, so
+    # that ∂z below is the derivative of the perturbation
+    if mode == "scale_transfer" and getattr(cfg.compute, "perturbation", False):
+        y_d, x_d = get_spatial_dims(ds)
+        ds["u"] = ds["u"] - ds["u"].mean((y_d, x_d))
+        ds["v"] = ds["v"] - ds["v"].mean((y_d, x_d))
+
+    # The vertical-advection term of scale_transfer needs ∂z u, ∂z v on the selected levels:
+    # differentiate the full column first (same centred operator as the spectral budget)
+    if mode == "scale_transfer" and getattr(cfg.compute, "vertical_advection", False):
+        ds["dzu"] = ds["u"].differentiate("z", edge_order=2)
+        ds["dzv"] = ds["v"].differentiate("z", edge_order=2)
 
     # select specified vertical levels
     if levels is not None and mode == "scale_transfer":
