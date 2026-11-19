@@ -384,6 +384,47 @@ def process_single_r_for_field_chunk(
     return integrand.expand_dims(r=[r_value])
 
 
+# Keyword arguments of scale_increments() that define the shift geometry
+_GEOMETRY_KWARGS = ("scales", "max_r", "resolution_factor", "min_valid_shifts", "exact_factor",
+                    "x_coord_boundary", "y_coord_boundary")
+
+# Per-process cache of resolved geometries, keyed by a hash of the recipe
+_GEOMETRY_CACHE: Dict[str, Dict] = {}
+_GEOMETRY_LOCK = threading.Lock()
+
+
+def _geometry_spec(x_coord: xr.DataArray, y_coord: xr.DataArray, kwargs: Dict) -> Dict:
+    """Small, picklable recipe for the shift geometry (coordinates + defining keywords)."""
+    import hashlib
+    import pickle
+
+    recipe = {
+        "x": (x_coord.name, np.asarray(x_coord.values), dict(x_coord.attrs)),
+        "y": (y_coord.name, np.asarray(y_coord.values), dict(y_coord.attrs)),
+        "kwargs": {k: kwargs[k] for k in _GEOMETRY_KWARGS if k in kwargs},
+    }
+    recipe["key"] = hashlib.sha1(pickle.dumps(recipe)).hexdigest()
+    return {"geometry_spec": recipe}
+
+
+def _increments_from_spec(recipe: Dict) -> Dict:
+    """Rebuild (once per process) and return the resolved geometry described by a recipe."""
+    key = recipe["key"]
+    cached = _GEOMETRY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with _GEOMETRY_LOCK:
+        if key not in _GEOMETRY_CACHE:
+            coords = {}
+            for axis in ("x", "y"):
+                name, values, attrs = recipe[axis]
+                coords[axis] = xr.DataArray(values, dims=name, name=name, attrs=attrs)
+            increments = scale_increments(coords["x"], coords["y"], verbose=False,
+                                          **recipe["kwargs"])
+            _GEOMETRY_CACHE[key] = _resolve_increments_data(increments)
+    return _GEOMETRY_CACHE[key]
+
+
 def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
     float | str, Dict[str, np.ndarray]]:
     """
@@ -488,6 +529,8 @@ def _block_space_scale_integral(
     # increments is now either the precomputed dictionary or a Future pointing to it.
     if isinstance(increments, Future):
         increments_data = increments.result()
+    elif isinstance(increments, dict) and "geometry_spec" in increments:
+        increments_data = _increments_from_spec(increments["geometry_spec"])
     else:
         increments_data = increments
 
@@ -895,9 +938,13 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         client = None
 
     if client:
-        # Scatter increments to workers
-        increments_data = client.scatter([increments_data], broadcast=True)[0]
-        print(f"[transfer] Preprocessed geometry scattered to workers.")
+        # With a distributed client, pass a small *recipe* for the geometry instead of a
+        # scattered future: each worker process rebuilds it once from the coordinates and caches
+        # it (_increments_from_spec). A scattered future embedded in the task arguments deadlocked
+        # the scheduler on Levante (32 workers): the graph never reached the workers and nothing
+        # was logged.
+        increments_data = _geometry_spec(x_coord, y_coord, kwargs)
+        print("[transfer] Shift geometry will be rebuilt once per worker process.")
 
     # ----------------------------------------------------------------------------
     # Ensure 'optimal' chunks along non-spatial dimensions for high parallelism

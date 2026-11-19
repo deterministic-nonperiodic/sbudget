@@ -782,6 +782,24 @@ def test_reader_keeps_native_half_level_w(tmp_path=None):
     assert "w_half" not in open_dataset(cfg)                            # only for the budget
 
 
+def test_geometry_recipe_matches_direct_geometry():
+    """The per-worker geometry rebuilt from a recipe equals the geometry built directly."""
+    from budget.grid_utils import scale_increments
+    from budget.inter_scale_transfers import (_geometry_spec, _increments_from_spec,
+                                              _resolve_increments_data)
+    x = xr.DataArray(np.arange(48) * 900.0, dims="x", name="x", attrs={"units": "m"})
+    y = xr.DataArray(np.arange(36) * 2500.0, dims="y", name="y", attrs={"units": "m"})
+    kw = dict(scales=[3000.0, 8000.0], x_coord_boundary="reflect", y_coord_boundary="reflect")
+    direct = _resolve_increments_data(scale_increments(x, y, **kw))
+    rebuilt = _increments_from_spec(_geometry_spec(x, y, dict(kw, verbose=True, p=1))["geometry_spec"])
+    assert np.array_equal(direct["r"], rebuilt["r"])
+    for key in ("sy", "sx", "dist", "angle"):
+        assert np.array_equal(direct["lattice"][key], rebuilt["lattice"][key])
+    for r in direct["r"]:
+        for key in ("nx_values", "ny_values", "angles", "weights"):
+            assert np.array_equal(direct[r][key], rebuilt[r][key])
+
+
 def test_cartesian_grid_is_not_global():
     """A Cartesian x in metres must not be detected as global longitude (forced periodic)."""
     from budget.grid_utils import infer_boundary_conditions
@@ -805,7 +823,8 @@ if __name__ == "__main__":
              test_vertical_operators_exact_for_linear_profiles,
              test_staggered_conversions_and_dwdz_more_accurate,
              test_staggered_flux_divergence_telescopes, test_compute_budget_with_half_level_w,
-             test_reader_keeps_native_half_level_w, test_cartesian_grid_is_not_global]
+             test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
+             test_cartesian_grid_is_not_global]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")
