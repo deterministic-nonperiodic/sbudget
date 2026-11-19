@@ -327,13 +327,75 @@ def compute_angle_weights(angle_vals: np.ndarray) -> xr.DataArray:
 # Section 7 — r-Bin Mask
 # ============================================================================
 
+def compute_lattice_r_bins(
+        distances: np.ndarray,
+        r_step: float,
+        r_max: float,
+        exact_factor: float = 8.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Radial bins for the lattice quadrature of the scale-transfer integral.
+
+    Every distinct lattice distance below ``exact_factor * r_step`` gets its own bin, so the
+    integral is an exact lattice sum where the kernel varies fastest (small scales). Beyond,
+    bins have width ``r_step`` and are centred on multiples of ``r_step``.
+
+    Returns
+    -------
+    bounds : (2, n_bins) lower and upper bin edges
+    centers : (n_bins,) mean distance of the shifts in each bin (kernel evaluation points)
+    """
+    d = distances[(distances > 0) & (distances <= r_max + 0.5 * r_step)]
+    r_exact = min(exact_factor * r_step, r_max)
+
+    small = np.unique(np.round(d[d < r_exact], 6))
+    if small.size:
+        mids = 0.5 * (small[:-1] + small[1:])
+        small_edges = np.concatenate([[0.5 * small[0]], mids, [small[-1] + 1e-6 * r_step]])
+    else:
+        small_edges = np.array([0.0])
+
+    start = small_edges[-1]
+    j0 = int(np.ceil(start / r_step - 0.5))
+    big_edges = (np.arange(j0, int(np.floor(r_max / r_step)) + 1) + 0.5) * r_step
+    big_edges = big_edges[big_edges > start]
+    edges = np.concatenate([small_edges, big_edges])
+
+    # Bin centres: mean distance of the shifts falling in each bin; drop empty bins
+    idx = np.digitize(d, edges) - 1
+    valid = (idx >= 0) & (idx < edges.size - 1)
+    counts = np.bincount(idx[valid], minlength=edges.size - 1)
+    sums = np.bincount(idx[valid], weights=d[valid], minlength=edges.size - 1)
+    centers = sums / np.maximum(counts, 1)
+
+    keep = counts > 0
+    bounds = np.stack([edges[:-1][keep], edges[1:][keep]])
+    return bounds, centers[keep]
+
+
+def compute_r_mask_from_bins(
+        distances: np.ndarray,
+        bounds: np.ndarray,
+        centers: np.ndarray,
+        nx: xr.DataArray,
+        ny: xr.DataArray,
+) -> xr.DataArray:
+    """ Boolean mask (r, ny, nx) assigning each shift to the bin [lower, upper). """
+    lower = bounds[0][:, None, None]
+    upper = bounds[1][:, None, None]
+    mask = (distances[None] >= lower) & (distances[None] < upper)
+
+    coords = {"r": centers, "ny": ny, "nx": nx}
+    return xr.DataArray(mask, dims=("r", "ny", "nx"), coords=coords, name="r_mask")
+
+
 def compute_r_mask(
         distances: np.ndarray,
         r_values: np.ndarray,
         nx: xr.DataArray,
         ny: xr.DataArray,
 ) -> xr.DataArray:
-    """ Build a boolean mask selecting which shifts fall into which r-bin. """
+    """ Build a boolean mask selecting which shifts fall into which r-bin (uniform bins). """
     r_step = np.diff(r_values)[0] if r_values.size > 1 else r_values[0]  # Handle single r-step case
 
     lower = r_values[:, None, None] - r_step / 2
@@ -433,17 +495,21 @@ def scale_increments(
         resolution_factor : int
             Shift-grid density factor.
         min_valid_shifts : int
-            Required directional sampling per r-bin.
+            Minimum number of shifts per r-bin (default 1: keep every non-empty bin, which the
+            lattice quadrature requires; larger values drop area from the integral).
+        exact_factor : float
+            Distinct lattice distances below exact_factor * r_step get their own bin (default 8).
         verbose : bool
             Print diagnostics.
 
     Returns
     -------
     xr.Dataset
-        Dataset containing: r, scale, mask, distance_grid, angle_grid, etc.
+        Dataset containing: r (mean shift distance per bin), scale, mask, distance_grid,
+        angle_grid, shift_area (area per lattice shift), bin_area (r), cell_area.
     """
     verbose = kwargs.get("verbose", False)
-    min_shifts = kwargs.get("min_valid_shifts", 10)
+    min_shifts = kwargs.get("min_valid_shifts", 1)
     res_factor = kwargs.get("resolution_factor", 1)
 
     # Validation & Grid Metrics
@@ -468,10 +534,18 @@ def scale_increments(
 
     # Distance, Angle, and Weights Calculation
     dist_da, angle_da = compute_distance_angle(nx_da, ny_da, grid_res, use_geode, center)
-    angle_w = compute_angle_weights(angle_da.values)
 
-    # Mask for valid r-bins
-    r_mask = compute_r_mask(dist_da.values, r_da.values, nx_da, ny_da)
+    # Lattice quadrature: every shift carries the area of one grid cell, so that summing over
+    # shifts approximates the area integral over separations. Bins are exact lattice distances
+    # at small r and r_step-wide annuli beyond.
+    r_step = max(grid_res)
+    cell_area = float(grid_res[0] * grid_res[1])
+    bounds, centers = compute_lattice_r_bins(dist_da.values, r_step, r_max_pre_filter,
+                                             exact_factor=kwargs.get("exact_factor", 8.0))
+    r_mask = compute_r_mask_from_bins(dist_da.values, bounds, centers, nx_da, ny_da)
+    r_da = r_mask["r"].assign_attrs(r_da.attrs)
+    r_mask = r_mask.assign_coords(r=r_da)
+    bin_area = (r_mask.sum(("ny", "nx")) * cell_area).rename("bin_area")
 
     # Assemble Initial Dataset
     ds = xr.Dataset(
@@ -480,7 +554,9 @@ def scale_increments(
             "mask": r_mask,
             "distance_grid": dist_da,
             "angle_grid": angle_da,
-            "angle_weight": angle_w,
+            "shift_area": xr.full_like(dist_da, cell_area).assign_attrs(units="m**2"),
+            "bin_area": bin_area.assign_attrs(units="m**2"),
+            "cell_area": xr.DataArray(cell_area, attrs={"units": "m**2"}),
             "delta_x_spacing": xr.DataArray(grid_res[0], attrs={"units": "m"}),
             "delta_y_spacing": xr.DataArray(grid_res[1], attrs={"units": "m"}),
         }

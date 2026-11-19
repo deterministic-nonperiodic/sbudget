@@ -93,6 +93,36 @@ def _compute_half_power_cutoff(p_val: float) -> float:
     return float(res.root)
 
 
+def lattice_kernel_weights(r: xr.DataArray, bin_area: xr.DataArray, scales: xr.DataArray,
+                           cell_area: float, p: float = 1.0) -> xr.DataArray:
+    """
+    Quadrature weights W[scale, r] such that the Duchon-Robert flux is
+
+        D_ell = 1/4 ∫ d²r ∇G_ell(r)·δu |δu|²  ≈  Σ_r W[ell, r] · S(r),
+
+    where S(r) = Σ_{shifts in bin r} (δu·r̂)|δu|² ΔA is the area-weighted sum over the lattice
+    shifts of each radial bin (computed per grid point).
+
+    The kernel is normalized on the same lattice measure, Σ_shifts G_ell ΔA = 1 (including the
+    zero shift), so normalization and derivative use one discretization; this keeps the result
+    accurate down to ell ~ 1.5 grid spacings.
+    """
+    r_vals = np.asarray(r.values, dtype=float)
+    ell = np.asarray(scales.values, dtype=float)
+    area = np.asarray(bin_area.values, dtype=float)
+
+    g = _evaluate_mollifier(r_vals, ell, p=p)                  # (scale, r)
+    g0 = _evaluate_mollifier(np.array([0.0]), ell, p=p)[:, 0]  # (scale,)
+    dg = _evaluate_mollifier_derivative(r_vals, ell, p=p)      # (scale, r)
+
+    norm = g0 * cell_area + g @ area                           # Σ G ΔA over the lattice
+    weights = 0.25 * dg / np.clip(norm, epsilon, None)[:, None]
+
+    s_name = scales.name or "scale"
+    return xr.DataArray(weights, dims=[s_name, "r"], coords={s_name: scales, "r": r},
+                        name="lattice_kernel_weights")
+
+
 def _get_mollifier_norm(mollifier: xr.DataArray, method: str, r_name: str = "r") -> xr.DataArray:
     """
     Normalization for mollifier kernel using the appropriate area weighting.
@@ -357,58 +387,22 @@ def _vectorized_scale_integration(
         kernel_derivative: xr.DataArray | xr.Dataset
 ) -> xr.DataArray:
     """
-    Compute integral over scales using highly-optimized matrix multiplication (GEMM).
-    Returns an xarray DataArray with the 'scale' dimension replacing the 'r' dimension.
+    Apply the lattice quadrature weights W[scale, r] to the bin sums S[r, ...] with one matrix
+    multiplication (GEMM): D[scale, ...] = Σ_r W[scale, r] S[r, ...].
+    The weights vanish outside the kernel support (r ≥ 2ℓ) and already include the 1/4 prefactor
+    and the lattice normalization of G_ℓ (see lattice_kernel_weights).
     """
-    r_coords = integrand.r.values
     scale_coords = kernel_derivative.scale.values
-
-    # Pre-calculate trapezoidal rule integration weights for r
-    dr = np.zeros_like(r_coords)
-    if len(r_coords) > 1:
-        dr[0] = (r_coords[1] - r_coords[0]) / 2.0
-        dr[-1] = (r_coords[-1] - r_coords[-2]) / 2.0
-        dr[1:-1] = (r_coords[2:] - r_coords[:-2]) / 2.0
-    else:
-        dr[0] = 1.0
-
-    kd_s_np = kernel_derivative.values  # shape: (scale, r)
-
-    # Create masking matrix (1 where r <= 2 * scale, 0 otherwise)
-    r_grid = r_coords[None, :]  # shape: (1, r)
-    scale_grid = scale_coords[:, None]  # shape: (scale, 1)
-    mask_matrix = r_grid <= 2 * scale_grid
-
-    kd_s_masked = np.where(mask_matrix, kd_s_np, 0.0)
+    weights = kernel_derivative.transpose("scale", "r").values  # shape: (scale, r)
 
     integrand_np = integrand.values  # shape: (r, ...)
-    shape = integrand_np.shape
-    r_dim = shape[0]
-    spatial_shape = shape[1:]
+    r_dim, spatial_shape = integrand_np.shape[0], integrand_np.shape[1:]
 
     # Flatten spatial dimensions for matrix multiplication: (r, N)
-    integrand_flat = integrand_np.reshape(r_dim, -1)
-
-    # den = sum_r( kd_s * integrand ) -> shape: (scale, N)
-    den_flat = kd_s_np @ integrand_flat
-
-    # num = sum_r_masked( kd_s * integrand ) -> shape: (scale, N)
-    num_flat = kd_s_masked @ integrand_flat
-
-    # Retention fraction handles the integral over unbounded domains
-    retention_fraction_flat = np.where(den_flat > epsilon, num_flat / den_flat, 1.0)
-
-    # integration_matrix applies trapz step width scaling to masked mollifiers
-    integration_matrix = kd_s_masked * dr[None, :]  # shape: (scale, r)
-
-    # integral = int_r_masked( kd_s * integrand ) -> shape: (scale, N)
-    integral_flat = integration_matrix @ integrand_flat
-
-    # Adjust for retention fraction
-    integral_corrected_flat = integral_flat / retention_fraction_flat
+    integral_flat = weights @ integrand_np.reshape(r_dim, -1)
 
     # Reshape back to exactly match our spatial chunk (scale, ...)
-    integral_corrected = integral_corrected_flat.reshape(len(scale_coords), *spatial_shape)
+    integral_corrected = integral_flat.reshape(len(scale_coords), *spatial_shape)
 
     out_dims = ["scale"] + list(integrand.dims)[1:]
     out_coords = {"scale": scale_coords}
@@ -454,13 +448,16 @@ def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
         # These data accesses are synchronous and must be run on a worker.
         mask = r_slice.mask.data.astype(bool)
         ny_idx, nx_idx = np.where(mask)
-        weights = r_slice.angle_weight.data[mask].astype(np.float32)
+
+        # Lattice quadrature: each shift contributes its cell area (area-weighted SUM over the
+        # shifts of the bin, not an average), see lattice_kernel_weights.
+        weights = r_slice.shift_area.data[mask].astype(np.float32)
 
         increments_data[r_value] = {
             "nx_values": r_slice.nx.data[nx_idx].astype(int),
             "ny_values": r_slice.ny.data[ny_idx].astype(int),
             "angles": r_slice.angle_grid.data[mask].astype(np.float32),
-            "weights": weights / np.clip(np.sum(weights), epsilon, None),
+            "weights": weights,
         }
 
     return increments_data
@@ -554,16 +551,18 @@ def scale_transfer(
         y_dim: str,
         name: str = "energy_transfer",
         transform_type: str = "delta_u_cubed",
-        weighting: str = "sphere",
+        bin_area: xr.DataArray = None,
+        cell_area: float = None,
         p: int = 1,
         verbose: bool = False
 ) -> xr.DataArray:
     """
-    Compute the inter-scale energy transfer.
+    Compute the inter-scale energy transfer (Duchon & Robert 2000):
 
-    This integrates the quantity:
-        Du = ∫₀^{2ℓ} (dG/dr) (δu ⋅ r̂) |δu|²  dr
-    with normalization for truncated kernels (r ≤ 2ℓ).
+        D_ℓ = 1/4 ∫ d²r ∇G_ℓ(r) · δu |δu|²,
+
+    evaluated as a lattice sum over grid shifts r (see lattice_kernel_weights), with G_ℓ
+    normalized on the same lattice. Kernels truncated by r_max are renormalized.
 
     Parameters
     ----------
@@ -581,8 +580,10 @@ def scale_transfer(
         Names of the spatial dimensions.
     transform_type : str
         Type of integrand, i.e., cubed velocity differences
-    weighting : {"2D", "3D"}, optional
-        Mollifier normalization type for the kernel.
+    bin_area : xr.DataArray
+        Lattice area of each radial bin (number of shifts × cell area), dims ("r",).
+    cell_area : float
+        Area of one grid cell (Δx Δy).
     verbose : bool, optional
         If True, print progress and summary info.
 
@@ -595,14 +596,14 @@ def scale_transfer(
         print(f"[scale-integral] Building parallel graph for '{name}' ...")
 
     # ------------------------------------------------------------
-    # Build integration kernels dG_ℓ(r)/dr for all ℓ and r
+    # Lattice quadrature weights ¼ G'_ℓ(r) / Σ G_ℓ ΔA for all ℓ and r
     # ------------------------------------------------------------
-    kernel_derivative = get_integration_kernels(
-        radial_distance, length_scale,
-        normalization=weighting,
-        scaled=True, return_derivative=True,
-        p=p
-    ).compute()
+    if bin_area is None or cell_area is None:
+        raise ValueError("scale_transfer needs bin_area and cell_area from scale_increments().")
+
+    kernel_derivative = lattice_kernel_weights(
+        radial_distance, bin_area, length_scale, cell_area=float(cell_area), p=p
+    )
 
     # ------------------------------------------------------------
     # Distribute computation over spatial blocks
@@ -708,7 +709,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         length_scale=length_scale,
         name="energy_transfer",
         x_dim=x_name, y_dim=y_name,
-        weighting="sphere",
+        bin_area=increments["bin_area"],
+        cell_area=float(increments["cell_area"]),
         p=kwargs.get("p", 1),
         verbose=verbose
     )
