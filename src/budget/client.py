@@ -115,6 +115,12 @@ def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
         "optimization.fuse.max-width": 256,
     }
 
+    # Rechunk with plain tasks, not the distributed P2P shuffle: on Levante (32 worker processes)
+    # the P2P rechunk in the scale-transfer graph hung indefinitely (> 20 min, idle workers);
+    # with "tasks" the same run finishes in 53 s. An explicit environment setting wins.
+    if "DASK_ARRAY__RECHUNK__METHOD" not in os.environ:
+        dask_config["array.rechunk.method"] = "tasks"
+
     if chunk_mb:
         dask_config["array.chunk-size"] = f"{chunk_mb}MB"
 

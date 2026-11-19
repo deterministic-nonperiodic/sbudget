@@ -598,6 +598,255 @@ def test_shift_fallback_close_to_exact():
             assert point < 1e-5, (ell, point)
 
 
+# ------------------------------------------------------------------------------------------------
+# Lorenz-staggered vertical grid (w on half levels)
+# ------------------------------------------------------------------------------------------------
+def _lorenz_case(levels_per_lambda=8, n=24, lam=4000.0, depth=24000.0, seed=31):
+    """Analytic vertical waves (growing as exp(z/2H)) on a uniform Lorenz-staggered grid."""
+    rng = np.random.default_rng(seed)
+    L = 240e3
+    x = np.arange(n) * L / n
+    X, Y = np.meshgrid(x, x, indexing="xy")
+    m, H = 2 * np.pi / lam, 7000.0
+    modes = [(1, 0), (1, 1), (2, 1), (0, 2)]
+    pars = {k: (rng.normal(size=len(modes)), rng.uniform(0, 2 * np.pi, len(modes)))
+            for k in ("u", "v", "w", "p", "t")}
+    scale = {"u": 10.0, "v": 10.0, "w": 0.5, "p": 1e-3, "t": 2.0}
+
+    def f(name, z, deriv=False):
+        z = np.asarray(z)[:, None, None]
+        out = np.zeros((z.shape[0], n, n))
+        for (kx, ky), a, ph in zip(modes, *pars[name]):
+            arg = 2 * np.pi * (kx * X + ky * Y) / L - m * z + ph
+            out += a * (np.cos(arg) / H + m * np.sin(arg)) if deriv else a * np.cos(arg)
+        return scale[name] * np.exp(z / H) * out
+
+    dz = lam / levels_per_lambda
+    zh = np.arange(0.0, depth + 0.5 * dz, dz)
+    zf = 0.5 * (zh[1:] + zh[:-1])
+    full = lambda a: xr.DataArray(a, dims=("z", "y", "x"), coords={"z": zf, "y": x, "x": x})
+    half = lambda a: xr.DataArray(a, dims=("z_half", "y", "x"),
+                                  coords={"z_half": zh, "y": x, "x": x})
+    return f, full, half, zf, zh, x[1] - x[0]
+
+
+def _collocated(w_half_da, zf):
+    """Linear interpolation of a half-level field to full levels (the collocated path)."""
+    w = w_half_da.interp(z_half=zf).rename(z_half="z")
+    return w.drop_vars("z", errors="ignore").assign_coords(z=zf)
+
+
+def test_vertical_operators_exact_for_linear_profiles():
+    from budget.vertical import (is_lorenz_staggered, half_to_full_mean, diff_half_to_full,
+                                 interp_full_to_half, diff_full_to_half)
+    zh = np.cumsum(np.r_[0.0, 300.0 * 1.03 ** np.arange(40)])   # stretched interfaces
+    zf = 0.5 * (zh[1:] + zh[:-1])
+    a, b = 2.0e-3, -5.0
+    lin_h = xr.DataArray(a * zh + b, dims="z_half", coords={"z_half": zh})
+    lin_f = xr.DataArray(a * zf + b, dims="z", coords={"z": zf})
+    z_full = lin_f["z"]
+    assert is_lorenz_staggered(z_full, lin_h["z_half"])
+    assert not is_lorenz_staggered(z_full, xr.DataArray(zf, dims="z_half", name="z_half"))
+    assert np.allclose(half_to_full_mean(lin_h, z_full), lin_f)
+    assert np.allclose(diff_half_to_full(lin_h, z_full), a)
+    assert np.allclose(interp_full_to_half(lin_f, lin_h["z_half"]), lin_h)   # incl. ends
+    assert np.allclose(diff_full_to_half(lin_f, lin_h["z_half"]), a)
+    # descending orientation (ICON stores levels top-down)
+    lin_h_d, lin_f_d = lin_h[::-1], lin_f[::-1]
+    assert is_lorenz_staggered(lin_f_d["z"], lin_h_d["z_half"])
+    assert np.allclose(diff_half_to_full(lin_h_d, lin_f_d["z"]), a)
+    assert np.allclose(interp_full_to_half(lin_f_d, lin_h_d["z_half"]), lin_h_d)
+
+
+def test_staggered_conversions_and_dwdz_more_accurate():
+    """At 5 levels per vertical wavelength the native staggered operators are far more accurate
+    for dw/dz and the pressure-work conversion than interpolating w and centred differences."""
+    from budget.budget import staggered_vertical_terms, conversion_ape_to_dke
+    from budget.constants import cp
+    from budget.spectral_primitives import scalar_cross_spectrum
+    from budget.thermodynamics import lorenz_parameter
+    from budget.vertical import diff_half_to_full
+    f, full, half, zf, zh, dx = _lorenz_case(levels_per_lambda=5)
+    u, v, th, pp = (full(f(k, zf)) for k in ("u", "v", "t", "p"))
+    w_half = half(f("w", zh))
+    w_col = _collocated(w_half, zf)
+    th_mean = xr.DataArray(250.0 * np.exp(0.02 ** 2 * zf / 9.81), dims="z", coords={"z": zf})
+    gamma = lorenz_parameter(th_mean)
+    inner = slice(3, zf.size - 3)
+    err = lambda a, b: float(np.linalg.norm((a - b)[inner]) / np.linalg.norm(b[inner]))
+    with _NoTaper():
+        dzw_true = f("w", zf, True)
+        e_dzw_stag = err(diff_half_to_full(w_half, u["z"]).values, dzw_true)
+        e_dzw_col = err(w_col.differentiate("z", edge_order=2).values, dzw_true)
+
+        iso = lambda s: isotropize(s, dx, dx, cumulative=False).values
+        cad_true = iso(cp * th_mean * scalar_cross_spectrum(full(f("w", zf)),
+                                                            full(f("p", zf, True))))
+        stag = staggered_vertical_terms(u, v, w_half, th_mean, th, gamma, pp)
+        e_cad_stag = err(iso(stag["cad"]), cad_true)
+        e_cad_col = err(iso(conversion_ape_to_dke(th_mean, w_col, pp)), cad_true)
+    print(f"  dw/dz error: staggered {e_dzw_stag:.3f}, collocated {e_dzw_col:.3f}; "
+          f"C_A->h error: staggered {e_cad_stag:.3f}, collocated {e_cad_col:.3f}")
+    assert e_dzw_stag < 0.08 and e_cad_stag < 0.08
+    assert e_dzw_col > 4 * e_dzw_stag and e_cad_col > 4 * e_cad_stag
+
+
+def test_staggered_flux_divergence_telescopes():
+    """Layer sums of the staggered flux divergences equal the interface flux difference."""
+    from budget.budget import staggered_vertical_terms, turbulent_hke_flux, pressure_flux
+    from budget.thermodynamics import lorenz_parameter
+    from budget.vertical import interp_full_to_half
+    f, full, half, zf, zh, dx = _lorenz_case(levels_per_lambda=6)
+    u, v, th, pp = (full(f(k, zf)) for k in ("u", "v", "t", "p"))
+    w_half = half(f("w", zh))
+    th_mean = xr.DataArray(250.0 * np.exp(0.02 ** 2 * zf / 9.81), dims="z", coords={"z": zf})
+    gamma = lorenz_parameter(th_mean)
+    zh_da = w_half["z_half"]
+    with _NoTaper():
+        stag = staggered_vertical_terms(u, v, w_half, th_mean, th, gamma, pp)
+        f_h = turbulent_hke_flux(interp_full_to_half(u, zh_da), interp_full_to_half(v, zh_da),
+                                 w_half)
+        f_p = pressure_flux(interp_full_to_half(th_mean, zh_da), w_half,
+                            interp_full_to_half(pp, zh_da))
+        dz = xr.DataArray(np.diff(zh), dims="z", coords={"z": zf})
+        a, b = 4, zf.size - 4
+        for name, flux in (("vfd_hke", f_h), ("vfd_pres", f_p)):
+            layer = (stag[name] * dz).isel(z=slice(a, b)).sum("z")
+            jump = flux.isel(z_half=b) - flux.isel(z_half=a)
+            err = float(np.abs(layer - jump).max() / np.abs(jump).max())
+            print(f"  {name}: layer sum vs interface flux difference {err:.1e}")
+            assert err < 1e-10
+
+
+def test_compute_budget_with_half_level_w():
+    """compute_budget detects a Lorenz-staggered w_half and returns finite terms."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget
+    n = 16
+    f, full, half, zf, zh, dx = _lorenz_case(levels_per_lambda=8, n=n, depth=12000.0)
+    theta = full(250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + f("t", zf))
+    pres = full(np.broadcast_to((1e5 * np.exp(-zf / 7000.0))[:, None, None],
+                                (zf.size, n, n)).copy())
+    ds = xr.Dataset({"u": full(f("u", zf)), "v": full(f("v", zf)), "theta": theta,
+                     "pressure": pres, "density": pres / (287.0 * 240.0)})
+    ds["w_half"] = half(f("w", zh))
+    ds["w"] = _collocated(ds["w_half"], zf)
+    cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                  transfer_form="flux", rechunk_spatial=False))
+    out = compute_budget(ds, cfg).compute()
+    assert all(bool(np.isfinite(out[k]).all()) for k in out.data_vars)
+    for k in ("vf_hke", "vfd_dke", "vf_pres", "vfd_pres", "cad", "caz", "np_vke", "div_hke"):
+        assert k in out
+
+
+def test_staggered_outputs_have_zarr_compatible_chunks():
+    """Shifted half-level slices must not leave irregular dask chunks along the vertical.
+    On Levante, 501 half levels chunked (251, 250) gave vf_vke chunks (250, 1, 249) on the 500
+    full levels, which zarr refuses."""
+    import tempfile
+    from budget.vertical import (half_to_full_mean, diff_half_to_full, interp_full_to_half,
+                                 diff_full_to_half)
+    nf = 20
+    zh = np.linspace(0.0, 10000.0, nf + 1)
+    zf = 0.5 * (zh[1:] + zh[:-1])
+    rng = np.random.default_rng(3)
+    h = xr.DataArray(rng.standard_normal((nf + 1, 4)), dims=("z_half", "x"),
+                     coords={"z_half": zh}).chunk({"z_half": 11})          # (11, 10)
+    fl = xr.DataArray(rng.standard_normal((nf, 4)), dims=("z", "x"),
+                      coords={"z": zf}).chunk({"z": 10})                   # (10, 10)
+    outs = {"mean": half_to_full_mean(h, fl["z"]), "dh": diff_half_to_full(h, fl["z"]),
+            "interp": interp_full_to_half(fl, h["z_half"]), "df": diff_full_to_half(fl, h["z_half"])}
+    for name, da in outs.items():
+        sizes = da.chunks[0]
+        assert len(set(sizes[:-1])) <= 1 and sizes[-1] <= sizes[0], (name, sizes)
+    assert np.allclose(outs["mean"], 0.5 * (h.values[1:] + h.values[:-1]))
+    with tempfile.TemporaryDirectory() as tmp:
+        xr.Dataset({k: v.rename({v.dims[0]: f"lev_{k}"}).drop_vars(v.dims[0], errors="ignore")
+                    for k, v in outs.items()}).to_zarr(f"{tmp}/out.zarr", mode="w", consolidated=False)
+
+
+def test_write_guard_makes_any_chunks_zarr_safe():
+    """The Levante div_hke pattern (z chunks 11, ..., 9, 2, 11, ..., 5) is rechunked before the
+    zarr write; values are unchanged and uniform variables are left alone."""
+    import tempfile
+    from budget.io_utils import zarr_safe_chunks
+    rng = np.random.default_rng(5)
+    zc = (11,) * 22 + (9, 2) + (11,) * 23 + (5,)
+    data = rng.standard_normal((2, sum(zc), 3))
+    bad = xr.DataArray(data, dims=("time", "z", "k")).chunk({"time": 2, "z": zc, "k": 3})
+    good = xr.DataArray(data, dims=("time", "z", "k")).chunk({"time": 1, "z": 50})
+    ds = xr.Dataset({"div_hke": bad, "pi_nke": good})
+    out = zarr_safe_chunks(ds)
+    sizes = out["div_hke"].chunks[1]
+    assert len(set(sizes[:-1])) == 1 and sizes[-1] <= sizes[0], sizes
+    assert out["pi_nke"].chunks == good.chunks
+    with tempfile.TemporaryDirectory() as tmp:
+        out.to_zarr(f"{tmp}/o.zarr", mode="w", consolidated=False)
+        assert np.array_equal(xr.open_zarr(f"{tmp}/o.zarr", consolidated=False)["div_hke"].values,
+                              data)
+
+
+def test_reader_keeps_native_half_level_w(tmp_path=None):
+    """ICON-like file (full and half levels as separate dims, stored top-down, w on half levels):
+    open_dataset keeps w_half on z_half for the spectral budget, and it is Lorenz-staggered."""
+    import tempfile
+    from pathlib import Path
+    from budget.config import Config, IOConfig, OutputConfig, ComputeConfig
+    from budget.io_utils import open_dataset
+    from budget.vertical import is_lorenz_staggered
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    n, k = 8, 6
+    zh = np.linspace(12000.0, 0.0, k + 1)                 # interfaces, top-down
+    zf = 0.5 * (zh[1:] + zh[:-1])
+    x = np.arange(n) * 1000.0
+    rng = np.random.default_rng(3)
+    full = lambda: (("time", "height", "y", "x"), rng.normal(size=(1, k, n, n)).astype("float32"))
+    ds = xr.Dataset(
+        {"u": full(), "v": full(), "temp": full(),
+         "pres": (("time", "height", "y", "x"),
+                  np.broadcast_to((1e5 * np.exp(-zf / 7000.0))[None, :, None, None],
+                                  (1, k, n, n)).astype("float32")),
+         "w": (("time", "height_2", "y", "x"), rng.normal(size=(1, k + 1, n, n)).astype("float32"))},
+        coords={"time": [0.0], "height": ("height", zf, {"units": "m", "standard_name": "height"}),
+                "height_2": ("height_2", zh, {"units": "m", "standard_name": "height"}),
+                "y": ("y", x, {"units": "m"}), "x": ("x", x, {"units": "m"})})
+    for name, units in (("u", "m s-1"), ("v", "m s-1"), ("w", "m s-1"), ("temp", "K"),
+                        ("pres", "Pa")):
+        ds[name].attrs["units"] = units
+    path = tmp / "icon_like.nc"
+    ds.to_netcdf(path)
+    cfg = Config(input=IOConfig(path=str(path), dims=["height", "y", "x"]),
+                 output=OutputConfig(path=str(tmp / "out.nc")),
+                 compute=ComputeConfig(mode="spectral_budget"),
+                 variables={"u": "u", "v": "v", "w": "w", "temperature": "temp",
+                            "pressure": "pres"})
+    out = open_dataset(cfg)
+    assert "w_half" in out and out["w_half"].sizes["z_half"] == k + 1
+    assert np.allclose(out["w_half"]["z_half"], zh)
+    assert np.allclose(out["w_half"].values, ds["w"].values)            # native values kept
+    assert is_lorenz_staggered(out["z"], out["w_half"]["z_half"])
+    cfg.compute.mode = "scale_transfer"
+    assert "w_half" not in open_dataset(cfg)                            # only for the budget
+
+
+def test_geometry_recipe_matches_direct_geometry():
+    """The per-worker geometry rebuilt from a recipe equals the geometry built directly."""
+    from budget.grid_utils import scale_increments
+    from budget.inter_scale_transfers import (_geometry_spec, _increments_from_spec,
+                                              _resolve_increments_data)
+    x = xr.DataArray(np.arange(48) * 900.0, dims="x", name="x", attrs={"units": "m"})
+    y = xr.DataArray(np.arange(36) * 2500.0, dims="y", name="y", attrs={"units": "m"})
+    kw = dict(scales=[3000.0, 8000.0], x_coord_boundary="reflect", y_coord_boundary="reflect")
+    direct = _resolve_increments_data(scale_increments(x, y, **kw))
+    rebuilt = _increments_from_spec(_geometry_spec(x, y, dict(kw, verbose=True, p=1))["geometry_spec"])
+    assert np.array_equal(direct["r"], rebuilt["r"])
+    for key in ("sy", "sx", "dist", "angle"):
+        assert np.array_equal(direct["lattice"][key], rebuilt["lattice"][key])
+    for r in direct["r"]:
+        for key in ("nx_values", "ny_values", "angles", "weights"):
+            assert np.array_equal(direct[r][key], rebuilt[r][key])
+
+
 def test_cartesian_grid_is_not_global():
     """A Cartesian x in metres must not be detected as global longitude (forced periodic)."""
     from budget.grid_utils import infer_boundary_conditions
@@ -618,6 +867,12 @@ if __name__ == "__main__":
              test_density_weighted_closure_hke_vke_ape, test_pressure_work_closure,
              test_vertical_pressure_buoyancy_closure, test_layer_integral_gives_boundary_flux,
              test_fft_path_matches_exact_lattice_nonperiodic, test_shift_fallback_close_to_exact,
+             test_vertical_operators_exact_for_linear_profiles,
+             test_staggered_conversions_and_dwdz_more_accurate,
+             test_staggered_flux_divergence_telescopes, test_compute_budget_with_half_level_w,
+             test_staggered_outputs_have_zarr_compatible_chunks,
+             test_write_guard_makes_any_chunks_zarr_safe,
+             test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
              test_cartesian_grid_is_not_global]
     failed = 0
     for t in tests:
