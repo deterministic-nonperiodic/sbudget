@@ -36,6 +36,17 @@ def _layer_thickness(z_half: xr.DataArray, z_full: xr.DataArray) -> xr.DataArray
     return xr.DataArray(zh[1:] - zh[:-1], dims=FULL, coords={FULL: z_full.values})
 
 
+def _uniform_chunks(out: xr.DataArray, src: xr.DataArray, src_dim: str,
+                    dst_dim: str) -> xr.DataArray:
+    """Shifted slices and index arrays leave irregular dask chunks along the vertical, e.g.
+    (250, 1, 249), which zarr cannot store. Rechunk ``dst_dim`` uniformly to the largest input
+    chunk along ``src_dim`` (a cheap 1-D rechunk). No-op for numpy-backed arrays."""
+    if out.chunks is None or src.chunks is None:
+        return out
+    size = max(src.chunksizes[src_dim]) if src_dim in src.chunksizes else out.sizes[dst_dim]
+    return out.chunk({dst_dim: min(size, out.sizes[dst_dim])})
+
+
 def _upper_lower(da: xr.DataArray, z_full: xr.DataArray) -> Tuple[xr.DataArray, xr.DataArray]:
     """The half-level values at z_half[k+1] and z_half[k], relabelled onto full level k."""
     hi = da.isel({HALF: slice(1, None)}).rename({HALF: FULL})
@@ -48,14 +59,14 @@ def _upper_lower(da: xr.DataArray, z_full: xr.DataArray) -> Tuple[xr.DataArray, 
 def half_to_full_mean(da: xr.DataArray, z_full: xr.DataArray) -> xr.DataArray:
     """Average of the two half levels bounding each full level."""
     hi, lo = _upper_lower(da, z_full)
-    return 0.5 * (hi + lo)
+    return _uniform_chunks(0.5 * (hi + lo), da, HALF, FULL)
 
 
 def diff_half_to_full(da: xr.DataArray, z_full: xr.DataArray) -> xr.DataArray:
     """Compact derivative of a half-level field on full levels:
     (a[k+1/2] - a[k-1/2]) / (z_half[k+1] - z_half[k])."""
     hi, lo = _upper_lower(da, z_full)
-    return (hi - lo) / _layer_thickness(da[HALF], z_full)
+    return _uniform_chunks((hi - lo) / _layer_thickness(da[HALF], z_full), da, HALF, FULL)
 
 
 def _bracketing(z_full: np.ndarray, z_half: np.ndarray):
@@ -80,7 +91,8 @@ def interp_full_to_half(da: xr.DataArray, z_half: xr.DataArray) -> xr.DataArray:
     a1 = da.isel({FULL: xr.DataArray(i1, dims=HALF)})
     w = xr.DataArray(wgt, dims=HALF)
     out = a0 + w * (a1 - a0)
-    return out.drop_vars(FULL, errors="ignore").assign_coords({HALF: zh})
+    out = out.drop_vars(FULL, errors="ignore").assign_coords({HALF: zh})
+    return _uniform_chunks(out, da, FULL, HALF)
 
 
 def diff_full_to_half(da: xr.DataArray, z_half: xr.DataArray) -> xr.DataArray:
@@ -93,4 +105,5 @@ def diff_full_to_half(da: xr.DataArray, z_half: xr.DataArray) -> xr.DataArray:
     a1 = da.isel({FULL: xr.DataArray(i1, dims=HALF)})
     dz = xr.DataArray(zf[i1] - zf[i0], dims=HALF)
     out = (a1 - a0) / dz
-    return out.drop_vars(FULL, errors="ignore").assign_coords({HALF: zh})
+    out = out.drop_vars(FULL, errors="ignore").assign_coords({HALF: zh})
+    return _uniform_chunks(out, da, FULL, HALF)

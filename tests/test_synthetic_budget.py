@@ -739,6 +739,32 @@ def test_compute_budget_with_half_level_w():
         assert k in out
 
 
+def test_staggered_outputs_have_zarr_compatible_chunks():
+    """Shifted half-level slices must not leave irregular dask chunks along the vertical.
+    On Levante, 501 half levels chunked (251, 250) gave vf_vke chunks (250, 1, 249) on the 500
+    full levels, which zarr refuses."""
+    import tempfile
+    from budget.vertical import (half_to_full_mean, diff_half_to_full, interp_full_to_half,
+                                 diff_full_to_half)
+    nf = 20
+    zh = np.linspace(0.0, 10000.0, nf + 1)
+    zf = 0.5 * (zh[1:] + zh[:-1])
+    rng = np.random.default_rng(3)
+    h = xr.DataArray(rng.standard_normal((nf + 1, 4)), dims=("z_half", "x"),
+                     coords={"z_half": zh}).chunk({"z_half": 11})          # (11, 10)
+    fl = xr.DataArray(rng.standard_normal((nf, 4)), dims=("z", "x"),
+                      coords={"z": zf}).chunk({"z": 10})                   # (10, 10)
+    outs = {"mean": half_to_full_mean(h, fl["z"]), "dh": diff_half_to_full(h, fl["z"]),
+            "interp": interp_full_to_half(fl, h["z_half"]), "df": diff_full_to_half(fl, h["z_half"])}
+    for name, da in outs.items():
+        sizes = da.chunks[0]
+        assert len(set(sizes[:-1])) <= 1 and sizes[-1] <= sizes[0], (name, sizes)
+    assert np.allclose(outs["mean"], 0.5 * (h.values[1:] + h.values[:-1]))
+    with tempfile.TemporaryDirectory() as tmp:
+        xr.Dataset({k: v.rename({v.dims[0]: f"lev_{k}"}).drop_vars(v.dims[0], errors="ignore")
+                    for k, v in outs.items()}).to_zarr(f"{tmp}/out.zarr", mode="w", consolidated=False)
+
+
 def test_reader_keeps_native_half_level_w(tmp_path=None):
     """ICON-like file (full and half levels as separate dims, stored top-down, w on half levels):
     open_dataset keeps w_half on z_half for the spectral budget, and it is Lorenz-staggered."""
@@ -823,6 +849,7 @@ if __name__ == "__main__":
              test_vertical_operators_exact_for_linear_profiles,
              test_staggered_conversions_and_dwdz_more_accurate,
              test_staggered_flux_divergence_telescopes, test_compute_budget_with_half_level_w,
+             test_staggered_outputs_have_zarr_compatible_chunks,
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
              test_cartesian_grid_is_not_global]
     failed = 0
