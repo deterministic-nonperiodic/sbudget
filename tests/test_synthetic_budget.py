@@ -521,6 +521,34 @@ def test_layer_integral_gives_boundary_flux():
     assert err < 0.02
 
 
+def test_fast_path_matches_roll_path_nonperiodic():
+    """Pad-once fast path == original per-shift pad/roll path, for reflect and mixed boundaries."""
+    import budget.inter_scale_transfers as ist
+    rng = np.random.default_rng(29)
+    ny, nx, d = 40, 56, 1000.0
+    x = np.arange(nx) * d
+    y = np.arange(ny) * d
+    z = np.array([0.0, 1.0, 2.0])
+    fields = {k: rng.normal(size=(3, ny, nx)).astype(np.float32) for k in ("u", "v", "w")}
+    ds = xr.Dataset({k: (("z", "y", "x"), a) for k, a in fields.items()},
+                    coords={"z": z, "y": y, "x": x})
+    scales = np.array([1.5, 3.0, 6.0]) * d
+    saved = dict(ist._NP_PAD_MODES)
+    try:
+        for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
+            kw = dict(scales=scales, x_coord_boundary=xb, y_coord_boundary=yb, allow_rechunk=False)
+            fast = inter_scale_kinetic_energy_transfer(ds, **kw)["energy_transfer"].values
+            ist._NP_PAD_MODES.clear()          # force the original pad/roll implementation
+            slow = inter_scale_kinetic_energy_transfer(ds, **kw)["energy_transfer"].values
+            ist._NP_PAD_MODES.update(saved)
+            err = float(np.abs(fast - slow).max() / np.abs(slow).max())
+            print(f"  boundaries x={xb:8s} y={yb:9s}: max |fast - roll| / max |roll| = {err:.1e}")
+            assert err < 1e-5, (xb, yb, err)
+    finally:
+        ist._NP_PAD_MODES.clear()
+        ist._NP_PAD_MODES.update(saved)
+
+
 def test_cartesian_grid_is_not_global():
     """A Cartesian x in metres must not be detected as global longitude (forced periodic)."""
     from budget.grid_utils import infer_boundary_conditions
@@ -540,7 +568,7 @@ if __name__ == "__main__":
              test_dell_rotation_invariance, test_spectrum_parseval_and_cumulative_convention,
              test_density_weighted_closure_hke_vke_ape, test_pressure_work_closure,
              test_vertical_pressure_buoyancy_closure, test_layer_integral_gives_boundary_flux,
-             test_cartesian_grid_is_not_global]
+             test_fast_path_matches_roll_path_nonperiodic, test_cartesian_grid_is_not_global]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")

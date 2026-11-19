@@ -8,7 +8,7 @@ from dask.distributed import get_client
 from .cf_coords import get_spatial_dims
 from .constants import earth_radius, epsilon
 from .grid_utils import scale_increments
-from .memory_manager import CacheManager, ensure_optimal_chunking
+from .memory_manager import CacheManager, ensure_optimal_chunking, get_current_worker_count
 
 
 # --------------------------------------------------------------------------------------------------
@@ -382,40 +382,6 @@ def process_single_r_for_field_chunk(
     return integrand.expand_dims(r=[r_value])
 
 
-def _vectorized_scale_integration(
-        integrand: xr.DataArray,
-        kernel_derivative: xr.DataArray | xr.Dataset
-) -> xr.DataArray:
-    """
-    Apply the lattice quadrature weights W[scale, r] to the bin sums S[r, ...] with one matrix
-    multiplication (GEMM): D[scale, ...] = Σ_r W[scale, r] S[r, ...].
-    The weights vanish outside the kernel support (r ≥ 2ℓ) and already include the 1/4 prefactor
-    and the lattice normalization of G_ℓ (see lattice_kernel_weights).
-    """
-    scale_coords = kernel_derivative.scale.values
-    weights = kernel_derivative.transpose("scale", "r").values  # shape: (scale, r)
-
-    integrand_np = integrand.values  # shape: (r, ...)
-    r_dim, spatial_shape = integrand_np.shape[0], integrand_np.shape[1:]
-
-    # Flatten spatial dimensions for matrix multiplication: (r, N)
-    integral_flat = weights @ integrand_np.reshape(r_dim, -1)
-
-    # Reshape back to exactly match our spatial chunk (scale, ...)
-    integral_corrected = integral_flat.reshape(len(scale_coords), *spatial_shape)
-
-    out_dims = ["scale"] + list(integrand.dims)[1:]
-    out_coords = {"scale": scale_coords}
-    for d in out_dims[1:]:
-        out_coords[str(d)] = integrand.coords[d]
-
-    return xr.DataArray(
-        integral_corrected,
-        dims=out_dims,
-        coords=out_coords
-    )
-
-
 def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
     float | str, Dict[str, np.ndarray]]:
     """
@@ -485,18 +451,18 @@ def _block_space_scale_integral(
     transform_type : str
         Transformation to compute ("delta_u_cubed").
     kernel_derivative : xr.DataArray
-        Precomputed mollifier kernel derivatives dG/dr, dims: (scale, r).
+        Lattice quadrature weights W[scale, r] (see lattice_kernel_weights).
     Returns
     -------
     xr.DataArray
-        Integrated field with dimension 'scale' and same spatial dims as integrand.
+        Integrated field with dimension 'scale' and same spatial dims as the block (float32).
 
-    Workflow inside each block:
-        1. loop over all r-values → integrand(r, ...)
-        2. build mollifier kernels for all ℓ
-        3. compute (dg/dr)(r;ℓ) * r * integrand
-        4. perform truncated, normalized ∫ ... dr
-        5. return final (scale, ...) DataArray
+    Workflow inside each block (streaming, memory independent of the number of r-bins):
+        for each r-bin with any non-zero weight:
+            S_r = Σ_{shifts in bin} (δu·r̂)|δu|² ΔA           (block-sized array)
+            D[scale, ...] += W[scale, r] · S_r                 (accumulate, float64)
+        return D as float32 (scale, ...)
+    Peak memory per block ≈ (n_scales × 8 + a few × 4) bytes per grid point.
     """
 
     # Run the indexing loop ONLY once per block to get the dictionary.
@@ -508,38 +474,126 @@ def _block_space_scale_integral(
 
     radial_distance = increments_data["r"]  # Access without modifying the shared dict
 
-    # ------------------------------------------------------------------------------------
-    # Compute cubed velocity differences for all radial distances: strictly in-memory
-    # ------------------------------------------------------------------------------------
-    integrand_list = []
+    weights = kernel_derivative.transpose("scale", "r")
+    w_np = weights.values  # (scale, r)
+    w_r = weights["r"].values
+    scale_coords = weights["scale"].values
 
+    template = field_chunk["u"]
+
+    # r-bins that contribute to at least one requested scale (others lie beyond every 2ℓ)
+    used = []
     for r_value in radial_distance:
-        da_r = process_single_r_for_field_chunk(
-            field_chunk_ds=field_chunk,
-            r_value=float(r_value),
-            increments_data=increments_data,
-            x_dim=x_dim,
-            y_dim=y_dim,
-            transform_type=transform_type,
-            cache_manager=None
-        )
-        integrand_list.append(da_r)
-
-    if not integrand_list:
+        k = int(np.argmin(np.abs(w_r - r_value)))
+        if np.any(w_np[:, k]):
+            used.append((r_value, w_np[:, k]))
+    if not used:
         raise ValueError("No radial distances to process.")
 
-    # ------------------------------------------------------------------------------------
-    # Merge integrand into a single NumPy-backed array 
-    # ------------------------------------------------------------------------------------
-    integrand = xr.concat(integrand_list, dim="r")
+    x_mode = _NP_PAD_MODES.get(increments_data.get("x_boundary_type", "periodic"))
+    y_mode = _NP_PAD_MODES.get(increments_data.get("y_boundary_type", "reflect"))
 
-    # ------------------------------------------------------------------------------------
-    # Kernel-weighting / masking (Kernel support r <= 2 * scale is guaranteed by construction)
-    # Compute integral over scales using highly-optimized matrix multiplication (GEMM)
-    # ------------------------------------------------------------------------------------
-    weighted_integral = _vectorized_scale_integration(integrand, kernel_derivative)
+    if transform_type == "delta_u_cubed" and x_mode and y_mode:
+        result = _stream_bins_padded(field_chunk, increments_data, used, scale_coords.size,
+                                     x_dim, y_dim, x_mode, y_mode)
+        work_dims = result.pop("dims")
+        accumulator = result.pop("accumulator")
+    else:
+        # Fallback for boundary modes whose padding depends on the pad width (e.g. linear_ramp)
+        work_dims = template.dims
+        accumulator = np.zeros((scale_coords.size,) + template.shape, dtype=np.float64)
+        expand = (slice(None),) + (None,) * template.ndim
+        for r_value, w_col in used:
+            bin_sum = process_single_r_for_field_chunk(
+                field_chunk_ds=field_chunk, r_value=float(r_value),
+                increments_data=increments_data, x_dim=x_dim, y_dim=y_dim,
+                transform_type=transform_type, cache_manager=None
+            ).transpose("r", *template.dims).values[0]
+            accumulator += w_col[expand] * bin_sum
 
-    return weighted_integral
+    coords = {"scale": scale_coords}
+    coords.update({str(d): template.coords[d] for d in template.dims if d in template.coords})
+
+    out = xr.DataArray(accumulator.astype(np.float32), dims=("scale",) + tuple(work_dims),
+                       coords=coords)
+    return out.transpose("scale", *template.dims)
+
+
+# numpy.pad equivalents of the boundary types for which padding once by the largest shift and
+# slicing gives exactly the same values as padding by |shift| + 1 and rolling per shift.
+_NP_PAD_MODES = {"periodic": "wrap", "wrap": "wrap", "reflect": "reflect",
+                 "symmetric": "symmetric", "edge": "edge", "constant": "constant"}
+
+
+def _stream_bins_padded(field_chunk: xr.Dataset, increments_data: Dict, used: list,
+                        n_scales: int, x_dim: str, y_dim: str,
+                        x_mode: str, y_mode: str) -> Dict[str, Any]:
+    """
+    Fast path of the scale integral for one block.
+
+    Each velocity component is padded ONCE by the largest shift used (instead of padding,
+    rolling and cropping every component for every shift). A shifted field is then a view
+    into the padded array, and all per-shift arithmetic runs in preallocated NumPy buffers,
+    which keeps the Python overhead per shift small and releases the GIL for the array work.
+
+    Returns {"accumulator": (scale, ..., y, x) float64, "dims": (..., y, x)}.
+    """
+    names = [v for v in ("u", "v", "w") if v in field_chunk]
+    lead = [d for d in field_chunk["u"].dims if d not in (y_dim, x_dim)]
+    work_dims = tuple(lead) + (y_dim, x_dim)
+    base = {v: np.ascontiguousarray(field_chunk[v].transpose(*work_dims).values,
+                                    dtype=np.float32) for v in names}
+    shape = base["u"].shape
+    ny, nx = shape[-2], shape[-1]
+
+    # Largest shifts actually needed
+    py = max(int(np.abs(increments_data[r]["ny_values"]).max(initial=0)) for r, _ in used)
+    px = max(int(np.abs(increments_data[r]["nx_values"]).max(initial=0)) for r, _ in used)
+
+    def pad(a):
+        lead_pad = [(0, 0)] * (a.ndim - 2)
+        kw_y = {"constant_values": np.nan} if y_mode == "constant" else {}
+        kw_x = {"constant_values": np.nan} if x_mode == "constant" else {}
+        a = np.pad(a, lead_pad + [(py, py), (0, 0)], mode=y_mode, **kw_y)
+        return np.pad(a, lead_pad + [(0, 0), (px, px)], mode=x_mode, **kw_x)
+
+    padded = {v: pad(base[v]) for v in names}
+
+    # Preallocated work buffers
+    du, dv, sq, proj, tmp = (np.empty(shape, dtype=np.float32) for _ in range(5))
+    bin_sum = np.empty(shape, dtype=np.float32)
+    accumulator = np.zeros((n_scales,) + shape, dtype=np.float64)
+    expand = (slice(None),) + (None,) * len(shape)
+
+    for r_value, w_col in used:
+        grid = increments_data[r_value]
+        bin_sum.fill(0.0)
+        for phi, weight, sx, sy in zip(grid["angles"], grid["weights"],
+                                       grid["nx_values"], grid["ny_values"]):
+            ys = slice(py + int(sy), py + int(sy) + ny)
+            xs = slice(px + int(sx), px + int(sx) + nx)
+
+            np.subtract(padded["u"][..., ys, xs], base["u"], out=du)
+            np.subtract(padded["v"][..., ys, xs], base["v"], out=dv)
+            np.multiply(du, du, out=sq)
+            np.multiply(dv, dv, out=tmp)
+            sq += tmp
+            if "w" in padded:
+                np.subtract(padded["w"][..., ys, xs], base["w"], out=tmp)
+                np.multiply(tmp, tmp, out=tmp)
+                sq += tmp
+
+            # (δu·r̂) |δu|² ΔA,  r̂ = (cos φ, sin φ)
+            np.multiply(du, np.float32(np.cos(phi)), out=proj)
+            np.multiply(dv, np.float32(np.sin(phi)), out=tmp)
+            proj += tmp
+            proj *= sq
+            proj *= np.float32(weight)
+            bin_sum += proj
+
+        accumulator += w_col[expand] * bin_sum
+
+    return {"accumulator": accumulator, "dims": work_dims}
 
 
 def scale_transfer(
@@ -688,16 +742,38 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # ----------------------------------------------------------------------------
     # Ensure 'optimal' chunks along non-spatial dimensions for high parallelism
     # ----------------------------------------------------------------------------
-    num_workers = kwargs.get("num_workers", None)
     allow_rechunk = kwargs.get("allow_rechunk", True)
 
     if allow_rechunk:
+        # Thread layout: each worker runs one block per thread at the same time
+        n_workers = kwargs.get("num_workers", None) or get_current_worker_count(
+            verbose=False, total=False)
+        n_threads = max(n_workers, get_current_worker_count(verbose=False, total=True))
+        tasks_per_worker = max(1, n_threads // max(1, n_workers))
+
+        # Working set per grid point of one block, relative to the float32 input fields:
+        #   float64 accumulator + float32 result copy over all scales (12 B per scale), and
+        #   each field padded once by the largest shift (pad_factor × 4 B), its contiguous copy,
+        #   and 7 float32 work buffers (increments, products, bin sum).
+        n_vars = len(velocity_vars)
+        shifted = increments["mask"].any("r")
+        max_ny = int(np.abs(increments["ny"].where(shifted.any("nx"))).max())
+        max_nx = int(np.abs(increments["nx"].where(shifted.any("ny"))).max())
+        pad_factor = ((wind.sizes[y_name] + 2 * max_ny) * (wind.sizes[x_name] + 2 * max_nx)
+                      / (wind.sizes[y_name] * wind.sizes[x_name]))
+        working_bytes = 12 * length_scale.size + 4 * (n_vars * (pad_factor + 1) + 7)
+        expansion = int(np.ceil(working_bytes / (4 * n_vars)))
+
         wind = ensure_optimal_chunking(wind,
                                        spatial_dims=(y_name, x_name), vertical_dim="z",
-                                       # Data size increases by the number of scales, but we batch it
-                                       output_scale_mult=radial_distance.size,
-                                       # Limit number of workers to avoid overheads
-                                       num_workers=num_workers)
+                                       output_scale_mult=expansion,
+                                       num_workers=n_workers,
+                                       tasks_per_worker=tasks_per_worker,
+                                       # compute-bound: one block per thread
+                                       preferred_num_blocks=n_threads,
+                                       min_chunk_mb=1.0,
+                                       # whole horizontal planes are required (shifts span them)
+                                       allow_spatial_tiling=False)
 
     # ----------------------------------------------------------------------------
     # Compute third-order structure functions for each radial distance
