@@ -769,8 +769,12 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
                                        output_scale_mult=expansion,
                                        num_workers=n_workers,
                                        tasks_per_worker=tasks_per_worker,
-                                       # compute-bound: one block per thread
+                                       # compute-bound: at least one block per thread, and
+                                       # one plane per block, so memory per task does not grow
+                                       # with the data volume (measured: per-plane time rises
+                                       # 2.7x and memory 8x from 1 to 24 planes per block)
                                        preferred_num_blocks=n_threads,
+                                       max_planes_per_block=1,
                                        min_chunk_mb=1.0,
                                        # whole horizontal planes are required (shifts span them)
                                        allow_spatial_tiling=False)

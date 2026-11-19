@@ -916,6 +916,7 @@ def ensure_optimal_chunking(
         min_chunk_mb: float = 128.0,
         tasks_per_worker: int = 1,
         allow_spatial_tiling: bool = True,
+        max_planes_per_block: Optional[int] = None,
 ) -> xr.Dataset:
     """
     Adaptive, HPC‑aware multi‑dimensional chunking for Xarray+Dask datasets.
@@ -926,6 +927,9 @@ def ensure_optimal_chunking(
         thread-parallel kernels); the worker memory budget is shared among them.
     allow_spatial_tiling : if False, horizontal planes are never split (required by kernels
         that need whole planes, e.g. the scale transfer); a MemoryError is raised instead.
+    max_planes_per_block : upper bound on (time × level) planes per block. For compute-bound
+        per-plane kernels, small blocks keep memory per task constant (independent of the data
+        volume) and the working arrays cache-friendly.
     """
     y_dim, x_dim = spatial_dims
 
@@ -1036,6 +1040,8 @@ def ensure_optimal_chunking(
 
     # Calculate final planes per chunk based on the target block count
     planes_final = max(1, int(np.ceil(total_planes / blocks_target)))
+    if max_planes_per_block is not None:
+        planes_final = max(1, min(planes_final, int(max_planes_per_block)))
 
     # ---- Choose chunking for time/Z ----
     # Aim for a square chunk in the t-z plane if possible for easier access/caching.

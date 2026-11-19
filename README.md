@@ -160,9 +160,13 @@ Measured on a 24-core workstation (14 usable workers by memory), UA-ICON 267×26
 | `spectral_budget`, 50 levels | 87 s, 6.9 GB | 59 s, 14.0 GB | — | 75 s, 10.4 GB |
 
 In `scale_transfer` mode each block needs whole horizontal planes (shifts span the plane), so the
-planner splits only time and levels, aims for one block per thread, and stops with a
+planner splits only time and levels into blocks of one plane each (at least one block per
+thread), and stops with a
 `MemoryError` if a single plane does not fit in the memory available per thread; reduce the number
 of scales or the threads per worker in that case. Memory per block is about
 `(12 × n_scales + 4 × (n_vars × (pad_factor + 1) + 7))` bytes per grid point and plane, where
 `pad_factor` is the area growth from padding the plane by the largest shift (≈ 4 for the default
-scales).
+scales). Peak memory is therefore about the number of threads times one plane's working set,
+independent of the number of times and levels: on the 267×267 grid with 24 scales, 0.8 GB for
+24 planes and 1.3 GB for 400 planes, with run time linear in the number of planes (~1.7 s per
+plane on 14 threads).
