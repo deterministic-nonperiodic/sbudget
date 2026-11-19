@@ -65,6 +65,40 @@ where, $\delta\mathbf{u}:=\mathbf{u}(x + r)-\mathbf{u}(x)$ is a velocity increme
 and $G_{\ell}(r)$
 is a filter kernel with characteristic length scale $\ell$. See refences for more details.
 
+#### How $\mathcal{T}_\ell$ is computed: exact lattice sum by FFT correlation
+
+On the grid, the integral is the sum over the lattice of horizontal shifts $\mathbf{s}$ (cell area
+$\Delta A$), with the mollifier normalized on the same lattice:
+
+$$\mathcal{T}_\ell(\mathbf{x}) = \sum_{\mathbf{s}} \sum_{i\in\{x,y\}} K_i(\mathbf{s})\,
+\delta u_i \,|\delta\mathbf{u}|^2, \qquad
+K_i(\mathbf{s}) = \frac{\tfrac14\, G_\ell'(|\mathbf{s}|)\,\hat{s}_i\,\Delta A}
+{\sum_{\mathbf{s}'} G_\ell(|\mathbf{s}'|)\,\Delta A}.$$
+
+Writing $\mathbf{a} = \mathbf{u}(\mathbf{x}+\mathbf{s})$ and $\mathbf{b} = \mathbf{u}(\mathbf{x})$, each
+term of $(a_i - b_i)\sum_j (a_j - b_j)^2$ is a product of a field at $\mathbf{x}$ and a field at
+$\mathbf{x}+\mathbf{s}$, so the sum over shifts reduces to correlations
+$(K_i \star F)(\mathbf{x}) = \sum_{\mathbf{s}} K_i(\mathbf{s})F(\mathbf{x}+\mathbf{s})$:
+
+$$\mathcal{T}_\ell = \sum_i K_i\star(u_i|\mathbf{u}|^2)
+- 2\sum_j b_j \sum_i K_i\star(u_i u_j) + |\mathbf{b}|^2 \sum_i K_i\star u_i
+- \sum_i b_i\, K_i\star|\mathbf{u}|^2 + 2\sum_{i,j} b_i b_j\, K_i\star u_j
+- |\mathbf{b}|^2 \sum_i b_i \sum_{\mathbf{s}} K_i(\mathbf{s}),$$
+
+with $i$ over the horizontal and $j$ over all velocity components. Each plane is padded with the
+boundary extension (`reflect`, `wrap`, `symmetric`, `edge`) by the largest shift, so the circular
+FFT correlation of the padded plane equals the linear one at every interior point: the result is
+the exact lattice sum, for any boundary treatment of that kind. Plane means are removed first
+($\delta\mathbf{u}$ is unchanged) to limit cancellation; transforms are float64.
+
+Cost per plane and scale: 12 inverse real FFTs of the padded plane (11 forward FFTs of products
+of the fields per plane, kernel spectra cached per process), i.e. $O(n_\ell\, N \log N)$ instead
+of $O(N_{\rm shifts}\, N)$ for a direct sum over shifts. Measured on UA-ICON nests (16 cores):
+10× faster than the direct sum on a 267×267 grid (20,592 shifts, 24 scales) and 23× faster on a
+267×889 grid (174,000 shifts, 66 scales). Tested against a brute-force lattice sum (agreement
+better than $10^{-5}$) for periodic, reflect, mixed and edge/symmetric boundaries. A
+`constant` (NaN-filled) boundary falls back to a direct sum over shift-distance bins.
+
 ### References:
 
 - J. Peng, L. Zhang, and J. Guan (2015). Applications of a Moist Nonhydrostatic Formulation of the
@@ -146,27 +180,36 @@ Perform analysis on selected levels and scales. Note, level selection is ignored
 `compute.scheduler` (or `--scheduler`) selects how Dask runs:
 
 * `null` (default) — automatic: `distributed` under SLURM, `threads` otherwise.
-* `threads` — one process, all cores as threads. Lowest memory; recommended on workstations.
+* `threads` — one process; recommended on workstations.
 * `distributed` — several worker processes. Needed to span nodes; recommended on HPC. Without
   SLURM or explicit `n_workers`/`threads_per_worker`, cores are grouped into workers of 4 threads.
   Under SLURM, workers and threads follow `SLURM_NTASKS` and `SLURM_CPUS_PER_TASK`.
 
-Measured on a 24-core workstation (14 usable workers by memory), UA-ICON 267×267 lon–lat grid,
-8 times (wall time, peak memory of all processes; identical results in every configuration):
+Resources are sized automatically. Under SLURM, the allocation is used (minus a 4 GB / 10%
+reserve). On a workstation, sbudget uses the physical cores and 85% of the memory available at
+start-up (`threads` mode: at least 0.5 GB per thread; `distributed`: at least 4 GB per process).
+`--n-workers` and `--threads-per-worker` override the core count.
 
-| Mode | `threads` 1×14 | `distributed` 14×1 | `distributed` 7×2 | `distributed` 4×4 |
-|---|---|---|---|---|
-| `scale_transfer`, 3 levels, 24 scales | 36 s, 1.3 GB | 41 s, 4.2 GB | 34 s, 2.6 GB | 33 s, 1.9 GB |
-| `spectral_budget`, 50 levels | 87 s, 6.9 GB | 59 s, 14.0 GB | — | 75 s, 10.4 GB |
+Measured on a workstation (i7-14650HX, 16 physical / 24 logical cores, 62 GB), UA-ICON 267×267
+lon–lat grid, 12 levels × 8 times, 24 scales (wall time incl. start-up and I/O, peak memory of
+all processes; identical results in every configuration):
+
+| `scale_transfer` | 8 threads | 12 threads | **16 threads (default)** | 24 threads | `distributed` 6×4 |
+|---|---|---|---|---|---|
+| wall time | 19.3 s | 17.0 s | **17.0 s** | 18.3 s | 20.7 s |
+| peak memory | 1.8 GB | 2.4 GB | **3.0 GB** | 4.3 GB | 4.9 GB |
+
+Larger runs with the defaults: 50 levels × 8 times (400 planes) 71 s and 4.6 GB; the 267×889
+nest with 66 scales, 2 levels × 8 times, 48 s and 11.7 GB. `spectral_budget` (50 levels, before
+the automatic sizing; 14 threads/workers): `threads` 87 s / 6.9 GB, `distributed` 14×1 59 s /
+14.0 GB, 4×4 75 s / 10.4 GB.
 
 In `scale_transfer` mode each block needs whole horizontal planes (shifts span the plane), so the
 planner splits only time and levels into blocks of one plane each (at least one block per
-thread), and stops with a
-`MemoryError` if a single plane does not fit in the memory available per thread; reduce the number
-of scales or the threads per worker in that case. Memory per block is about
-`(12 × n_scales + 4 × (n_vars × (pad_factor + 1) + 7))` bytes per grid point and plane, where
-`pad_factor` is the area growth from padding the plane by the largest shift (≈ 4 for the default
-scales). Peak memory is therefore about the number of threads times one plane's working set,
-independent of the number of times and levels: on the 267×267 grid with 24 scales, 0.8 GB for
-24 planes and 1.3 GB for 400 planes, with run time linear in the number of planes (~1.7 s per
-plane on 14 threads).
+thread), and stops with a `MemoryError` if a single plane does not fit in the memory available
+per thread; reduce the number of scales or the threads per worker in that case. Memory per block
+is about `(12 × n_scales + 320 × pad_factor)` bytes per grid point and plane, where `pad_factor`
+is the area growth from padding the plane by the largest shift (≈ 3–4 for the default scales);
+each process also caches the kernel spectra (≤ 2 GB). Peak memory is therefore about the number
+of threads times one plane's working set, independent of the number of times and levels, and
+run time is linear in the number of planes.
