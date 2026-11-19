@@ -765,6 +765,27 @@ def test_staggered_outputs_have_zarr_compatible_chunks():
                     for k, v in outs.items()}).to_zarr(f"{tmp}/out.zarr", mode="w", consolidated=False)
 
 
+def test_write_guard_makes_any_chunks_zarr_safe():
+    """The Levante div_hke pattern (z chunks 11, ..., 9, 2, 11, ..., 5) is rechunked before the
+    zarr write; values are unchanged and uniform variables are left alone."""
+    import tempfile
+    from budget.io_utils import zarr_safe_chunks
+    rng = np.random.default_rng(5)
+    zc = (11,) * 22 + (9, 2) + (11,) * 23 + (5,)
+    data = rng.standard_normal((2, sum(zc), 3))
+    bad = xr.DataArray(data, dims=("time", "z", "k")).chunk({"time": 2, "z": zc, "k": 3})
+    good = xr.DataArray(data, dims=("time", "z", "k")).chunk({"time": 1, "z": 50})
+    ds = xr.Dataset({"div_hke": bad, "pi_nke": good})
+    out = zarr_safe_chunks(ds)
+    sizes = out["div_hke"].chunks[1]
+    assert len(set(sizes[:-1])) == 1 and sizes[-1] <= sizes[0], sizes
+    assert out["pi_nke"].chunks == good.chunks
+    with tempfile.TemporaryDirectory() as tmp:
+        out.to_zarr(f"{tmp}/o.zarr", mode="w", consolidated=False)
+        assert np.array_equal(xr.open_zarr(f"{tmp}/o.zarr", consolidated=False)["div_hke"].values,
+                              data)
+
+
 def test_reader_keeps_native_half_level_w(tmp_path=None):
     """ICON-like file (full and half levels as separate dims, stored top-down, w on half levels):
     open_dataset keeps w_half on z_half for the spectral budget, and it is Lorenz-staggered."""
@@ -850,6 +871,7 @@ if __name__ == "__main__":
              test_staggered_conversions_and_dwdz_more_accurate,
              test_staggered_flux_divergence_telescopes, test_compute_budget_with_half_level_w,
              test_staggered_outputs_have_zarr_compatible_chunks,
+             test_write_guard_makes_any_chunks_zarr_safe,
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
              test_cartesian_grid_is_not_global]
     failed = 0

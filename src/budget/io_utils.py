@@ -298,6 +298,29 @@ def _resolve_store_and_path(path: Path | str, store_type: Optional[str] = None) 
     return path, store
 
 
+def zarr_safe_chunks(ds: xr.Dataset) -> xr.Dataset:
+    """Rechunk every dask variable whose chunks are not uniform (all equal except a smaller
+    last one), which zarr cannot store. Combining arrays with different chunk boundaries (e.g.
+    half- and full-level vertical operators) leaves chunks like (11, 9, 2, 11, ...); each such
+    dimension is rechunked to its largest chunk. Variables already uniform are left alone."""
+    fixes = {}
+    for name, da in ds.data_vars.items():
+        if da.chunks is None:
+            continue
+        bad = {dim: max(sizes) for dim, sizes in zip(da.dims, da.chunks)
+               if len(set(sizes[:-1])) > 1 or sizes[-1] > sizes[0]}
+        if bad:
+            fixes[name] = da.chunk(bad)
+    if fixes:
+        print(f"[I/O] Rechunked {len(fixes)} variable(s) to uniform chunks for zarr: "
+              f"{', '.join(sorted(fixes))}")
+        ds = ds.assign(fixes)
+    for name in ds.data_vars:            # stale encodings would re-impose the old chunks
+        ds[name].encoding.pop("chunks", None)
+        ds[name].encoding.pop("preferred_chunks", None)
+    return ds
+
+
 def write_dataset(ds: xr.Dataset, cfg, client=None) -> None:
     """
     Write a Dask-backed xarray.Dataset to disk efficiently.
@@ -369,6 +392,7 @@ def write_dataset(ds: xr.Dataset, cfg, client=None) -> None:
             shutil.rmtree(temp_zarr_path)
 
     # --- Setup Parallel Zarr Write ---
+    ds = zarr_safe_chunks(ds)
     ds.attrs.update(_global_attrs)
 
     engine = getattr(cfg.input, "engine", "netcdf4")
