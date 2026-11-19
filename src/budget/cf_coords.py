@@ -567,6 +567,11 @@ def _is_global_longitude(x_coord: xr.DataArray) -> bool:
         """Map to [0, 360) in degrees; ignore NaNs."""
         return np.asarray(x, dtype=np.float32) % 360.0
 
+    # Only longitudes can be global. Without this check a Cartesian coordinate in metres,
+    # taken modulo 360, fills [0, 360) densely and is misread as global (periodic) coverage.
+    if not _is_geographic(x_coord, "lon"):
+        return False
+
     lon = x_coord.values
     lon = _normalize_deg(lon[np.isfinite(lon)])
 
