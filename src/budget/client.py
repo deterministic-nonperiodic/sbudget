@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import dask
 import asyncio
 import psutil
-from dask.distributed import Client, LocalCluster
+from dask.distributed import Client, LocalCluster, get_client
 
 from .budget import compute_budget
 from .config import load_config, apply_overrides
@@ -29,6 +29,8 @@ warnings.filterwarnings(
 _MAX_FILE_DESCRIPTORS = 8192
 _MIN_WORKER_MEM_GB = 4.0  # Minimum memory per worker in GiB
 _DEFAULT_THREADS_PER_WORKER = 4  # distributed mode without SLURM/explicit settings
+_MIN_THREAD_MEM_GB = 0.5  # threads mode: memory floor per thread
+_WORKSTATION_MEMORY_FRACTION = 0.85  # share of currently available memory used without SLURM
 
 
 
@@ -50,8 +52,17 @@ def _detect_resources(cfg: Optional[Any] = None) -> Dict[str, Union[int, float, 
     from .memory_manager import get_current_worker_count, _parse_slurm_memory
 
     # Thread/Worker Allocation
-    # Use centralized logic from memory_manager
+    # Use centralized logic from memory_manager (SLURM tasks, active client, else CPUs)
     n_workers = get_current_worker_count(verbose=False, total=False)
+
+    # Workstation without client or SLURM: physical cores. Hyperthreads add memory but no
+    # speed for the FFT-bound scale transfer (12-level UA-ICON benchmark, i7-14650HX:
+    # 16 physical cores 17.0 s / 3.0 GB, 24 logical 18.3 s / 4.3 GB).
+    if "SLURM_JOB_ID" not in os.environ:
+        try:
+            get_client()
+        except ValueError:
+            n_workers = psutil.cpu_count(logical=False) or n_workers
     
     # Determine threads per worker
     if "SLURM_CPUS_PER_TASK" in os.environ:
@@ -70,13 +81,15 @@ def _detect_resources(cfg: Optional[Any] = None) -> Dict[str, Union[int, float, 
     # Total Memory Allocation (in GiB)
     # Use centralized logic from memory_manager
     slurm_mem = _parse_slurm_memory()
+    vm = psutil.virtual_memory()
     if slurm_mem is not None:
         total_mem_gb = slurm_mem
     else:
         # Fallback to system memory
-        total_mem_gb = psutil.virtual_memory().total / (1024 ** 3)
+        total_mem_gb = vm.total / (1024 ** 3)
 
-    return {"n_workers": n_workers, "threads_per_worker": n_threads, "total_mem_gb": total_mem_gb}
+    return {"n_workers": n_workers, "threads_per_worker": n_threads, "total_mem_gb": total_mem_gb,
+            "available_mem_gb": vm.available / (1024 ** 3), "slurm_mem": slurm_mem is not None}
 
 
 def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
@@ -139,27 +152,25 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
     for env_var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"]:
         os.environ[env_var] = str(threads_per_worker_detected)
 
-    total_mem_gb = _detect_resources(cfg)["total_mem_gb"]
+    resources = _detect_resources(cfg)
 
-    # Reserve memory for OS/Scheduler (e.g. 4GB or 10%, whichever is larger)
-    # This prevents the cluster from consuming 100% of RAM and triggering OOM kills.
-    reserved_mem = max(4.0, total_mem_gb * 0.10)
-    available_mem_gb = max(0, total_mem_gb - reserved_mem)
+    # Memory pool for the cluster.
+    #  - SLURM: the allocation minus a reserve (4 GB or 10%) for the OS and scheduler.
+    #  - Workstation: a large fraction of the memory that is *available now*, so that other
+    #    applications are respected and swapping/OOM cannot be triggered by sbudget.
+    if resources["slurm_mem"]:
+        total_mem_gb = resources["total_mem_gb"]
+        available_mem_gb = max(0.0, total_mem_gb - max(4.0, total_mem_gb * 0.10))
+    else:
+        available_mem_gb = resources["available_mem_gb"] * _WORKSTATION_MEMORY_FRACTION
 
-    # Calculate the maximum number of workers that can safely fit (N_stable)
-    # This determines the final worker count.
-    max_workers_by_mem = int(available_mem_gb // _MIN_WORKER_MEM_GB)
+    # Total threads requested (cores, or SLURM tasks x cpus-per-task, or config overrides)
+    total_threads = max(1, num_workers_detected * threads_per_worker_detected)
 
-    # Final worker count is the minimum of requested cores and memory capacity
-    num_workers = min(num_workers_detected, max_workers_by_mem)
-
-    if num_workers == 0:
-        raise MemoryError(f"Insufficient memory ({available_mem_gb:.2f}GB available after reservation) "
-                          f"to start even one worker with required minimum budget ({_MIN_WORKER_MEM_GB}GB).")
-    # Finalize Configuration
     if scheduler == "distributed":
-        # Distributed mode: We use multiple processes, so threads per worker is respected
+        # Distributed mode: several processes; each needs its own memory floor
         threads_per_worker = threads_per_worker_detected
+        num_workers = num_workers_detected
         processes = True
 
         # Without SLURM or explicit settings, group the cores into workers of 4 threads:
@@ -168,12 +179,20 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
                     or getattr(cfg.compute, "threads_per_worker", None) is not None)
         if "SLURM_CPUS_PER_TASK" not in os.environ and not explicit:
             threads_per_worker = _DEFAULT_THREADS_PER_WORKER
-            num_workers = max(1, -(-num_workers // threads_per_worker))
+            num_workers = max(1, -(-total_threads // threads_per_worker))
+
+        num_workers = min(num_workers, int(available_mem_gb // _MIN_WORKER_MEM_GB))
     else:
-        # Threads mode: We use one process, so threads per worker = total cores
-        threads_per_worker = num_workers * threads_per_worker_detected
-        num_workers = 1  # Force single worker process for thread mode
+        # Threads mode: one process using every core; memory is shared, so only a small
+        # per-thread floor applies (the scale transfer needs ~0.1-0.5 GB per thread)
+        threads_per_worker = min(total_threads, int(available_mem_gb // _MIN_THREAD_MEM_GB))
+        num_workers = 1
         processes = False
+
+    if num_workers < 1 or threads_per_worker < 1:
+        raise MemoryError(f"Insufficient memory ({available_mem_gb:.2f} GB available) to start "
+                          f"a worker ({_MIN_WORKER_MEM_GB} GB per process, "
+                          f"{_MIN_THREAD_MEM_GB} GB per thread).")
 
     # Calculate the Actual Worker Memory Limit. Distributing the *available* memory among workers
     actual_worker_mem_gb = available_mem_gb / num_workers
