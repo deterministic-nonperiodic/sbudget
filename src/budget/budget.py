@@ -72,6 +72,14 @@ _BUDGET_META = {
               "Adiabatic nonconservative contribution to VKE budget", _BUDGET_UNITS),
     "j_ape": ("adiabatic_nonconservative_ape",
               "Adiabatic nonconservative contribution to APE budget", _BUDGET_UNITS),
+    "j_pres": ("adiabatic_nonconservative_pressure",
+               "Reference-profile term of the vertical pressure flux", _BUDGET_UNITS),
+    "div_pres": ("pressure_divergence_work",
+                 "Pressure work by the anelastic-departure divergence", _BUDGET_UNITS),
+    "np_hke": ("nonlinear_pressure_work_hke",
+               "Horizontal pressure work by potential temperature perturbations", _BUDGET_UNITS),
+    "np_vke": ("nonlinear_pressure_work_vke",
+               "Vertical pressure work by potential temperature perturbations", _BUDGET_UNITS),
 }
 
 
@@ -433,45 +441,73 @@ def conversion_ape(theta_mean: xr.DataArray, theta_prime: xr.DataArray, w: xr.Da
     return ca.rename(name)
 
 
-@budget_metadata
-def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
-                   divergence: xr.DataArray, name="div_hke") -> xr.DataArray:
-    """Horizontal divergence contribution to the HKE budget."""
+# --------------------------------------------------------------------------------------------------
+# Compressibility (Div) and reference-profile (J) terms
+#
+# Per unit mass, the advective tendency of X splits exactly into
+#     -(X, u·∇X + w ∂z X)_k = t_X + ∂z F_X + J_X + Div_X,
+# with the anelastic-departure divergence D = ∇·v + w ∂z ln ρ̄ (zero for anelastic flow) and
+#     Div_X = ½ (X, X D)_k,   J_X = F_X ∂z ln ρ̄   (J_A = F_A ∂z ln(ρ̄/γ) for APE).
+# Then ∂z F_X + J_X = ρ̄⁻¹ ∂z(ρ̄ F_X) for HKE and VKE (γ ρ̄⁻¹ ∂z(ρ̄ F_A / γ) for APE), so the
+# density-weighted layer integrals of the HKE and VKE flux terms reduce to boundary fluxes ρ̄ F.
+# --------------------------------------------------------------------------------------------------
+def _ddz_log_rho_mean(rho: xr.DataArray) -> xr.DataArray:
+    """∂z ln ρ̄ with ρ̄ the horizontal domain mean of density."""
+    return np.log(domain_mean(rho)).differentiate("z", edge_order=2)
+
+
+def anelastic_divergence(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                         divergence: xr.DataArray = None,
+                         rho: xr.DataArray = None) -> xr.DataArray:
+    """D = ∇·v + w ∂z ln ρ̄ = ρ̄⁻¹ ∇·(ρ̄ v). Without rho, returns the full 3-D divergence ∇·v."""
     if divergence is None:
         divergence = horizontal_divergence(u, v)
 
-    wind = stack_vector(u, v, name="wind")
-    divergence_3d = divergence + w.differentiate("z", edge_order=2)
+    div_3d = divergence + w.differentiate("z", edge_order=2)
 
-    div_hke = 0.5 * vector_cross_spectrum(wind, wind * divergence_3d)
+    if rho is not None:
+        div_3d = div_3d + w * _ddz_log_rho_mean(rho)
+
+    return div_3d
+
+
+@budget_metadata
+def divergence_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                   divergence: xr.DataArray, rho: xr.DataArray = None,
+                   name="div_hke") -> xr.DataArray:
+    """Compressibility term of the HKE budget: ½(U, U D)_k.
+
+    With ``rho``, D is the anelastic-departure divergence ρ̄⁻¹∇·(ρ̄v), consistent with
+    J_h = F_h ∂z ln ρ̄. Without ``rho``, D = ∇·v and J_h must be omitted.
+    """
+    wind = stack_vector(u, v, name="wind")
+    div_d = anelastic_divergence(u, v, w, divergence, rho)
+
+    div_hke = 0.5 * vector_cross_spectrum(wind, wind * div_d)
 
     return div_hke.rename(name)
 
 
 @budget_metadata
 def divergence_vke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
-                   divergence: xr.DataArray, name="div_vke") -> xr.DataArray:
-    """Horizontal divergence contribution to the VKE budget."""
-    if divergence is None:
-        divergence = horizontal_divergence(u, v)
+                   divergence: xr.DataArray, rho: xr.DataArray = None,
+                   name="div_vke") -> xr.DataArray:
+    """Compressibility term of the VKE budget: ½(w, w D)_k (see divergence_hke)."""
+    div_d = anelastic_divergence(u, v, w, divergence, rho)
 
-    divergence_3d = divergence + w.differentiate("z", edge_order=2)
-
-    div_vke = 0.5 * scalar_cross_spectrum(w, w * divergence_3d)
+    div_vke = 0.5 * scalar_cross_spectrum(w, w * div_d)
 
     return div_vke.rename(name)
 
 
 @budget_metadata
 def divergence_ape(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray, theta_prime: xr.DataArray,
-                   gamma: xr.DataArray, divergence: xr.DataArray, name="div_ape") -> xr.DataArray:
-    """Horizontal divergence contribution to the APE budget."""
-    if divergence is None:
-        divergence = horizontal_divergence(u, v)
+                   gamma: xr.DataArray, divergence: xr.DataArray, rho: xr.DataArray = None,
+                   name="div_ape") -> xr.DataArray:
+    """Compressibility term of the APE budget: ½γ(θ', θ' D)_k (see divergence_hke)."""
+    div_d = anelastic_divergence(u, v, w, divergence, rho)
 
-    divergence_3d = divergence + w.differentiate("z", edge_order=2)
-
-    div_ape = 0.5 * gamma * scalar_cross_spectrum(theta_prime, theta_prime * divergence_3d)
+    div_ape = 0.5 * gamma * scalar_cross_spectrum(theta_prime, theta_prime * div_d)
 
     return div_ape.rename(name)
 
@@ -480,20 +516,15 @@ def divergence_ape(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray, theta_prim
 def nonconservative_adiabatic_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
                                   rho: xr.DataArray, vf_hke: xr.DataArray = None,
                                   name="j_hke") -> xr.DataArray:
-    """Nonconservative adiabatic contribution to the HKE budget."""
+    """Reference-density term of the HKE budget: J_h = F_h ∂z ln ρ̄.
 
-    # Vertical flux of HKE (compute if absent)
+    Together with ∂z F_h it forms the density-weighted flux divergence ρ̄⁻¹∂z(ρ̄ F_h). Use with
+    divergence_hke(..., rho=rho); with the full-divergence Div_h, J_h would double-count.
+    """
     if vf_hke is None:
         vf_hke = turbulent_hke_flux(u, v, w)
 
-    # Calculate the spatially averaged density at each height (z)
-    rho_mean = domain_mean(rho)
-
-    # Calculate the vertical derivative of the log of the mean density: ∂z( ln(rho_mean) )
-    ddz_ln_rho = np.log(rho_mean).differentiate("z", edge_order=2)
-
-    # Compute the budget term: - vf_hke * [∂z( ln(rho_mean) )]
-    anc_hke = - vf_hke * ddz_ln_rho
+    anc_hke = vf_hke * _ddz_log_rho_mean(rho)
 
     return anc_hke.rename(name)
 
@@ -501,20 +532,11 @@ def nonconservative_adiabatic_hke(u: xr.DataArray, v: xr.DataArray, w: xr.DataAr
 @budget_metadata
 def nonconservative_adiabatic_vke(w: xr.DataArray, rho: xr.DataArray, vf_vke: xr.DataArray = None,
                                   name="j_vke") -> xr.DataArray:
-    """Nonconservative adiabatic contribution to the VKE budget."""
-
-    # Vertical flux of VKE (compute if absent)
+    """Reference-density term of the VKE budget: J_z = F_z ∂z ln ρ̄ (see the HKE version)."""
     if vf_vke is None:
         vf_vke = turbulent_vke_flux(w)
 
-    # Calculate the spatially averaged density at each height (z)
-    rho_mean = domain_mean(rho)
-
-    # Calculate the vertical derivative of the log of the mean density: ∂z( ln(rho_mean) )
-    ddz_ln_rho = np.log(rho_mean).differentiate("z", edge_order=2)
-
-    # Compute the budget term: - vf_vke * [∂z( ln(rho_mean) )]
-    anc_vke = - vf_vke * ddz_ln_rho
+    anc_vke = vf_vke * _ddz_log_rho_mean(rho)
 
     return anc_vke.rename(name)
 
@@ -522,22 +544,77 @@ def nonconservative_adiabatic_vke(w: xr.DataArray, rho: xr.DataArray, vf_vke: xr
 @budget_metadata
 def nonconservative_adiabatic_ape(theta_prime: xr.DataArray, gamma: xr.DataArray, rho: xr.DataArray,
                                   vf_ape: xr.DataArray = None, name="j_ape") -> xr.DataArray:
-    """Nonconservative adiabatic contribution to the APE budget."""
+    """Reference-profile term of the APE budget: J_A = F_A ∂z ln(ρ̄/γ).
 
-    # Vertical flux of APE (compute if absent)
+    The γ(z) part arises because E_A = ½γ(θ', θ')_k with a height-dependent γ.
+    """
     if vf_ape is None:
-        vf_ape = turbulent_ape_flux(theta_prime, gamma)
+        raise ValueError("nonconservative_adiabatic_ape needs vf_ape (turbulent_ape_flux).")
 
-    # Calculate the spatially averaged density at each height (z)
-    rho_mean = domain_mean(rho)
+    ddz_ln_rho_over_gamma = _ddz_log_rho_mean(rho) - np.log(gamma).differentiate("z", edge_order=2)
 
-    # Calculate the vertical derivative of the log of the mean density: ∂z( ln(rho_mean) )
-    ddz_ln_gamma_rho = np.log(rho_mean * gamma).differentiate("z", edge_order=2)
-
-    # Compute the budget term: - vf_ape * [∂z( ln(gamma * rho_mean) )]
-    anc_ape = - vf_ape * ddz_ln_gamma_rho
+    anc_ape = vf_ape * ddz_ln_rho_over_gamma
 
     return anc_ape.rename(name)
+
+
+# --------------------------------------------------------------------------------------------------
+# Pressure work
+#
+# With π' the Exner deviation from the hydrostatic reference built on θ̄(z), the exact horizontal
+# pressure work on HKE, -c_p (U, θ ∇h π')_k, splits exactly into
+#     ∂z F_p + J_p + C_{A→h} + Div_p + N_h,
+#     F_p = -c_p θ̄ (w, π')_k,  J_p = F_p ∂z ln(ρ̄/θ̄),  C_{A→h} = c_p θ̄ (w, ∂z π')_k,
+#     Div_p = c_p θ̄ (π', D)_k,  N_h = -c_p (U, θ' ∇h π')_k.
+# For VKE, (w, -c_p θ ∂z π - g)_k = C_{A→z} + N_z with N_z = -c_p (w, θ' ∂z π')_k.
+# --------------------------------------------------------------------------------------------------
+@budget_metadata
+def pressure_divergence_work(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                             divergence: xr.DataArray, rho: xr.DataArray,
+                             theta_mean: xr.DataArray, exner: xr.DataArray,
+                             name="div_pres") -> xr.DataArray:
+    """Pressure work by the anelastic-departure divergence: c_p θ̄ (π', D)_k."""
+    div_d = anelastic_divergence(u, v, w, divergence, rho)
+
+    div_pres = cp * theta_mean * scalar_cross_spectrum(exner, div_d)
+
+    return div_pres.rename(name)
+
+
+@budget_metadata
+def nonconservative_adiabatic_pressure(vf_pres: xr.DataArray, rho: xr.DataArray,
+                                       theta_mean: xr.DataArray, name="j_pres") -> xr.DataArray:
+    """Reference-profile term of the pressure flux: J_p = F_p ∂z ln(ρ̄/θ̄)."""
+    ddz = _ddz_log_rho_mean(rho) - np.log(theta_mean).differentiate("z", edge_order=2)
+
+    j_pres = vf_pres * ddz
+
+    return j_pres.rename(name)
+
+
+@budget_metadata
+def nonlinear_pressure_work_hke(u: xr.DataArray, v: xr.DataArray, theta_prime: xr.DataArray,
+                                exner: xr.DataArray, name="np_hke") -> xr.DataArray:
+    """Horizontal pressure work by θ' (neglected by the θ̄-based split): -c_p (U, θ' ∇h π')_k."""
+    grad_x, grad_y = horizontal_gradient(exner)
+
+    wind = stack_vector(u, v, name="wind")
+    force = stack_vector(theta_prime * grad_x, theta_prime * grad_y, name="force")
+
+    np_hke = -cp * vector_cross_spectrum(wind, force)
+
+    return np_hke.rename(name)
+
+
+@budget_metadata
+def nonlinear_pressure_work_vke(w: xr.DataArray, theta_prime: xr.DataArray,
+                                exner: xr.DataArray, name="np_vke") -> xr.DataArray:
+    """Vertical pressure work by θ' (not in C_{A→z}): -c_p (w, θ' ∂z π')_k."""
+    dz_exner = exner.differentiate("z", edge_order=2)
+
+    np_vke = -cp * scalar_cross_spectrum(w, theta_prime * dz_exner)
+
+    return np_vke.rename(name)
 
 
 @budget_metadata
@@ -734,6 +811,10 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     vfd_pres_2d = vertical_gradient_flux(vf_pres_2d, name="vfd_pres")
     vfd_pres = isotropize(vfd_pres_2d, dx, dy, cumulative=cumulative)
 
+    # Reference-profile term of the pressure flux (j_pres): ∂z F_p + J_p = θ̄ ρ̄⁻¹ ∂z(ρ̄ F_p / θ̄)
+    j_pres_2d = nonconservative_adiabatic_pressure(vf_pres_2d, rho, theta_mean, name="j_pres")
+    j_pres = isotropize(j_pres_2d, dx, dy, cumulative=cumulative)
+
     # Conversion (cad, caz)
     cad_2d = conversion_ape_to_dke(theta_mean, w, exner_prime, name="cad")
     cad = isotropize(cad_2d, dx, dy, cumulative=cumulative)
@@ -741,23 +822,34 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     caz_2d = conversion_ape_to_vke(theta_mean, theta_prime, w, exner_prime, name="caz")
     caz = isotropize(caz_2d, dx, dy, cumulative=cumulative)
 
-    # --- HORIZONTAL KE DIVERGENCE (div_hke) ---
-    div_hke_2d = divergence_hke(u, v, w, divergence, name="div_hke")
+    # Pressure work by the anelastic-departure divergence (div_pres) and by θ' (np_hke, np_vke):
+    # with these, ∂z F_p + J_p + C_{A→h} + Div_p + N_h is the exact horizontal pressure work.
+    div_pres_2d = pressure_divergence_work(u, v, w, divergence, rho, theta_mean, exner_prime,
+                                           name="div_pres")
+    div_pres = isotropize(div_pres_2d, dx, dy, cumulative=cumulative)
+
+    np_hke_2d = nonlinear_pressure_work_hke(u, v, theta_prime, exner_prime, name="np_hke")
+    np_hke = isotropize(np_hke_2d, dx, dy, cumulative=cumulative)
+
+    np_vke_2d = nonlinear_pressure_work_vke(w, theta_prime, exner_prime, name="np_vke")
+    np_vke = isotropize(np_vke_2d, dx, dy, cumulative=cumulative)
+
+    # --- COMPRESSIBILITY TERMS: D = ρ̄⁻¹∇·(ρ̄v), consistent with the J terms above ---
+    div_hke_2d = divergence_hke(u, v, w, divergence, rho=rho, name="div_hke")
     div_hke = isotropize(div_hke_2d, dx, dy, cumulative=cumulative)
 
-    # --- VERTICAL KE DIVERGENCE (div_vke) ---
-    div_vke_2d = divergence_vke(u, v, w, divergence, name="div_vke")
+    div_vke_2d = divergence_vke(u, v, w, divergence, rho=rho, name="div_vke")
     div_vke = isotropize(div_vke_2d, dx, dy, cumulative=cumulative)
 
-    # --- APE DIVERGENCE (div_ape) ---
-    div_ape_2d = divergence_ape(u, v, w, theta_prime, gamma, divergence, name="div_ape")
+    div_ape_2d = divergence_ape(u, v, w, theta_prime, gamma, divergence, rho=rho, name="div_ape")
     div_ape = isotropize(div_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- ASSEMBLE ---
     fluxes = [hke_1d, rke_1d, dke_1d, vke_1d, ape_1d,
               pi_nke, pi_lke, pi_vke, pi_ape, vfd_dke, vfd_vke, vfd_ape,
               j_hke, j_vke, j_ape, vf_hke, vf_vke, vf_ape, cad, caz,
-              vf_pres, vfd_pres, div_hke, div_vke, div_ape]
+              vf_pres, vfd_pres, j_pres, div_pres, np_hke, np_vke,
+              div_hke, div_vke, div_ape]
 
     # Filter out None and assemble into Dataset
     fluxes = xr.Dataset({da.name: da for da in fluxes if da is not None})

@@ -13,24 +13,37 @@ suitable for studying spectral energy transfers across scales. The budget is for
 [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1),
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
-$$\partial_t E_h(k)=C_{A\to h}(k)+T_h(k)+L_h(k)+\partial_z F_{K\uparrow}(k)+\mathrm{Div}_h(k)+H_h
-(k)+J_h(k)+D_h(k),$$
+$$\partial_t E_h(k)=T_h(k)+L_h(k)+\partial_z F_{h\uparrow}(k)+J_h(k)+\mathrm{Div}_h(k)
++\partial_z F_{p\uparrow}(k)+J_p(k)+C_{A\to h}(k)+\mathrm{Div}_p(k)+N_h(k)+H_h(k)+D_h(k),$$
 and the budget of available potential energy (APE) as:
-$$\partial_t E_A(k)=-C_{A\to h}(k)+T_A(k)+\partial_z F_{A\uparrow}(k)+\mathrm{Div}_A(k)+H_A
-(k)+J_A(k)+D_A(k).$$
+$$\partial_t E_A(k)=-C_A(k)+T_A(k)+\partial_z F_{A\uparrow}(k)+J_A(k)+\mathrm{Div}_A(k)+H_A
+(k)+D_A(k).$$
 
-Where subscripts $h$ and $A$ denote terms for HKE and APE, respectively:
+Where subscripts $h$ and $A$ denote terms for HKE and APE, respectively, and $(a,b)_k$ is the
+co-spectrum summed over the wavenumber shell $k$:
 * $E_h(k), E_A(k)$ — isotropic spectrum of energy at wavenumber $k$.
-* $C_{A\to h}(k)$ — **conversion** from APE to HKE.
-* $T_h(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales).
+* $T_h(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales); sums to zero over
+  $k$ on a periodic domain.
 * $L_h(k)$ — linear **spectral transfer** of HKE due to Coriolis.
-* $F_{K\uparrow}(k), F_{A\uparrow}(k)$ — net **vertical flux** of energy (includes pressure-work for HKE).
-* $\mathrm{Div}_h(k), \mathrm{Div}_A(k)$ — tendency from **3-D divergence** processes.
+* $F_{h\uparrow} = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, $F_{A\uparrow}$ — **vertical flux** of energy
+  (positive downward, so $\partial_z F > 0$ is a gain).
+* $F_{p\uparrow} = -c_p\bar\theta(w,\pi')_k$ — vertical **pressure** flux.
+* $J_h = F_{h\uparrow}\partial_z\ln\bar\rho$, $J_A = F_{A\uparrow}\partial_z\ln(\bar\rho/\gamma)$,
+  $J_p = F_{p\uparrow}\partial_z\ln(\bar\rho/\bar\theta)$ — **reference-profile** terms; with them,
+  $\partial_z F + J = \bar\rho^{-1}\partial_z(\bar\rho F)$ (HKE), so density-weighted layer
+  integrals reduce to boundary fluxes.
+* $\mathrm{Div}_X = \tfrac12(X, X D)_k$, $\mathrm{Div}_p = c_p\bar\theta(\pi', D)_k$ — **compressibility**
+  terms, with $D = \bar\rho^{-1}\nabla\cdot(\bar\rho\mathbf{v})$ (zero for anelastic flow).
+* $C_{A\to h} = c_p\bar\theta(w,\partial_z\pi')_k$ — **conversion** from APE to HKE (pressure work);
+  $C_A = (g/\bar\theta)(w,\theta')_k$ is the total APE→KE conversion.
+* $N_h = -c_p(\mathbf{u}, \theta'\nabla_h\pi')_k$ — pressure work by $\theta'$ (and
+  $N_z = -c_p(w, \theta'\partial_z\pi')_k$ for VKE).
 * $H_h(k), H_A(k)$ — **diabatic** tendency (heating/cooling).
-* $J_h(k), J_A(k)$ — **adiabatic nonconservative** tendency.
 * $D_h(k), D_A(k)$ — **diffusive/dissipative** tendency (viscosity, filters).
 
-Terms $H_{h,A}(k)$ and $D_{h,A}(k)$ are model-physics dependent and therefore omitted here.
+With these definitions the advective and pressure terms reproduce the exact per-unit-mass
+tendencies (tested in `tests/test_synthetic_budget.py`). Terms $H_{h,A}(k)$ and $D_{h,A}(k)$ are
+model-physics dependent and therefore omitted here; $D$ is the budget residual.
 
 #### Features
 

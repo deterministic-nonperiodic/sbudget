@@ -47,7 +47,7 @@ class _NoTaper:
         sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = self.saved
 
 
-def _random_3d_fields(seed=3, n=40, nz=33, L=400e3, H=40e3, w_amp=0.05):
+def _random_3d_fields(seed=3, n=40, nz=33, L=400e3, H=40e3, w_amp=0.05, m_max=4.0):
     """Smooth periodic (in x, y) fields with vertical structure; w deliberately not small."""
     rng = np.random.default_rng(seed)
     dx = L / n
@@ -59,7 +59,7 @@ def _random_3d_fields(seed=3, n=40, nz=33, L=400e3, H=40e3, w_amp=0.05):
         f = np.zeros_like(X)
         for _ in range(10):
             kx, ky = rng.integers(1, 5, 2)
-            m = rng.uniform(1, 4) * 2 * np.pi / H
+            m = rng.uniform(1, m_max) * 2 * np.pi / H
             f += rng.normal() * np.cos(2 * np.pi * (kx * X + ky * Y) / L + m * Z + rng.uniform(0, 6.3))
         return amp * f
 
@@ -400,6 +400,127 @@ def test_spectrum_parseval_and_cumulative_convention():
         assert np.allclose(cum.isel(wavenumber=0), e1d.sum("wavenumber"))
 
 
+# ------------------------------------------------------------------------------------------------
+# Density-weighted closure of the advective and pressure terms (reference profiles rho(z), theta(z))
+# ------------------------------------------------------------------------------------------------
+def _stratified_case(seed=13, n=64):
+    """Synthetic fields plus reference profiles of an isothermal-like atmosphere."""
+    from budget.thermodynamics import lorenz_parameter
+    # 97 levels over 40 km and vertical wavelengths >= 20 km: vertical finite-difference error is
+    # small, so the tests isolate the algebra of the split
+    kw = dict(n=n, nz=97, m_max=2.0)
+    u, v, w, th, dx = _random_3d_fields(seed=seed, w_amp=0.5, **kw)
+    z = u.z
+    rho = xr.ones_like(u) * np.exp(-z / 7000.0)                    # rho_bar(z) after domain mean
+    theta_mean = 250.0 * np.exp(0.02 ** 2 * z / 9.81)              # N = 0.02 s^-1
+    theta_prime = 2.0 * th
+    gamma = lorenz_parameter(theta_mean)
+    exner_prime = 1e-3 * _random_3d_fields(seed=seed + 1, **kw)[0]
+    return u, v, w, theta_prime, theta_mean, gamma, rho, exner_prime, dx
+
+
+def _closure(lhs_terms, exact, dx):
+    lhs = sum(_interior(_shell_sum(t, dx)) for t in lhs_terms)
+    ex = _interior(_shell_sum(exact, dx))
+    return _rel(lhs - ex, float(np.abs(ex).mean()))
+
+
+def test_density_weighted_closure_hke_vke_ape():
+    """t + dF/dz + J + Div reproduces the advective tendency for HKE, VKE and APE."""
+    from budget.budget import (turbulent_vke_flux, turbulent_ape_flux, divergence_vke,
+                               divergence_ape, nonconservative_adiabatic_hke,
+                               nonconservative_adiabatic_vke, nonconservative_adiabatic_ape)
+    from budget.spectral_primitives import scalar_cross_spectrum
+    u, v, w, th, th_mean, gamma, rho, _, dx = _stratified_case()
+    with _NoTaper():
+        div = horizontal_divergence(u, v)
+        wind = stack_vector(u, v)
+
+        f_h = turbulent_hke_flux(u, v, w)
+        adv_h = stack_vector(horizontal_advection(u, u, v) + w * u.differentiate("z"),
+                             horizontal_advection(v, u, v) + w * v.differentiate("z"))
+        err_h = _closure([nonlinear_hke_transfer_flux(u, v, w, div), vertical_gradient_flux(f_h),
+                          nonconservative_adiabatic_hke(u, v, w, rho, vf_hke=f_h),
+                          divergence_hke(u, v, w, div, rho=rho)],
+                         -vector_cross_spectrum(wind, adv_h), dx)
+
+        f_z = turbulent_vke_flux(w)
+        err_z = _closure([nonlinear_vke_transfer(u, v, w, div), vertical_gradient_flux(f_z),
+                          nonconservative_adiabatic_vke(w, rho, vf_vke=f_z),
+                          divergence_vke(u, v, w, div, rho=rho)],
+                         -scalar_cross_spectrum(w, horizontal_advection(w, u, v)
+                                                + w * w.differentiate("z")), dx)
+
+        f_a = turbulent_ape_flux(w, th, gamma)
+        err_a = _closure([nonlinear_ape_transfer(u, v, w, th, gamma, div),
+                          vertical_gradient_flux(f_a),
+                          nonconservative_adiabatic_ape(th, gamma, rho, vf_ape=f_a),
+                          divergence_ape(u, v, w, th, gamma, div, rho=rho)],
+                         -gamma * scalar_cross_spectrum(th, horizontal_advection(th, u, v)
+                                                        + w * th.differentiate("z")), dx)
+    print(f"  closure error: HKE {err_h:.4f}, VKE {err_z:.4f}, APE {err_a:.4f}")
+    assert max(err_h, err_z, err_a) < 0.02
+
+
+def test_pressure_work_closure():
+    """dF_p/dz + J_p + C_{A->h} + Div_p + N_h = -c_p (u, theta grad_h pi')  (exact pressure work)."""
+    from budget.budget import (pressure_flux, conversion_ape_to_dke, pressure_divergence_work,
+                               nonconservative_adiabatic_pressure, nonlinear_pressure_work_hke)
+    from budget.constants import cp
+    from budget.numeric_tools import horizontal_gradient
+    u, v, w, th, th_mean, _, rho, exner, dx = _stratified_case(seed=17)
+    with _NoTaper():
+        div = horizontal_divergence(u, v)
+        f_p = pressure_flux(th_mean, w, exner)
+        gx, gy = horizontal_gradient(exner)
+        theta = th_mean + th
+        exact = -cp * vector_cross_spectrum(stack_vector(u, v), stack_vector(theta * gx, theta * gy))
+        err = _closure([vertical_gradient_flux(f_p),
+                        nonconservative_adiabatic_pressure(f_p, rho, th_mean),
+                        conversion_ape_to_dke(th_mean, w, exner),
+                        pressure_divergence_work(u, v, w, div, rho, th_mean, exner),
+                        nonlinear_pressure_work_hke(u, v, th, exner)], exact, dx)
+    print(f"  pressure-work closure error: {err:.4f}")
+    assert err < 0.03
+
+
+def test_vertical_pressure_buoyancy_closure():
+    """C_{A->z} + N_z = (w, -c_p theta dpi/dz - g)_k with pi = hydrostatic reference + pi'."""
+    from budget.budget import conversion_ape_to_vke, nonlinear_pressure_work_vke
+    from budget.constants import cp, g
+    from budget.spectral_primitives import scalar_cross_spectrum
+    from budget.thermodynamics import hydrostatic_exner_function
+    u, v, w, th, th_mean, _, _, exner_prime, dx = _stratified_case(seed=23)
+    with _NoTaper():
+        exner_ref = hydrostatic_exner_function(th_mean, pi_sfc=xr.DataArray(1.0))
+        theta = th_mean + th
+        dz_pi = (exner_ref + exner_prime).differentiate("z", edge_order=2)
+        exact = scalar_cross_spectrum(w, -cp * theta * dz_pi - g)
+        err = _closure([conversion_ape_to_vke(th_mean, th, w, exner_prime),
+                        nonlinear_pressure_work_vke(w, th, exner_prime)], exact, dx)
+    print(f"  vertical pressure/buoyancy closure error: {err:.4f}")
+    assert err < 0.01
+
+
+def test_layer_integral_gives_boundary_flux():
+    """int rho_bar (dF/dz + J) dz = [rho_bar F] between layer bounds (density-weighted flux form)."""
+    from budget.budget import nonconservative_adiabatic_hke
+    u, v, w, *_, rho, _, dx = _stratified_case(seed=19)
+    with _NoTaper():
+        f_h = turbulent_hke_flux(u, v, w)
+        src = isotropize(vertical_gradient_flux(f_h)
+                         + nonconservative_adiabatic_hke(u, v, w, rho, vf_hke=f_h), dx, dx)
+        flux = isotropize(f_h, dx, dx)
+        rho_bar = rho.mean(("y", "x"))
+        lay = slice(5, 25)
+        integral = (rho_bar * src).isel(z=lay).integrate("z")
+        bounds = (rho_bar * flux).isel(z=lay)
+        jump = bounds.isel(z=-1) - bounds.isel(z=0)
+        err = float(np.abs(integral - jump).max() / np.abs(jump).max())
+    print(f"  layer integral vs boundary-flux difference: {err:.4f}")
+    assert err < 0.02
+
+
 def test_cartesian_grid_is_not_global():
     """A Cartesian x in metres must not be detected as global longitude (forced periodic)."""
     from budget.grid_utils import infer_boundary_conditions
@@ -417,6 +538,8 @@ if __name__ == "__main__":
              test_lattice_bins_partition_shifts, test_lattice_kernel_normalization,
              test_dell_anisotropic_grid, test_dell_converges_with_resolution,
              test_dell_rotation_invariance, test_spectrum_parseval_and_cumulative_convention,
+             test_density_weighted_closure_hke_vke_ape, test_pressure_work_closure,
+             test_vertical_pressure_buoyancy_closure, test_layer_integral_gives_boundary_flux,
              test_cartesian_grid_is_not_global]
     failed = 0
     for t in tests:
