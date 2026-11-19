@@ -19,7 +19,7 @@ compute:
   # FFT stability & memory control
   rechunk_spatial: false    # ensure single spatial chunks (y, x) for FFTs, and convolutions
   chunk_size: 512           # constraint on largest chunk size [MB] for a horizontal plane (y, x)
-  scheduler: threads        # Dask scheduler [threads, distributed, processes]
+  scheduler: null           # null = auto (threads locally, distributed under SLURM) | threads | distributed
 
 variables:
   u: u                      # zonal velocity

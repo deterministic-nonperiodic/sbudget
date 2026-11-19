@@ -28,6 +28,7 @@ warnings.filterwarnings(
 # New constant for maximum file descriptors
 _MAX_FILE_DESCRIPTORS = 8192
 _MIN_WORKER_MEM_GB = 4.0  # Minimum memory per worker in GiB
+_DEFAULT_THREADS_PER_WORKER = 4  # distributed mode without SLURM/explicit settings
 
 
 
@@ -120,8 +121,11 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
     # Ensure sufficient file descriptor limit
     _increase_fd_limit()
 
-    # Scheduler type
-    scheduler = getattr(cfg.compute, "scheduler", "distributed")
+    # Scheduler type. None = automatic: "distributed" under SLURM (scales across nodes),
+    # "threads" otherwise (single process: lowest memory, see README "Choosing a scheduler").
+    scheduler = getattr(cfg.compute, "scheduler", None)
+    if scheduler is None:
+        scheduler = "distributed" if "SLURM_JOB_ID" in os.environ else "threads"
 
     if scheduler not in {"distributed", "threads"}:
         raise ValueError(f"Unknown scheduler type: {scheduler}. Use 'threads' or 'distributed'.")
@@ -157,6 +161,14 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
         # Distributed mode: We use multiple processes, so threads per worker is respected
         threads_per_worker = threads_per_worker_detected
         processes = True
+
+        # Without SLURM or explicit settings, group the cores into workers of 4 threads:
+        # measured fastest for scale_transfer and ~25% less memory than 1-thread workers.
+        explicit = (getattr(cfg.compute, "n_workers", None) is not None
+                    or getattr(cfg.compute, "threads_per_worker", None) is not None)
+        if "SLURM_CPUS_PER_TASK" not in os.environ and not explicit:
+            threads_per_worker = _DEFAULT_THREADS_PER_WORKER
+            num_workers = max(1, -(-num_workers // threads_per_worker))
     else:
         # Threads mode: We use one process, so threads per worker = total cores
         threads_per_worker = num_workers * threads_per_worker_detected

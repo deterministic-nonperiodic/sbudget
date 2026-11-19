@@ -29,7 +29,9 @@ class ComputeConfig:
     shape_parameter: float = 1.0  # Shape parameter p for the mollifier filter
     cumulative: bool = True  # Aggregate scale transfers cumulatively up to each scale
     rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
-    scheduler: str | None = "distributed"  # dask scheduler type: "distributed" or "threads"
+    # Dask scheduler: "threads", "distributed", or None = automatic ("distributed" under SLURM,
+    # "threads" otherwise). See README "Choosing a scheduler" for the measurements behind this.
+    scheduler: str | None = None
     client: bool | None = True  # Run with dask client or local threads
     chunk_size: float | None = None  # approximate chunk size in MiB for non-spatial dimensions
     n_workers: int | None = None

@@ -122,8 +122,10 @@ Write to a different file or store type (NetCDF/Zarr)
   --store netcdf --overwrite
 ```
 
-Switch to scale transfer mode in physical space and define wavelengths (meters). This mode
-calculates inter-scale transfers at specified wavelengths based on third-order structure functions.
+Switch to scale transfer mode in physical space and define filter scales $\ell$ (meters). This mode
+calculates inter-scale transfers across each filter scale based on third-order structure functions;
+the output also carries the equivalent wavelength $\lambda_{eq} \approx 5.58\,\ell$ (half-power point
+of the filter) for comparison with spectral fluxes.
 
 ```bash
   sbudget compute examples/config.yaml \
@@ -138,3 +140,29 @@ Perform analysis on selected levels and scales. Note, level selection is ignored
   sbudget compute examples/config.yaml --mode scale_transfer \ 
   --levels 60e3 --scales 20e3,35e3
 ```
+
+### Choosing a scheduler
+
+`compute.scheduler` (or `--scheduler`) selects how Dask runs:
+
+* `null` (default) — automatic: `distributed` under SLURM, `threads` otherwise.
+* `threads` — one process, all cores as threads. Lowest memory; recommended on workstations.
+* `distributed` — several worker processes. Needed to span nodes; recommended on HPC. Without
+  SLURM or explicit `n_workers`/`threads_per_worker`, cores are grouped into workers of 4 threads.
+  Under SLURM, workers and threads follow `SLURM_NTASKS` and `SLURM_CPUS_PER_TASK`.
+
+Measured on a 24-core workstation (14 usable workers by memory), UA-ICON 267×267 lon–lat grid,
+8 times (wall time, peak memory of all processes; identical results in every configuration):
+
+| Mode | `threads` 1×14 | `distributed` 14×1 | `distributed` 7×2 | `distributed` 4×4 |
+|---|---|---|---|---|
+| `scale_transfer`, 3 levels, 24 scales | 36 s, 1.3 GB | 41 s, 4.2 GB | 34 s, 2.6 GB | 33 s, 1.9 GB |
+| `spectral_budget`, 50 levels | 87 s, 6.9 GB | 59 s, 14.0 GB | — | 75 s, 10.4 GB |
+
+In `scale_transfer` mode each block needs whole horizontal planes (shifts span the plane), so the
+planner splits only time and levels, aims for one block per thread, and stops with a
+`MemoryError` if a single plane does not fit in the memory available per thread; reduce the number
+of scales or the threads per worker in that case. Memory per block is about
+`(12 × n_scales + 4 × (n_vars × (pad_factor + 1) + 7))` bytes per grid point and plane, where
+`pad_factor` is the area growth from padding the plane by the largest shift (≈ 4 for the default
+scales).
