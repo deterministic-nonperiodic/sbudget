@@ -790,13 +790,15 @@ def get_current_worker_count(verbose=True, total=True) -> int:
     # --- Dask client check (Total Threads = Sum of threads across all workers) ---
     try:
         client = get_client()
-        workers = client.scheduler_info().get("workers", {})
+        # client.nthreads() lists every worker ({address: nthreads}); scheduler_info() returns
+        # only the first 5 workers by default in recent distributed versions.
+        nthreads = client.nthreads()
 
         # Sum the number of threads value for all workers
         if total:
-            n_tasks = sum(w.get("nthreads", 1) for w in workers.values())
+            n_tasks = sum(nthreads.values())
         else:
-            n_tasks = len(workers)
+            n_tasks = len(nthreads)
 
         # Ensure at least one thread is assumed if client is active
         if verbose:
@@ -912,11 +914,18 @@ def ensure_optimal_chunking(
         num_workers: Optional[int] = None,
         preferred_num_blocks: Optional[int] = None,
         min_chunk_mb: float = 128.0,
+        tasks_per_worker: int = 1,
+        allow_spatial_tiling: bool = True,
 ) -> xr.Dataset:
     """
     Adaptive, HPC‑aware multi‑dimensional chunking for Xarray+Dask datasets.
     Optimized for the Distributed Scheduler by maximizing chunk size
     within the memory budget while ensuring high parallelism.
+
+    tasks_per_worker : number of chunks a worker processes concurrently (its thread count for
+        thread-parallel kernels); the worker memory budget is shared among them.
+    allow_spatial_tiling : if False, horizontal planes are never split (required by kernels
+        that need whole planes, e.g. the scale transfer); a MemoryError is raised instead.
     """
     y_dim, x_dim = spatial_dims
 
@@ -941,6 +950,17 @@ def ensure_optimal_chunking(
         mode="worker",
     )
 
+    # Memory available to one concurrently running chunk
+    tasks_per_worker = max(1, int(tasks_per_worker))
+    task_limit = worker_limit / tasks_per_worker
+    fits = plane_bytes <= task_limit
+
+    if not fits and not allow_spatial_tiling:
+        raise MemoryError(
+            f"[chunking] One horizontal plane needs ~{_fmt_bytes(plane_bytes)} but only "
+            f"{_fmt_bytes(task_limit)} is available per task ({tasks_per_worker} per worker). "
+            f"Request fewer scales, fewer threads per worker, or more memory per worker.")
+
     plan: Dict[str, Any] = {}
 
     # ---- Spatial chunking decision ----
@@ -954,7 +974,7 @@ def ensure_optimal_chunking(
                   f"{_fmt_bytes(plane_bytes)} / {_fmt_bytes(worker_limit)}.")
     else:
         # Must tile spatial dims (logic remains correct for memory safety)
-        reduction = max(1.0, plane_bytes / max(1, worker_limit))
+        reduction = max(1.0, plane_bytes / max(1, task_limit))
         n_tiles = int(np.ceil(np.sqrt(reduction)))
         cy = int(np.ceil(ds.sizes[y_dim] / n_tiles))
         cx = int(np.ceil(ds.sizes[x_dim] / n_tiles))
@@ -986,7 +1006,7 @@ def ensure_optimal_chunking(
     # Memory Constraint: Minimum blocks needed for safety (blocks_mem)
     # We must account for the expansion factor (output_scale_mult) when checking fit
     expanded_tile_bytes = tile_bytes * output_scale_mult
-    planes_per_chunk_mem = max(1, int(worker_limit // max(1, expanded_tile_bytes)))
+    planes_per_chunk_mem = max(1, int(task_limit // max(1, expanded_tile_bytes)))
     blocks_mem = max(1, int(np.ceil(total_planes / planes_per_chunk_mem)))
 
     # Parallelism Constraint: Workers * Buffer (Goal: keep pipeline full)
