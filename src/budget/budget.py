@@ -181,10 +181,14 @@ def nonlinear_hke_transfer_flux(
     """Nonlinear transfer term for horizontal kinetic energy (HKE), vectorized.
 
     Uses the compact form:
-        T = -⟨U, A⟩ + ⟨∂z U, w U⟩
+        T = -⟨U, A⟩ + ½⟨∂z U, w U⟩
     where U = (u, v),
           A = (u ∂x u + v ∂y u + ½ div·u + ½ w ∂z u,
                u ∂x v + v ∂y v + ½ div·v + ½ w ∂z v)
+
+    The vertical part ½[⟨∂z U, w U⟩ - ⟨U, w ∂z U⟩] is antisymmetric, so T sums to zero over
+    wavenumbers on a periodic domain, and T + ∂z F_h + Div_h equals the spectrum of the
+    advective tendency -⟨U, (U·∇)U + w ∂z U⟩ exactly (Augier & Lindborg 2013).
     """
     # Horizontal & vertical derivatives
     dzu = u.differentiate("z", edge_order=2)
@@ -202,11 +206,11 @@ def nonlinear_hke_transfer_flux(
     adv_u = horizontal_advection(u, u, v) + 0.5 * divergence * u
     adv_v = horizontal_advection(v, u, v) + 0.5 * divergence * v
 
-    advection = - stack_vector(adv_u, adv_v, name="advection") + 0.5 * w * wind_shear
+    advection = - stack_vector(adv_u, adv_v, name="advection") - 0.5 * w * wind_shear
 
     # Spectral vector inner products (sum over components)
     t_adv = vector_cross_spectrum(wind, advection)  # -⟨U, A⟩
-    t_shear = vector_cross_spectrum(wind_shear, w * wind)  # ⟨∂z U, w U⟩
+    t_shear = 0.5 * vector_cross_spectrum(wind_shear, w * wind)  # ½⟨∂z U, w U⟩
 
     pi_nke = t_adv + t_shear
 
@@ -245,9 +249,9 @@ def nonlinear_hke_transfer_invariant(u: xr.DataArray, v: xr.DataArray, w: xr.Dat
     advection = grad_hke + vorticity * rotate_vector(wind)
     advection += (divergence * wind + w * wind_shear) / 2.0
 
-    # Nonlinear spectral transfer
+    # Nonlinear spectral transfer (antisymmetric vertical part: see nonlinear_hke_transfer_flux)
     adv_transfer = - vector_cross_spectrum(wind, advection)
-    vertical_transport = vector_cross_spectrum(wind_shear, w * wind)
+    vertical_transport = 0.5 * vector_cross_spectrum(wind_shear, w * wind)
 
     pi_nke = adv_transfer + vertical_transport
 
@@ -291,9 +295,10 @@ def nonlinear_vke_transfer(
     """Nonlinear transfer term for vertical kinetic energy (VKE), vectorized.
 
     Uses the compact form:
-        T = -⟨w, Aw⟩ + ⟨∂z w, w^2⟩
+        T = -⟨w, Aw⟩ + ½⟨∂z w, w^2⟩
     where U = (u, v),
-          Aw = (u ∂x w + v ∂y w + ½ div·w + ½ w ∂z w) / 2
+          Aw = u ∂x w + v ∂y w + ½ div·w + ½ w ∂z w
+    (antisymmetric vertical part, as in nonlinear_hke_transfer_flux).
     """
 
     # Horizontal & vertical derivatives
@@ -308,7 +313,7 @@ def nonlinear_vke_transfer(
 
     # Spectral vector inner products (sum over components)
     t_adv = - scalar_cross_spectrum(w, advection_w)  # -⟨w, Aw⟩
-    t_shear = scalar_cross_spectrum(dzw, w * w)  # ⟨∂z w, w^2⟩
+    t_shear = 0.5 * scalar_cross_spectrum(dzw, w * w)  # ½⟨∂z w, w^2⟩
 
     pi_vke = t_adv + t_shear
 
@@ -328,9 +333,10 @@ def nonlinear_ape_transfer(
     """Nonlinear transfer term for available potential energy (APE), vectorized.
 
     Uses the compact form:
-        T = γ (-⟨theta, At⟩ + ⟨∂z theta, w.theta⟩)
+        T = γ (-⟨theta, At⟩ + ½⟨∂z theta, w.theta⟩)
     where U = (u, v),
           At = (u ∂x theta + v ∂y theta + ½ div·theta + ½ w ∂z theta)
+    (antisymmetric vertical part, as in nonlinear_hke_transfer_flux).
     """
 
     # Horizontal & vertical derivatives
@@ -346,7 +352,7 @@ def nonlinear_ape_transfer(
 
     # Spectral vector inner products (sum over components)
     t_adv = - scalar_cross_spectrum(theta_prime, advection_theta)  # -⟨theta, At⟩
-    t_shear = scalar_cross_spectrum(dztheta, w * theta_prime)  # ⟨∂z theta, w.theta⟩
+    t_shear = 0.5 * scalar_cross_spectrum(dztheta, w * theta_prime)  # ½⟨∂z theta, w.theta⟩
 
     pi_ape = gamma * (t_adv + t_shear)
 
