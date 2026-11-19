@@ -279,7 +279,9 @@ def _cmd_compute(args) -> None:
             kwargs = {
                 "scales": getattr(cfg.compute, "scales", None), 
                 "verbose": True,
-                "p": getattr(cfg.compute, "shape_parameter", 1)
+                "p": getattr(cfg.compute, "shape_parameter", 1),
+                "divergence_correction": bool(getattr(cfg.compute, "divergence_correction",
+                                                      False)),
             }
             # Compute scale-transfers
             out = inter_scale_kinetic_energy_transfer(ds, **kwargs)
@@ -411,6 +413,11 @@ def main(argv: list[str] | None = None) -> None:
     _add_bool_pair(p_compute, "rechunk-spatial", "rechunk_spatial",
                    "Force single spatial chunks for FFTs (recommended).",
                    "Skip spatial rechunking (faster, less stable for FFT).")
+
+    _add_bool_pair(p_compute, "divergence-correction", "divergence_correction",
+                   "scale_transfer: also output the divergence-corrected transfer "
+                   "(energy_transfer_divergent).",
+                   "scale_transfer: Duchon-Robert transfer only (default).")
 
     _add_bool_pair(p_compute, "client", "client",
                    "Execute local cluster with active dask client (default).",

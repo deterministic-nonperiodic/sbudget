@@ -599,6 +599,126 @@ def test_shift_fallback_close_to_exact():
 
 
 # ------------------------------------------------------------------------------------------------
+# Divergence-corrected transfer D_ell^c = D_ell - C_ell (horizontally divergent flow)
+# ------------------------------------------------------------------------------------------------
+def _brute_force_exchange_padded(fields, div, dx, dy, ell, x_mode, y_mode):
+    """-C_ell = 1/8 sum_s G(s) [(d(x) + d(x+s)) |du|^2 - d[d] d[|u|^2]] dA / sum G dA, padded."""
+    m_x, m_y = int(np.ceil(2 * ell / dx)), int(np.ceil(2 * ell / dy))
+    pad = lambda a: np.pad(np.pad(a, ((0, 0), (m_y, m_y), (0, 0)), mode=_NP_MODE[y_mode]),
+                           ((0, 0), (0, 0), (m_x, m_x)), mode=_NP_MODE[x_mode])
+    allf = dict(fields, div=div)
+    padded = {k: pad(a) for k, a in allf.items()}
+    nz, ny, nx = div.shape
+    sx, sy = np.meshgrid(np.arange(-m_x, m_x + 1), np.arange(-m_y, m_y + 1))
+    g = _mollifier(np.hypot(sx * dx, sy * dy), ell)
+    norm = g.sum() * dx * dy
+    k0 = sum(a ** 2 for a in fields.values())
+    acc = np.zeros((nz, ny, nx))
+    for i, j in zip(*np.nonzero(g)):
+        ys = slice(m_y + sy[i, j], m_y + sy[i, j] + ny)
+        xs = slice(m_x + sx[i, j], m_x + sx[i, j] + nx)
+        sh = {k: padded[k][:, ys, xs] for k in allf}
+        dq = sum((sh[k] - fields[k]) ** 2 for k in fields)
+        dk = sum(sh[k] ** 2 for k in fields) - k0
+        acc += g[i, j] * ((div + sh["div"]) * dq - (sh["div"] - div) * dk)
+    return 0.125 * acc * dx * dy / norm
+
+
+def test_divergence_correction_matches_increment_form():
+    """FFT C_ell == the increment form of the derivation, any boundary; D_ell itself unchanged."""
+    ds, fields, d, scales = _nonperiodic_case()
+    div_np = np.random.default_rng(5).normal(size=fields["u"].shape)
+    div = xr.DataArray(div_np.astype(np.float32), dims=("z", "y", "x"), coords=ds["u"].coords)
+    div_np = div.values.astype(np.float64)
+    for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
+        kw = dict(scales=scales, x_coord_boundary=xb, y_coord_boundary=yb, allow_rechunk=False)
+        out = inter_scale_kinetic_energy_transfer(ds, divergence_correction=True, divergence=div,
+                                                  **kw).transpose("scale", "z", "y", "x")
+        plain = inter_scale_kinetic_energy_transfer(ds, **kw).transpose("scale", "z", "y", "x")
+        assert np.array_equal(out["energy_transfer"].values, plain["energy_transfer"].values)
+        minus_c = (out["energy_transfer_divergent"] - out["energy_transfer"]).values
+        for k, ell in enumerate(scales):
+            ref = _brute_force_exchange_padded(fields, div_np, d, d, ell, xb, yb)
+            err = float(np.abs(minus_c[k] - ref).max() / np.abs(ref).max())
+            assert err < 1e-4, (xb, yb, ell, err)
+        print(f"  boundaries x={xb:8s} y={yb:9s}: C_ell matches the increment form (<1e-4), "
+              f"D_ell unchanged")
+    zero = inter_scale_kinetic_energy_transfer(ds, divergence_correction=True,
+                                               divergence=xr.zeros_like(div), scales=scales,
+                                               allow_rechunk=False)
+    assert np.array_equal(zero["energy_transfer_divergent"].values,
+                          zero["energy_transfer"].values), "C_ell must vanish for div = 0"
+    print("  div = 0: D_ell^c == D_ell exactly")
+
+
+def _spectral_divergent_case(n=64, L=64e3, seed=17):
+    """Periodic trigonometric (u, v), both rotational and divergent, with exact derivatives."""
+    rng = np.random.default_rng(seed)
+    d = L / n
+    x = np.arange(n) * d
+    X, Y = np.meshgrid(x, x, indexing="xy")
+    u = np.zeros((n, n))
+    v = np.zeros((n, n))
+    for _ in range(14):
+        kx, ky = rng.integers(-4, 5, 2)
+        ph = 2 * np.pi * (kx * X + ky * Y) / L + rng.uniform(0, 2 * np.pi)
+        u += rng.normal() * np.cos(ph)
+        v += rng.normal() * np.cos(ph + rng.uniform(0, 2 * np.pi))
+    k1 = 2 * np.pi * np.fft.fftfreq(n, d)
+    KX, KY = np.meshgrid(k1, k1, indexing="xy")
+    ddx = lambda f: np.real(np.fft.ifft2(1j * KX * np.fft.fft2(f)))
+    ddy = lambda f: np.real(np.fft.ifft2(1j * KY * np.fft.fft2(f)))
+    return u, v, x, d, ddx, ddy
+
+
+def test_divergence_corrected_dell_closes_local_budget():
+    """Exact local identity -1/2 [ubar.N + u.Nbar] = -div J - D_ell^c for divergent flow.
+
+    N = (U.grad)U + 1/2 div(U) U (skew-symmetric, the flux-form Pi_h), J the Duchon-Robert flux,
+    bar the lattice filter. Derivatives are spectral (exact for these fields); the remaining
+    error is the lattice quadrature of grad G in D_ell (decreases with ell / dx). Plain D_ell
+    must fail the same identity.
+    """
+    u, v, x, d, ddx, ddy = _spectral_divergent_case()
+    div = ddx(u) + ddy(v)
+    assert np.abs(div).max() > 0.5 * np.abs(ddx(u)).max()          # strongly divergent
+    ell = 8 * d
+    ds = _as_dataset(u, v, x)
+    div_da = xr.DataArray(np.repeat(div[None], 3, 0), dims=("z", "y", "x"), coords=ds["u"].coords)
+    out = inter_scale_kinetic_energy_transfer(
+        ds, scales=np.array([ell]), x_coord_boundary="periodic", y_coord_boundary="periodic",
+        allow_rechunk=False, divergence_correction=True, divergence=div_da)
+    dell = out["energy_transfer"].isel(z=1, scale=0).transpose("y", "x").values.astype(float)
+    dc = out["energy_transfer_divergent"].isel(z=1, scale=0).transpose("y", "x").values
+    dc = dc.astype(float)
+
+    m = int(np.ceil(2 * ell / d))
+    sx, sy = np.meshgrid(np.arange(-m, m + 1), np.arange(-m, m + 1))
+    g = _mollifier(np.hypot(sx, sy) * d, ell)
+    g = g / g.sum()
+    bar = lambda f: sum(g[i, j] * np.roll(f, (-sy[i, j], -sx[i, j]), (0, 1))
+                        for i, j in zip(*np.nonzero(g)))
+    ub, vb = bar(u), bar(v)
+    k = u ** 2 + v ** 2
+    nu = u * ddx(u) + v * ddy(u) + 0.5 * div * u
+    nv = u * ddx(v) + v * ddy(v) + 0.5 * div * v
+    s_f = -0.5 * (ub * nu + vb * nv + u * bar(nu) + v * bar(nv))
+    jx = 0.5 * u * (u * ub + v * vb) + 0.25 * (bar(u * k) - u * bar(k))
+    jy = 0.5 * v * (u * ub + v * vb) + 0.25 * (bar(v * k) - v * bar(k))
+    div_j = ddx(jx) + ddy(jy)
+
+    scale = np.abs(dell).max()
+    res_c = float(np.abs(s_f + div_j + dc).max() / scale)
+    res_d = float(np.abs(s_f + div_j + dell).max() / scale)
+    mean_c = abs(dc.mean() + s_f.mean()) / abs(s_f.mean())
+    print(f"  ell = 8 dx: local residual with D_ell^c {res_c:.1e}, with D_ell {res_d:.2f};"
+          f" domain mean: |<D^c> + <S>| / |<S>| = {mean_c:.1e}")
+    assert res_c < 2e-3, res_c
+    assert res_d > 0.1, res_d                     # the test discriminates
+    assert mean_c < 2e-3, mean_c
+
+
+# ------------------------------------------------------------------------------------------------
 # Lorenz-staggered vertical grid (w on half levels)
 # ------------------------------------------------------------------------------------------------
 def _lorenz_case(levels_per_lambda=8, n=24, lam=4000.0, depth=24000.0, seed=31):
@@ -867,6 +987,8 @@ if __name__ == "__main__":
              test_density_weighted_closure_hke_vke_ape, test_pressure_work_closure,
              test_vertical_pressure_buoyancy_closure, test_layer_integral_gives_boundary_flux,
              test_fft_path_matches_exact_lattice_nonperiodic, test_shift_fallback_close_to_exact,
+             test_divergence_correction_matches_increment_form,
+             test_divergence_corrected_dell_closes_local_budget,
              test_vertical_operators_exact_for_linear_profiles,
              test_staggered_conversions_and_dwdz_more_accurate,
              test_staggered_flux_divergence_telescopes, test_compute_budget_with_half_level_w,

@@ -143,6 +143,10 @@ def apply_overrides(cfg, args):
     if sp is not None:
         _set_nested(cfg, ["compute", "shape_parameter"], float(sp))
 
+    dc = _get(args, "divergence_correction")
+    if dc is not None:
+        _set_nested(cfg, ["compute", "divergence_correction"], bool(dc))
+
     rs = _get(args, "rechunk_spatial")
     if rs is not None:
         _set_nested(cfg, ["compute", "rechunk_spatial"], bool(rs))

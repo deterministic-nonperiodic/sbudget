@@ -125,6 +125,34 @@ of $O(N_{\rm shifts}\, N)$ for a direct sum over shifts. Measured on UA-ICON nes
 better than $10^{-5}$) for periodic, reflect, mixed and edge/symmetric boundaries. A
 `constant` (NaN-filled) boundary falls back to a direct sum over shift-distance bins.
 
+#### Divergent flow: $\mathcal{T}^c_\ell$ (`--divergence-correction`)
+
+$\mathcal{T}_\ell$ closes the local budget of the mixed energy $\tfrac12\mathbf{u}\cdot\bar{\mathbf{u}}$
+only for non-divergent horizontal flow. With $\delta = \partial_x u + \partial_y v \neq 0$ and the
+skew-symmetric (energy-conserving) advection $N_j = (\mathbf{U}\cdot\nabla_h)u_j + \tfrac12\delta u_j$,
+whose spectrum is the flux-form $\Pi_h$ of the spectral budget, the exact local identity is
+
+$$-\tfrac12\left[\bar{\mathbf{u}}\cdot\mathbf{N} + \mathbf{u}\cdot\bar{\mathbf{N}}\right]
+= -\nabla_h\cdot\mathbf{J}_\ell - \mathcal{T}^c_\ell, \qquad
+\mathcal{T}^c_\ell = \mathcal{T}_\ell - C_\ell,$$
+
+$$C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}}
+- \tfrac14\,|\mathbf{u}|^2\,\bar\delta - \tfrac14\,\delta\,\overline{|\mathbf{u}|^2}
+= -\tfrac18\int G_\ell(\mathbf{r})\left[(\delta(\mathbf{x})+\delta(\mathbf{x}+\mathbf{r}))\,|\delta\mathbf{u}|^2
+- \delta[\delta]\,\delta[|\mathbf{u}|^2]\right]\mathrm{d}^2\mathbf{r},$$
+
+with $\mathbf{J}_\ell$ the Duchon–Robert flux and the bar the same lattice filter. The domain mean
+of $\mathcal{T}^c_\ell$ is therefore the kernel-weighted flux-form spectral transfer
+$\sum_k T(k)\,[1-\hat G(k\ell)]$. $C_\ell$ (the dilatational exchange) vanishes for $\delta = 0$;
+unlike $\mathcal{T}_\ell$, it depends on a uniform background velocity when $\delta \neq 0$, as the
+flux-form $\Pi_h$ does. The option adds `energy_transfer_divergent` ($\mathcal{T}^c_\ell$) to the
+output; `energy_transfer` is unchanged. $\delta$ is computed from $(u, v)$ with the same finite
+differences as the spectral budget. Cost: $2n+2$ extra inverse FFTs per plane and scale ($n$
+velocity components). Tests: the FFT evaluation of $C_\ell$ equals its increment form to
+$10^{-4}$ (any boundary), and the local identity above closes to $4\times10^{-4}$ of
+$\max|\mathcal{T}_\ell|$ (lattice quadrature) for strongly divergent periodic fields, where plain
+$\mathcal{T}_\ell$ leaves a residual of order one.
+
 ### References:
 
 - J. Peng, L. Zhang, and J. Guan (2015). Applications of a Moist Nonhydrostatic Formulation of the

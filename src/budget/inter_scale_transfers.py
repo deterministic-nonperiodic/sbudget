@@ -636,7 +636,8 @@ def _kernel_spectra(lattice: Dict, shape: tuple, ell: float, p: float) -> tuple:
 
     nbytes = spectra[0].nbytes * 2
     with _KERNEL_CACHE_LOCK:
-        used = sum(v[0].nbytes * 2 for v in _KERNEL_CACHE.values())
+        used = sum((v[0].nbytes * 2 if isinstance(v, tuple) else v.nbytes)
+                   for v in _KERNEL_CACHE.values())
         if used + nbytes <= _KERNEL_CACHE_MAX_BYTES:
             _KERNEL_CACHE[key] = entry
     return entry
@@ -719,6 +720,113 @@ def _dell_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, 
             accumulator[(n,) + idx] = d
 
     return accumulator, work_dims
+
+
+def _filter_spectrum(lattice: Dict, shape: tuple, ell: float, p: float) -> np.ndarray:
+    """
+    conj(rFFT) of the normalized lattice filter on the padded plane,
+
+        G(s) = G_ℓ(|s|) ΔA / Σ_s G_ℓ(|s|) ΔA      (Σ and G include the zero shift),
+
+    the same normalization as the D_ℓ kernels (_kernel_spectra), placed at (s mod M) so that
+    irfft2(rfft2(A) · Ĝ) = Σ_s G(s) A(x + s) = Ā(x).
+    """
+    key = ("filter", shape, lattice["sy"].size, int(np.abs(lattice["sy"]).max()),
+           int(np.abs(lattice["sx"]).max()), lattice["cell_area"], float(ell), float(p))
+    cached = _KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    sy, sx, dist, cell = lattice["sy"], lattice["sx"], lattice["dist"], lattice["cell_area"]
+    zero = (sy == 0) & (sx == 0)
+    g = _evaluate_mollifier(dist[~zero], np.array([ell]), p=p)[0]
+    g0 = _evaluate_mollifier(np.array([0.0]), np.array([ell]), p=p)[0, 0]
+    norm = max((g.sum() + g0) * cell, epsilon)
+
+    my, mx = shape
+    kernel = np.zeros(shape, dtype=np.float64)
+    np.add.at(kernel, (sy[~zero] % my, sx[~zero] % mx), g * cell / norm)
+    kernel[0, 0] += g0 * cell / norm
+    spectrum = np.conj(sfft.rfft2(kernel, workers=1))
+
+    with _KERNEL_CACHE_LOCK:
+        used = sum((v[0].nbytes * 2 if isinstance(v, tuple) else v.nbytes)
+                   for v in _KERNEL_CACHE.values())
+        if used + spectrum.nbytes <= _KERNEL_CACHE_MAX_BYTES:
+            _KERNEL_CACHE[key] = spectrum
+    return spectrum
+
+
+def _block_dilatational_exchange(field_chunk: xr.Dataset, increments: Dict | Future,
+                                 x_dim: str, y_dim: str, scales: np.ndarray,
+                                 kernel_params: Dict | None = None) -> xr.DataArray:
+    """
+    Dilatational exchange C_ℓ per block (see inter_scale_kinetic_energy_transfer):
+
+        C_ℓ = ¼ δ (u·ū) + ¼ u·(δu)‾ - ¼ |u|² δ̄ - ¼ δ (|u|²)‾,
+
+    with δ = field_chunk["div"] and the bar the lattice filter G_ℓ of D_ℓ (same normalization,
+    same boundary extension). Unlike D_ℓ it is evaluated on the full fields (mean included).
+    Cost per plane and scale: 2 n + 2 inverse FFTs of the padded plane (n velocity components).
+    """
+    if isinstance(increments, Future):
+        increments_data = increments.result()
+    elif isinstance(increments, dict) and "geometry_spec" in increments:
+        increments_data = _increments_from_spec(increments["geometry_spec"])
+    else:
+        increments_data = increments
+
+    x_mode = _NP_PAD_MODES.get(increments_data.get("x_boundary_type", "periodic"))
+    y_mode = _NP_PAD_MODES.get(increments_data.get("y_boundary_type", "reflect"))
+    if "lattice" not in increments_data or x_mode not in _FFT_PAD_MODES \
+            or y_mode not in _FFT_PAD_MODES:
+        raise NotImplementedError(
+            "The divergence correction needs the FFT path (boundary types wrap, periodic, "
+            f"reflect, symmetric or edge); got x={x_mode}, y={y_mode}.")
+    lattice = increments_data["lattice"]
+    p = float((kernel_params or {}).get("p", 1.0))
+
+    names = [v for v in ("u", "v", "w") if v in field_chunk]
+    template = field_chunk["u"]
+    lead = [d for d in template.dims if d not in (y_dim, x_dim)]
+    work_dims = tuple(lead) + (y_dim, x_dim)
+    data = {v: field_chunk[v].transpose(*work_dims).values for v in names + ["div"]}
+
+    shape = data["u"].shape
+    ny, nx = shape[-2:]
+    py, px = int(np.abs(lattice["sy"]).max()), int(np.abs(lattice["sx"]).max())
+    my, mx = ny + 2 * py, nx + 2 * px
+    inner = (slice(py, py + ny), slice(px, px + nx))
+    rfft = lambda a: sfft.rfft2(a, workers=1)
+
+    accumulator = np.zeros((len(scales),) + shape, dtype=np.float64)
+    for idx in np.ndindex(*shape[:-2]):
+        b = {v: data[v][idx].astype(np.float64) for v in names + ["div"]}
+        a = {v: _pad_plane(b[v], py, px, y_mode, x_mode) for v in names + ["div"]}
+        k_pad = sum(a[v] ** 2 for v in names)
+        f_u = [rfft(a[v]) for v in names]
+        f_du = [rfft(a["div"] * a[v]) for v in names]
+        f_d, f_k = rfft(a["div"]), rfft(k_pad)
+        del k_pad
+
+        d = b["div"]
+        k = sum(b[v] ** 2 for v in names)
+        n = len(names)
+        for m, ell in enumerate(scales):
+            gh = _filter_spectrum(lattice, (my, mx), ell, p)
+            bars = sfft.irfft2(np.stack([f * gh for f in f_u + f_du + [f_d, f_k]]), s=(my, mx),
+                               axes=(-2, -1), workers=1)[(slice(None),) + inner]
+            u_bar, du_bar, d_bar, k_bar = bars[:n], bars[n:2 * n], bars[2 * n], bars[2 * n + 1]
+            c = 0.25 * d * sum(b[v] * u_bar[j] for j, v in enumerate(names))
+            c += 0.25 * sum(b[v] * du_bar[j] for j, v in enumerate(names))
+            c -= 0.25 * k * d_bar + 0.25 * d * k_bar
+            accumulator[(m,) + idx] = c
+
+    coords = {"scale": scales}
+    coords.update({str(dd): template.coords[dd] for dd in template.dims if dd in template.coords})
+    out = xr.DataArray(accumulator.astype(np.float32), dims=("scale",) + work_dims,
+                       coords=coords)
+    return out.transpose("scale", *template.dims)
 
 
 def _pad_plane(a: np.ndarray, py: int, px: int, y_mode: str, x_mode: str) -> np.ndarray:
@@ -901,8 +1009,19 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Validate input dataset
     velocity_vars = [v for v in ["u", "v", "w"] if v in wind]
 
+    # Divergence-corrected transfer (see below): needs the horizontal divergence of (u, v)
+    divergence_correction = bool(kwargs.get("divergence_correction", False))
+    divergence = None
+    if divergence_correction:
+        divergence = kwargs.get("divergence", None)
+        if divergence is None:
+            from .numeric_tools import horizontal_divergence
+            divergence = horizontal_divergence(wind["u"], wind["v"])
+
     # Ensure velocity components are float32 for memory efficiency
     wind = wind[velocity_vars].astype({v: "float32" for v in velocity_vars})
+    if divergence is not None:
+        wind = wind.assign(div=divergence.transpose(*wind["u"].dims).astype("float32"))
 
     # Check if the dataset has the required variables
     verbose = kwargs.get("verbose", False)
@@ -991,7 +1110,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Compute third-order structure functions for each radial distance
     # ----------------------------------------------------------------------------
     energy_transfer_rate = scale_transfer(
-        field=wind.fillna(0.0),
+        field=wind[velocity_vars].fillna(0.0),
         increments=increments_data,
         radial_distance=radial_distance,
         length_scale=length_scale,
@@ -1046,7 +1165,44 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         "description": "Equivalent spectral wavelength calculated as 2*pi / equivalent_wavenumber."
     })
 
+    # ----------------------------------------------------------------------------
+    # Divergence-corrected transfer D_ℓᶜ = D_ℓ - C_ℓ (optional)
+    #
+    # D_ℓ (Duchon & Robert 2000) closes the local budget of the mixed energy ½ u·ū only for
+    # non-divergent u. For horizontally divergent flow (δ = ∂x u + ∂y v ≠ 0) and the
+    # skew-symmetric advection N_j = (U·∇) u_j + ½ δ u_j, whose spectrum is the conservative
+    # (flux-form) Π_h, the exact local identity is
+    #     -½ [ū·N + u·N̄] = -∇·J_ℓ - D_ℓᶜ,   D_ℓᶜ = D_ℓ - C_ℓ,
+    #     C_ℓ = ¼ δ (u·ū) + ¼ u·(δu)‾ - ¼ |u|² δ̄ - ¼ δ (|u|²)‾
+    #         = -⅛ ∫ G_ℓ(r) [ (δ(x) + δ(x+r)) |δu|² - δ[δ] δ[|u|²] ] dr,
+    # with J_ℓ the Duchon-Robert flux. The domain mean of D_ℓᶜ is therefore the kernel-weighted
+    # flux-form spectral transfer, Σ_k T(k) [1 - Ĝ(kℓ)]. C_ℓ vanishes for δ = 0. Unlike D_ℓ,
+    # C_ℓ (like the flux-form Π_h) depends on a uniform background velocity when δ ≠ 0.
+    # ----------------------------------------------------------------------------
+    divergent = None
+    if divergence_correction:
+        field_c = wind.fillna(0.0)
+        exchange = xr.map_blocks(
+            _block_dilatational_exchange,
+            field_c,
+            kwargs=dict(increments=increments_data, x_dim=x_name, y_dim=y_name,
+                        scales=length_scale.values, kernel_params={"p": kwargs.get("p", 1)}),
+            template=field_c["u"].expand_dims(scale=length_scale).rename("exchange"),
+        ).assign_coords(**coord_dict)
+        divergent = (energy_transfer_rate - exchange).rename("energy_transfer_divergent")
+        divergent.attrs.update({
+            'units': "W / kg",
+            'long_name': "Divergence-corrected transfer rate of kinetic energy across scales",
+            'description': "D_ell - C_ell: Duchon-Robert transfer plus the dilatational "
+                           "exchange of horizontally divergent flow; its domain mean is the "
+                           "kernel-weighted flux-form (skew-symmetric) spectral transfer. "
+                           "Positive means forward energy transfer towards smaller scales"
+        })
+
     # Promote to dataset and transpose to have 'scale' as the last dimension
-    energy_transfer_rate = energy_transfer_rate.to_dataset().transpose(..., "scale")
+    energy_transfer_rate = energy_transfer_rate.to_dataset()
+    if divergent is not None:
+        energy_transfer_rate["energy_transfer_divergent"] = divergent
+    energy_transfer_rate = energy_transfer_rate.transpose(..., "scale")
 
     return energy_transfer_rate
