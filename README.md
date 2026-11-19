@@ -45,6 +45,32 @@ With these definitions the advective and pressure terms reproduce the exact per-
 tendencies (tested in `tests/test_synthetic_budget.py`). Terms $H_{h,A}(k)$ and $D_{h,A}(k)$ are
 model-physics dependent and therefore omitted here; $D$ is the budget residual.
 
+#### Vertical discretization on staggered model grids
+
+Models such as ICON use a Lorenz-staggered vertical grid: $u, v, \theta', \pi'$ on full levels
+(layer centres) and $w$ on half levels (interfaces). When the input stores $w$ on its own
+half-level dimension, the reader keeps it as `w_half` (coordinate `z_half`, metres) next to the
+interpolated full-level `w`, and the spectral budget uses the grid's own operators:
+
+* $\partial_z w$ (in all $\mathrm{Div}$ terms) is the compact difference of `w_half` across each layer;
+* the vertical fluxes $F_{h\uparrow}, F_{z\uparrow}, F_{A\uparrow}, F_{p\uparrow}$ are formed at the
+  interfaces with the native $w$ (full-level fields interpolated there) and their divergences are
+  compact differences, so layer sums telescope exactly to interface fluxes; the fluxes are
+  reported on full levels as the mean of the bounding interfaces;
+* the pressure-work conversions $C_{A\to h}, C_{A\to z}$ and $N_z$ use the compact $\partial_z\pi'$
+  at the interfaces, co-located with $w$, and are averaged to full levels.
+
+The nonlinear transfers keep the full-level form (their antisymmetric vertical part conserves
+energy exactly). Inputs without a half-level $w$ use centred differences on full levels.
+
+Why: interpolating $w$ to full levels damps it by $\cos(m\Delta z/2)$, and a centred difference
+over $2\Delta z$ by $\sin(m\Delta z)/(m\Delta z)$. Against analytic vertical waves
+(`dev/vertical_discretization_study.py`, tested in `tests/test_synthetic_budget.py`), at 5 levels
+per vertical wavelength the error of $\partial_z w$ falls from 39% to 6.5% and that of
+$C_{A\to h}$ from 39% to 6%; at 8 levels, from 17% to 2–3%. The cubic flux terms are limited by
+unresolved harmonics of the product (≈40% at 5 levels for every formulation), so the operator
+choice matters there only for telescoping and closure.
+
 #### Features
 
 - FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along

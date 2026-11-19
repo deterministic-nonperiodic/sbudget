@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Tuple, Optional
 
 import dask
+import numpy as np
 import xarray as xr
 from dask.base import is_dask_collection
 from dask.diagnostics import ProgressBar
@@ -20,8 +21,14 @@ _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git
                  'references': '', 'Conventions': 'CF-1.6'}
 
 
-def ensure_vertical_consistent(ds: xr.Dataset | xr.DataArray, target_name="z") -> xr.Dataset:
-    """Interpolate to common vertical levels"""
+def ensure_vertical_consistent(ds: xr.Dataset | xr.DataArray, target_name="z",
+                               keep_native_w: bool = False) -> xr.Dataset:
+    """Interpolate to common vertical levels.
+
+    With ``keep_native_w``, a w stored on its own (half-level) vertical dimension is also kept
+    unchanged as ``w_half`` on the coordinate ``z_half`` (metres), so that budgets can use the
+    model's staggered vertical operators (see budget.vertical).
+    """
 
     if target_name not in ds.coords:
         raise ValueError(f"'target_name' '{target_name}' is not a coordinate in the dataset.")
@@ -29,6 +36,18 @@ def ensure_vertical_consistent(ds: xr.Dataset | xr.DataArray, target_name="z") -
     # Candidate vertical dims: anything that's not the standardized horizontal/time or target_name
     excluded = {"time", "x", "y", target_name}
     z_candidate = [str(d) for d in ds.dims if _is_z(str(d), ds.coords) and (d not in excluded)]
+
+    w_half = None
+    if keep_native_w and "w" in ds:
+        for z_dim in z_candidate:
+            if z_dim in ds["w"].dims:
+                z_half = ds[z_dim]
+                if not _coord_is_meter(z_half):
+                    z_half = convert_units(z_half, "km", "m")
+                w_half = (ds["w"].rename({z_dim: "z_half"})
+                          .assign_coords(z_half=("z_half", np.asarray(z_half.values, dtype=float))))
+                print(f"Keeping native half-level w ({z_dim} -> z_half, {w_half.sizes['z_half']} levels)")
+                break
 
     for z_dim in z_candidate:
         # Check for metadata consistent with vertical coordinate
@@ -45,6 +64,9 @@ def ensure_vertical_consistent(ds: xr.Dataset | xr.DataArray, target_name="z") -
             # Assume km if not meters
             print(f"Converting vertical coordinate '{target_name}' to meters ...")
             ds = ds.assign_coords({target_name: convert_units(z_coord, "km", "m")})
+
+    if w_half is not None:
+        ds["w_half"] = w_half
 
     return ds
 
@@ -205,12 +227,14 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
     # Ensure units consistency
     ds = check_convert_units(ds)
 
-    # Interpolate to consistent vertical coordinates and convert to meters if needed
-    ds = ensure_vertical_consistent(ds, target_name='z')
-
     # select specified vertical levels
     levels = getattr(cfg.compute, "levels", None)
     mode = str(cfg.compute.mode).strip()
+
+    # Interpolate to consistent vertical coordinates and convert to meters if needed. The
+    # spectral budget also keeps the native half-level w for the staggered vertical operators.
+    ds = ensure_vertical_consistent(ds, target_name='z',
+                                    keep_native_w=(mode == "spectral_budget"))
 
     # select specified vertical levels
     if levels is not None and mode == "scale_transfer":
