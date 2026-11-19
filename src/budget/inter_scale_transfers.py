@@ -1,6 +1,8 @@
+import threading
 from typing import Any, Dict
 
 import numpy as np
+import scipy.fft as sfft
 import xarray as xr
 from dask.distributed import Future
 from dask.distributed import get_client
@@ -426,6 +428,18 @@ def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
             "weights": weights,
         }
 
+    # Full shift lattice (every shift of every bin) for the FFT path: exact per-shift kernel
+    used = increments_ds["mask"].any("r").values
+    ny_grid, nx_grid = np.meshgrid(increments_ds["ny"].values, increments_ds["nx"].values,
+                                   indexing="ij")
+    increments_data["lattice"] = {
+        "sy": ny_grid[used].astype(np.int64),
+        "sx": nx_grid[used].astype(np.int64),
+        "dist": increments_ds["distance_grid"].values[used].astype(np.float64),
+        "angle": increments_ds["angle_grid"].values[used].astype(np.float64),
+        "cell_area": float(increments_ds["cell_area"]),
+    }
+
     return increments_data
 
 
@@ -435,10 +449,15 @@ def _block_space_scale_integral(
         x_dim: str,
         y_dim: str,
         transform_type: str,
-        kernel_derivative: xr.Dataset
+        kernel_derivative: xr.Dataset,
+        kernel_params: Dict | None = None
 ) -> xr.DataArray:
     """
     Performs scale-space integral per Dask spatial block.
+
+    For boundary types with a fixed extension (wrap, reflect, symmetric, edge) the integral is
+    evaluated exactly on the shift lattice by FFT correlation (_dell_fft_block); otherwise by
+    streaming over r-bins (below).
 
     Parameters
     ----------
@@ -493,7 +512,14 @@ def _block_space_scale_integral(
     x_mode = _NP_PAD_MODES.get(increments_data.get("x_boundary_type", "periodic"))
     y_mode = _NP_PAD_MODES.get(increments_data.get("y_boundary_type", "reflect"))
 
-    if transform_type == "delta_u_cubed" and x_mode and y_mode:
+    p = float((kernel_params or {}).get("p", 1.0))
+    fft_ok = (transform_type == "delta_u_cubed" and "lattice" in increments_data
+              and x_mode in _FFT_PAD_MODES and y_mode in _FFT_PAD_MODES)
+
+    if fft_ok:
+        accumulator, work_dims = _dell_fft_block(field_chunk, increments_data["lattice"],
+                                                 scale_coords, p, x_dim, y_dim, x_mode, y_mode)
+    elif transform_type == "delta_u_cubed" and x_mode and y_mode:
         result = _stream_bins_padded(field_chunk, increments_data, used, scale_coords.size,
                                      x_dim, y_dim, x_mode, y_mode)
         work_dims = result.pop("dims")
@@ -523,6 +549,139 @@ def _block_space_scale_integral(
 # slicing gives exactly the same values as padding by |shift| + 1 and rolling per shift.
 _NP_PAD_MODES = {"periodic": "wrap", "wrap": "wrap", "reflect": "reflect",
                  "symmetric": "symmetric", "edge": "edge", "constant": "constant"}
+
+# Boundary extensions supported by the FFT path (no NaN fill)
+_FFT_PAD_MODES = {"wrap", "reflect", "symmetric", "edge"}
+
+# Per-process cache of kernel spectra, shared by the threads of a worker. Keyed by the padded
+# plane shape, the lattice and the scale; bounded so it never dominates worker memory.
+_KERNEL_CACHE: Dict[tuple, tuple] = {}
+_KERNEL_CACHE_LOCK = threading.Lock()
+_KERNEL_CACHE_MAX_BYTES = 2 * 1024 ** 3
+
+
+def _kernel_spectra(lattice: Dict, shape: tuple, ell: float, p: float) -> tuple:
+    """
+    conj(rFFT) of the two horizontal kernels K_x, K_y on the padded plane, and their sums:
+
+        K_i(s) = 1/4 G'_ℓ(|s|) r̂_i(s) ΔA / Σ_s G_ℓ(|s|) ΔA      (Σ includes the zero shift)
+
+    placed at index (s mod M) so that irfft2(rfft2(A) · conj(K̂)) is the correlation
+    Σ_s K(s) A(x + s).
+    """
+    key = (shape, lattice["sy"].size, int(np.abs(lattice["sy"]).max()),
+           int(np.abs(lattice["sx"]).max()), lattice["cell_area"], float(ell), float(p))
+    cached = _KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    dist, ang, cell = lattice["dist"], lattice["angle"], lattice["cell_area"]
+    g = _evaluate_mollifier(dist, np.array([ell]), p=p)[0]
+    g0 = _evaluate_mollifier(np.array([0.0]), np.array([ell]), p=p)[0, 0]
+    dg = _evaluate_mollifier_derivative(dist, np.array([ell]), p=p)[0]
+    coeff = 0.25 * dg * cell / max((g.sum() + g0) * cell, epsilon)
+
+    my, mx = shape
+    iy, ix = lattice["sy"] % my, lattice["sx"] % mx
+    spectra, sums = [], []
+    for trig in (np.cos(ang), np.sin(ang)):
+        kernel = np.zeros(shape, dtype=np.float64)
+        np.add.at(kernel, (iy, ix), coeff * trig)
+        spectra.append(np.conj(sfft.rfft2(kernel, workers=1)))
+        sums.append(float((coeff * trig).sum()))
+    entry = (spectra[0], spectra[1], sums[0], sums[1])
+
+    nbytes = spectra[0].nbytes * 2
+    with _KERNEL_CACHE_LOCK:
+        used = sum(v[0].nbytes * 2 for v in _KERNEL_CACHE.values())
+        if used + nbytes <= _KERNEL_CACHE_MAX_BYTES:
+            _KERNEL_CACHE[key] = entry
+    return entry
+
+
+def _dell_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, p: float,
+                    x_dim: str, y_dim: str, x_mode: str, y_mode: str):
+    """
+    Exact lattice evaluation of D_ℓ = ¼ Σ_s ∇G_ℓ(s)·δu |δu|² ΔA by FFT correlation.
+
+    With a = u(x+s), b = u(x) (mean removed; δu is unchanged), i over the horizontal and j over
+    all velocity components, (a_i - b_i) Σ_j (a_j - b_j)² expands into products of a function of
+    x and a function of x+s, so the shift sum becomes correlations (K_i ⋆ F)(x):
+
+      D = Σ_i K_i⋆(u_i|u|²) - 2 Σ_j b_j Σ_i K_i⋆(u_i u_j) + |b|² Σ_i K_i⋆u_i
+          - Σ_i b_i K_i⋆|u|² + 2 Σ_ij b_i b_j K_i⋆u_j - |b|² Σ_i b_i Σ_s K_i(s).
+
+    Each plane is padded by the largest shift with the boundary extension, so the circular FFT
+    correlation equals the linear one at every interior point (no wrap-around). Cost per plane
+    and scale: 12 inverse FFTs of the padded plane, independent of the number of shifts.
+
+    Returns (accumulator (scale, ..., y, x) float64, work dims).
+    """
+    names = [v for v in ("u", "v", "w") if v in field_chunk]
+    hor = ["u", "v"]
+    lead = [d for d in field_chunk["u"].dims if d not in (y_dim, x_dim)]
+    work_dims = tuple(lead) + (y_dim, x_dim)
+    data = {v: field_chunk[v].transpose(*work_dims).values for v in names}
+
+    shape = data["u"].shape
+    ny, nx = shape[-2:]
+    py, px = int(np.abs(lattice["sy"]).max()), int(np.abs(lattice["sx"]).max())
+    my, mx = ny + 2 * py, nx + 2 * px
+    inner = (slice(py, py + ny), slice(px, px + nx))
+
+    accumulator = np.zeros((len(scales),) + shape, dtype=np.float64)
+    rfft = lambda a: sfft.rfft2(a, workers=1)
+
+    for idx in np.ndindex(*shape[:-2]):
+        b = {v: data[v][idx].astype(np.float64) for v in names}
+        b = {v: a - a.mean() for v, a in b.items()}
+        a = {v: _pad_plane(b[v], py, px, y_mode, x_mode) for v in names}
+
+        s2_pad = sum(a[v] ** 2 for v in names)
+        f_us2 = {i: rfft(a[i] * s2_pad) for i in hor}
+        f_uu = {(i, j): rfft(a[i] * a[j]) for i in hor for j in names}
+        f_u = {j: rfft(a[j]) for j in names}
+        f_s2 = rfft(s2_pad)
+        del s2_pad
+
+        s2 = sum(b[v] ** 2 for v in names)
+
+        for n, ell in enumerate(scales):
+            kx, ky, sum_kx, sum_ky = _kernel_spectra(lattice, (my, mx), ell, p)
+            kh = {"u": kx, "v": ky}
+
+            specs = [f_us2["u"] * kx + f_us2["v"] * ky]                         # T1
+            specs += [f_uu[("u", j)] * kx + f_uu[("v", j)] * ky for j in names]  # T2_j
+            specs += [f_s2 * kh[i] for i in hor]                                 # T4_i
+            specs += [f_u[j] * kh[i] for i in hor for j in names]                # T5_ij
+            fields = sfft.irfft2(np.stack(specs), s=(my, mx), axes=(-2, -1),
+                                 workers=1)[(slice(None),) + inner]
+
+            t1 = fields[0]
+            t2 = dict(zip(names, fields[1:1 + len(names)]))
+            t4 = dict(zip(hor, fields[1 + len(names):3 + len(names)]))
+            t5 = {(i, j): fields[3 + len(names) + k]
+                  for k, (i, j) in enumerate((i, j) for i in hor for j in names)}
+
+            d = t1.copy()
+            for j in names:
+                d -= 2.0 * b[j] * t2[j]
+            d += s2 * (t5[("u", "u")] + t5[("v", "v")])
+            for i, s_k in (("u", sum_kx), ("v", sum_ky)):
+                d -= b[i] * t4[i]
+                d -= s2 * b[i] * s_k
+                for j in names:
+                    d += 2.0 * b[i] * b[j] * t5[(i, j)]
+
+            accumulator[(n,) + idx] = d
+
+    return accumulator, work_dims
+
+
+def _pad_plane(a: np.ndarray, py: int, px: int, y_mode: str, x_mode: str) -> np.ndarray:
+    """Pad a 2-D plane by (py, px) with numpy boundary extensions (y then x)."""
+    a = np.pad(a, ((py, py), (0, 0)), mode=y_mode)
+    return np.pad(a, ((0, 0), (px, px)), mode=x_mode)
 
 
 def _stream_bins_padded(field_chunk: xr.Dataset, increments_data: Dict, used: list,
@@ -669,7 +828,8 @@ def scale_transfer(
             increments=increments,
             x_dim=x_dim, y_dim=y_dim,
             transform_type=transform_type,
-            kernel_derivative=kernel_derivative
+            kernel_derivative=kernel_derivative,
+            kernel_params={"p": p},
         ),
         # Build template: final output is (scale, ...)
         template=field["u"].expand_dims(scale=length_scale).rename(name),
@@ -753,15 +913,16 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
         # Working set per grid point of one block, relative to the float32 input fields:
         #   float64 accumulator + float32 result copy over all scales (12 B per scale), and
-        #   each field padded once by the largest shift (pad_factor × 4 B), its contiguous copy,
-        #   and 7 float32 work buffers (increments, products, bin sum).
+        #   FFT path: per padded point ~320 B (11 half-spectra, 12 stacked inverse transforms,
+        #   padded fields and products, all float64); plus 12 B per scale per grid point
+        #   (float64 accumulator + float32 output). The shift path needs less.
         n_vars = len(velocity_vars)
         shifted = increments["mask"].any("r")
         max_ny = int(np.abs(increments["ny"].where(shifted.any("nx"))).max())
         max_nx = int(np.abs(increments["nx"].where(shifted.any("ny"))).max())
         pad_factor = ((wind.sizes[y_name] + 2 * max_ny) * (wind.sizes[x_name] + 2 * max_nx)
                       / (wind.sizes[y_name] * wind.sizes[x_name]))
-        working_bytes = 12 * length_scale.size + 4 * (n_vars * (pad_factor + 1) + 7)
+        working_bytes = 12 * length_scale.size + 320 * pad_factor
         expansion = int(np.ceil(working_bytes / (4 * n_vars)))
 
         wind = ensure_optimal_chunking(wind,

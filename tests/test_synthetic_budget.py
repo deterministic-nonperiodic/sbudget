@@ -521,32 +521,81 @@ def test_layer_integral_gives_boundary_flux():
     assert err < 0.02
 
 
-def test_fast_path_matches_roll_path_nonperiodic():
-    """Pad-once fast path == original per-shift pad/roll path, for reflect and mixed boundaries."""
-    import budget.inter_scale_transfers as ist
+_NP_MODE = {"periodic": "wrap", "reflect": "reflect", "edge": "edge", "symmetric": "symmetric"}
+
+
+def _brute_force_dell_padded(fields, dx, dy, ell, x_mode, y_mode):
+    """Exact lattice D_ell(x) on a non-periodic plane stack: fields padded with numpy modes."""
+    m_x, m_y = int(np.ceil(2 * ell / dx)), int(np.ceil(2 * ell / dy))
+    pad = {k: np.pad(np.pad(a, ((0, 0), (m_y, m_y), (0, 0)), mode=_NP_MODE[y_mode]),
+                     ((0, 0), (0, 0), (m_x, m_x)), mode=_NP_MODE[x_mode]) for k, a in fields.items()}
+    nz, ny, nx = fields["u"].shape
+    sx, sy = np.meshgrid(np.arange(-m_x, m_x + 1), np.arange(-m_y, m_y + 1))
+    r = np.hypot(sx * dx, sy * dy)
+    g = _mollifier(r, ell)
+    norm = g.sum() * dx * dy
+    q = (r / (2 * ell)) ** 2
+    dg = np.zeros_like(r)
+    ok = (q < 1) & (r > 0)
+    dg[ok] = -g[ok] * r[ok] / (2 * ell ** 2) / (1 - q[ok]) ** 2
+    acc = np.zeros((nz, ny, nx))
+    for i, j in zip(*np.nonzero(dg)):
+        ys = slice(m_y + sy[i, j], m_y + sy[i, j] + ny)
+        xs = slice(m_x + sx[i, j], m_x + sx[i, j] + nx)
+        du = {k: pad[k][:, ys, xs] - fields[k] for k in fields}
+        proj = (du["u"] * sx[i, j] * dx + du["v"] * sy[i, j] * dy) / r[i, j]
+        acc += dg[i, j] * proj * sum(v ** 2 for v in du.values())
+    return 0.25 * acc * dx * dy / norm
+
+
+def _nonperiodic_case():
     rng = np.random.default_rng(29)
     ny, nx, d = 40, 56, 1000.0
-    x = np.arange(nx) * d
-    y = np.arange(ny) * d
-    z = np.array([0.0, 1.0, 2.0])
-    fields = {k: rng.normal(size=(3, ny, nx)).astype(np.float32) for k in ("u", "v", "w")}
-    ds = xr.Dataset({k: (("z", "y", "x"), a) for k, a in fields.items()},
+    x, y, z = np.arange(nx) * d, np.arange(ny) * d, np.array([0.0, 1.0, 2.0])
+    fields = {k: rng.normal(size=(3, ny, nx)) for k in ("u", "v", "w")}
+    ds = xr.Dataset({k: (("z", "y", "x"), a.astype(np.float32)) for k, a in fields.items()},
                     coords={"z": z, "y": y, "x": x})
-    scales = np.array([1.5, 3.0, 6.0]) * d
-    saved = dict(ist._NP_PAD_MODES)
+    fields = {k: ds[k].values.astype(np.float64) for k in fields}
+    return ds, fields, d, np.array([1.5, 3.0, 6.0]) * d
+
+
+def test_fft_path_matches_exact_lattice_nonperiodic():
+    """FFT path == exact lattice sum with reflect, periodic/reflect and edge/symmetric boundaries."""
+    ds, fields, d, scales = _nonperiodic_case()
+    for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
+        out = inter_scale_kinetic_energy_transfer(
+            ds, scales=scales, x_coord_boundary=xb, y_coord_boundary=yb,
+            allow_rechunk=False)["energy_transfer"].transpose("scale", "z", "y", "x").values
+        for k, ell in enumerate(scales):
+            ref = _brute_force_dell_padded(fields, d, d, ell, xb, yb)
+            err = float(np.abs(out[k] - ref).max() / np.abs(ref).max())
+            assert err < 1e-5, (xb, yb, ell, err)
+        print(f"  boundaries x={xb:8s} y={yb:9s}: FFT path matches the exact lattice sum (<1e-5)")
+
+
+def test_shift_fallback_close_to_exact():
+    """r-bin streaming path (fallback): exact inside 8 dx, domain means within 1% beyond."""
+    import budget.inter_scale_transfers as ist
+    ds, fields, d, scales = _nonperiodic_case()
+    saved = set(ist._FFT_PAD_MODES)
     try:
-        for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
-            kw = dict(scales=scales, x_coord_boundary=xb, y_coord_boundary=yb, allow_rechunk=False)
-            fast = inter_scale_kinetic_energy_transfer(ds, **kw)["energy_transfer"].values
-            ist._NP_PAD_MODES.clear()          # force the original pad/roll implementation
-            slow = inter_scale_kinetic_energy_transfer(ds, **kw)["energy_transfer"].values
-            ist._NP_PAD_MODES.update(saved)
-            err = float(np.abs(fast - slow).max() / np.abs(slow).max())
-            print(f"  boundaries x={xb:8s} y={yb:9s}: max |fast - roll| / max |roll| = {err:.1e}")
-            assert err < 1e-5, (xb, yb, err)
+        ist._FFT_PAD_MODES.clear()  # force the shift path
+        out = inter_scale_kinetic_energy_transfer(
+            ds, scales=scales, x_coord_boundary="reflect", y_coord_boundary="reflect",
+            allow_rechunk=False)["energy_transfer"].transpose("scale", "z", "y", "x").values
     finally:
-        ist._NP_PAD_MODES.clear()
-        ist._NP_PAD_MODES.update(saved)
+        ist._FFT_PAD_MODES.update(saved)
+    for k, ell in enumerate(scales):
+        ref = _brute_force_dell_padded(fields, d, d, ell, "reflect", "reflect")
+        point = float(np.abs(out[k] - ref).max() / np.abs(ref).max())
+        mean = float(np.abs(out[k].mean((1, 2)) - ref.mean((1, 2))).max()
+                     / np.abs(ref).mean())
+        print(f"  shift path, ell = {ell / d:.1f} dx: pointwise error {point:.1e}, "
+              f"domain-mean error {mean:.1e}")
+        # exact inside 8 dx; beyond, the binned kernel is approximate pointwise on rough fields
+        assert mean < 0.01, (ell, mean)
+        if 2 * ell < 8 * d:
+            assert point < 1e-5, (ell, point)
 
 
 def test_cartesian_grid_is_not_global():
@@ -568,7 +617,8 @@ if __name__ == "__main__":
              test_dell_rotation_invariance, test_spectrum_parseval_and_cumulative_convention,
              test_density_weighted_closure_hke_vke_ape, test_pressure_work_closure,
              test_vertical_pressure_buoyancy_closure, test_layer_integral_gives_boundary_flux,
-             test_fast_path_matches_roll_path_nonperiodic, test_cartesian_grid_is_not_global]
+             test_fft_path_matches_exact_lattice_nonperiodic, test_shift_fallback_close_to_exact,
+             test_cartesian_grid_is_not_global]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")
