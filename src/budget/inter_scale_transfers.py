@@ -1,5 +1,5 @@
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, NamedTuple
 
 import numpy as np
 import scipy.fft as sfft
@@ -652,6 +652,50 @@ def _kernel_spectra(lattice: Dict, shape: tuple, ell: float, p: float) -> tuple:
     return entry
 
 
+def _rfft2(a: np.ndarray) -> np.ndarray:
+    """Real 2-D FFT over the last two axes, single-threaded (blocks run in parallel)."""
+    return sfft.rfft2(a, workers=1)
+
+
+class _Padding(NamedTuple):
+    """
+    Padding of a horizontal plane by the largest lattice shift with a boundary extension, so that
+    the circular FFT correlation of the padded plane equals the linear one on every original point
+    (no wrap-around).
+    """
+    py: int
+    px: int
+    ny: int
+    nx: int
+    y_mode: str
+    x_mode: str
+
+    @classmethod
+    def for_lattice(cls, lattice: Dict, plane_shape: tuple, y_mode: str, x_mode: str):
+        py, px = int(np.abs(lattice["sy"]).max()), int(np.abs(lattice["sx"]).max())
+        return cls(py, px, *plane_shape, y_mode, x_mode)
+
+    @property
+    def shape(self) -> tuple:
+        """Shape of the padded plane."""
+        return self.ny + 2 * self.py, self.nx + 2 * self.px
+
+    def pad(self, a: np.ndarray) -> np.ndarray:
+        return _pad_plane(a, self.py, self.px, self.y_mode, self.x_mode)
+
+    def inverse(self, spectra: np.ndarray) -> np.ndarray:
+        """Inverse FFT of stacked half-spectra (n, ...), cropped to the original plane."""
+        fields = sfft.irfft2(spectra, s=self.shape, axes=(-2, -1), workers=1)
+        return fields[..., self.py:self.py + self.ny, self.px:self.px + self.nx]
+
+
+def _block_planes(field_chunk: xr.Dataset, names: list, x_dim: str, y_dim: str) -> tuple:
+    """Arrays {name: (..., y, x)} of a block, and their dims with the horizontal ones last."""
+    lead = [d for d in field_chunk["u"].dims if d not in (y_dim, x_dim)]
+    work_dims = tuple(lead) + (y_dim, x_dim)
+    return {v: field_chunk[v].transpose(*work_dims).values for v in names}, work_dims
+
+
 def _dell_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, p: float,
                     x_dim: str, y_dim: str, x_mode: str, y_mode: str):
     """
@@ -662,69 +706,52 @@ def _dell_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, 
     x and a function of x+s, so the shift sum becomes correlations (K_i ⋆ F)(x):
 
       D = Σ_i K_i⋆(u_i|u|²) - 2 Σ_j b_j Σ_i K_i⋆(u_i u_j) + |b|² Σ_i K_i⋆u_i
-          - Σ_i b_i K_i⋆|u|² + 2 Σ_ij b_i b_j K_i⋆u_j - |b|² Σ_i b_i Σ_s K_i(s).
+          - Σ_i b_i [K_i⋆|u|² + |b|² Σ_s K_i(s) - 2 Σ_j b_j K_i⋆u_j].
 
-    Each plane is padded by the largest shift with the boundary extension, so the circular FFT
-    correlation equals the linear one at every interior point (no wrap-around). Cost per plane
-    and scale: 12 inverse FFTs of the padded plane, independent of the number of shifts.
+    Each plane is padded by the largest shift with the boundary extension (_Padding). Per plane,
+    the 11 products F are transformed once; per scale, the 12 correlations are one stacked inverse
+    FFT, independent of the number of shifts.
 
     Returns (accumulator (scale, ..., y, x) float64, work dims).
     """
     names = [v for v in ("u", "v", "w") if v in field_chunk]
-    hor = ["u", "v"]
-    lead = [d for d in field_chunk["u"].dims if d not in (y_dim, x_dim)]
-    work_dims = tuple(lead) + (y_dim, x_dim)
-    data = {v: field_chunk[v].transpose(*work_dims).values for v in names}
-
+    horizontal = ("u", "v")
+    data, work_dims = _block_planes(field_chunk, names, x_dim, y_dim)
     shape = data["u"].shape
-    ny, nx = shape[-2:]
-    py, px = int(np.abs(lattice["sy"]).max()), int(np.abs(lattice["sx"]).max())
-    my, mx = ny + 2 * py, nx + 2 * px
-    inner = (slice(py, py + ny), slice(px, px + nx))
-
+    padding = _Padding.for_lattice(lattice, shape[-2:], y_mode, x_mode)
     accumulator = np.zeros((len(scales),) + shape, dtype=np.float64)
-    rfft = lambda a: sfft.rfft2(a, workers=1)
 
     for idx in np.ndindex(*shape[:-2]):
         b = {v: data[v][idx].astype(np.float64) for v in names}
-        b = {v: a - a.mean() for v, a in b.items()}
-        a = {v: _pad_plane(b[v], py, px, y_mode, x_mode) for v in names}
+        b = {v: plane - plane.mean() for v, plane in b.items()}
+        b2 = sum(b[v] ** 2 for v in names)
 
-        s2_pad = sum(a[v] ** 2 for v in names)
-        f_us2 = {i: rfft(a[i] * s2_pad) for i in hor}
-        f_uu = {(i, j): rfft(a[i] * a[j]) for i in hor for j in names}
-        f_u = {j: rfft(a[j]) for j in names}
-        f_s2 = rfft(s2_pad)
-        del s2_pad
-
-        s2 = sum(b[v] ** 2 for v in names)
+        # Spectra of the products F, keyed by the horizontal component i that K_i acts on
+        a = {v: padding.pad(b[v]) for v in names}
+        a2 = sum(a[v] ** 2 for v in names)
+        f_u_a2 = {i: _rfft2(a[i] * a2) for i in horizontal}                       # u_i |u|²
+        f_uu = {j: {i: _rfft2(a[i] * a[j]) for i in horizontal} for j in names}   # u_i u_j
+        f_a2 = _rfft2(a2)                                                         # |u|²
+        f_u = {j: _rfft2(a[j]) for j in names}                                    # u_j
+        del a, a2
 
         for n, ell in enumerate(scales):
-            kx, ky, sum_kx, sum_ky = _kernel_spectra(lattice, (my, mx), ell, p)
-            kh = {"u": kx, "v": ky}
+            kx, ky, sum_kx, sum_ky = _kernel_spectra(lattice, padding.shape, ell, p)
+            k_hat, k_sum = {"u": kx, "v": ky}, {"u": sum_kx, "v": sum_ky}
 
-            specs = [f_us2["u"] * kx + f_us2["v"] * ky]  # T1
-            specs += [f_uu[("u", j)] * kx + f_uu[("v", j)] * ky for j in names]  # T2_j
-            specs += [f_s2 * kh[i] for i in hor]  # T4_i
-            specs += [f_u[j] * kh[i] for i in hor for j in names]  # T5_ij
-            fields = sfft.irfft2(np.stack(specs), s=(my, mx), axes=(-2, -1),
-                                 workers=1)[(slice(None),) + inner]
+            # The 12 correlations, summed over i where the formula sums them
+            corr = {"K⋆u|u|²": f_u_a2["u"] * kx + f_u_a2["v"] * ky}
+            corr.update({("K⋆u_i u_j", j): f_uu[j]["u"] * kx + f_uu[j]["v"] * ky for j in names})
+            corr.update({("K_i⋆|u|²", i): f_a2 * k_hat[i] for i in horizontal})
+            corr.update({("K_i⋆u_j", i, j): f_u[j] * k_hat[i] for i in horizontal for j in names})
+            t = dict(zip(corr, padding.inverse(np.stack(list(corr.values())))))
 
-            t1 = fields[0]
-            t2 = dict(zip(names, fields[1:1 + len(names)]))
-            t4 = dict(zip(hor, fields[1 + len(names):3 + len(names)]))
-            t5 = {(i, j): fields[3 + len(names) + k]
-                  for k, (i, j) in enumerate((i, j) for i in hor for j in names)}
-
-            d = t1.copy()
-            for j in names:
-                d -= 2.0 * b[j] * t2[j]
-            d += s2 * (t5[("u", "u")] + t5[("v", "v")])
-            for i, s_k in (("u", sum_kx), ("v", sum_ky)):
-                d -= b[i] * t4[i]
-                d -= s2 * b[i] * s_k
-                for j in names:
-                    d += 2.0 * b[i] * b[j] * t5[(i, j)]
+            d = t["K⋆u|u|²"]
+            d -= 2.0 * sum(b[j] * t["K⋆u_i u_j", j] for j in names)
+            d += b2 * (t["K_i⋆u_j", "u", "u"] + t["K_i⋆u_j", "v", "v"])
+            for i in horizontal:
+                b_dot_ku = sum(b[j] * t["K_i⋆u_j", i, j] for j in names)
+                d -= b[i] * (t["K_i⋆|u|²", i] + b2 * k_sum[i] - 2.0 * b_dot_ku)
 
             accumulator[(n,) + idx] = d
 
@@ -812,7 +839,7 @@ def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.nda
 
     Both terms are products of unfiltered fields with filtered ones, Ā = Σ_s G(s) A(x + s), where
     G is the lattice filter of D_ℓ (_filter_spectrum: same shifts and normalization). Each plane is
-    padded by the largest shift with the boundary extension of D_ℓ and transformed once; every
+    padded with the boundary extension of D_ℓ (_Padding) and transformed once; every
     scale then needs one stacked inverse FFT. Unlike in _dell_fft_block the plane mean is kept:
     C_ℓ and V_ℓ depend on it. Cost per plane and scale: up to 2 n + 4 inverse FFTs of the padded
     plane (n = number of components).
@@ -821,22 +848,14 @@ def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.nda
     """
     names = list(components)
     extra = (["div"] if divergence else []) + (["w_adv", "dzu", "dzv"] if vertical else [])
-    lead = [d for d in field_chunk["u"].dims if d not in (y_dim, x_dim)]
-    work_dims = tuple(lead) + (y_dim, x_dim)
-    data = {v: field_chunk[v].transpose(*work_dims).values for v in names + extra}
-
+    data, work_dims = _block_planes(field_chunk, names + extra, x_dim, y_dim)
     shape = data["u"].shape
-    ny, nx = shape[-2:]
-    py, px = int(np.abs(lattice["sy"]).max()), int(np.abs(lattice["sx"]).max())
-    my, mx = ny + 2 * py, nx + 2 * px
-    inner = (slice(py, py + ny), slice(px, px + nx))
-
+    padding = _Padding.for_lattice(lattice, shape[-2:], y_mode, x_mode)
     accumulator = np.zeros((len(scales),) + shape, dtype=np.float64)
-    rfft = lambda a: sfft.rfft2(a, workers=1)
 
     for idx in np.ndindex(*shape[:-2]):
         b = {v: data[v][idx].astype(np.float64) for v in names + extra}
-        a = {v: _pad_plane(b[v], py, px, y_mode, x_mode) for v in b}
+        a = {v: padding.pad(b[v]) for v in b}
 
         # Fields to be filtered (ū is shared by both terms; names always include u and v)
         filtered = {v: a[v] for v in names}
@@ -846,15 +865,13 @@ def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.nda
             filtered["|u|^2"] = sum(a[v] ** 2 for v in names)
         if vertical:
             filtered.update(dzu=a["dzu"], dzv=a["dzv"])
+        spectra = np.stack([_rfft2(f) for f in filtered.values()])
         keys = list(filtered)
-        spectra = np.stack([rfft(filtered[k]) for k in keys])
         del a, filtered
 
         for n, ell in enumerate(scales):
-            g_hat = _filter_spectrum(lattice, (my, mx), ell, p)
-            fields = sfft.irfft2(spectra * g_hat, s=(my, mx), axes=(-2, -1),
-                                 workers=1)[(slice(None),) + inner]
-            bar = dict(zip(keys, fields))
+            g_hat = _filter_spectrum(lattice, padding.shape, ell, p)
+            bar = dict(zip(keys, padding.inverse(spectra * g_hat)))
 
             if divergence:
                 accumulator[(n,) + idx] -= _dilatational_exchange(b, bar, names)
