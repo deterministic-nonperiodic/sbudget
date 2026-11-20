@@ -273,8 +273,11 @@ def _apply_weighting(field: xr.DataArray) -> tuple[xr.DataArray, float, xr.DataA
         detrend_type=detrend_type
     )
 
-    # -- Calculate energy to restore at DC (mu_restore = domain_mean(field)) --
+    # -- Mean to restore at DC: only what the detrending removed (without detrending the mean is
+    # still in the field, and restoring it would count the k = 0 product twice) --
     mu_restore = domain_mean(field)
+    if detrend_type is None:
+        mu_restore = xr.zeros_like(mu_restore)
 
     # -- Apply the final total window (f_w = f' * W_total) --
     return detrended_field * window_total, taper_ms, mu_restore

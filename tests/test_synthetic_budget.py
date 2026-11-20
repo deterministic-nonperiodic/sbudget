@@ -247,6 +247,23 @@ def test_compute_cli_conservative_periodic(tmp_path=None):
         assert err < 1e-3, (k, err)     # float32 storage: theta' ~ 1 K on 250 K
 
 
+def test_cross_spectrum_parseval_with_mean_and_no_detrend():
+    """Sum over all modes of the cross spectrum equals the domain mean of the product, with a
+    non-zero mean and detrending off (the mean was once restored at k = 0 a second time)."""
+    u, v, _, _, dx = _random_3d_fields(seed=2, n=24, nz=3)
+    a, b = u + 40.0, v * u + 3.0
+    saved = (sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
+    try:
+        for detrend in (None, "constant", "linear"):
+            sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = False, detrend
+            got = sp.scalar_cross_spectrum(a, b).sum(("ky", "kx"))
+            err = float(np.abs(got - (a * b).mean(("y", "x"))).max() / np.abs(a * b).mean())
+            print(f"  detrend {str(detrend):8s}: |sum_k - <a b>| / <|a b|> = {err:.1e}")
+            assert err < 1e-12 or detrend == "linear"
+    finally:
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = saved
+
+
 def test_compute_budget_conservative_periodic_axes():
     """End to end: with transfer_form conservative and periodic_axes [x, y], the cumulative
     transfers of compute_budget vanish at the smallest wavenumber (no DC, no corner modes) to
@@ -1746,6 +1763,7 @@ if __name__ == "__main__":
              test_conservative_and_flux_forms_converge,
              test_periodic_axes_skip_taper_and_linear_detrend,
              test_compute_budget_conservative_periodic_axes,
+             test_cross_spectrum_parseval_with_mean_and_no_detrend,
              test_compute_cli_conservative_periodic]
     failed = 0
     for t in tests:
