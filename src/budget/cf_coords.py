@@ -380,8 +380,8 @@ def _is_geographic(coord: xr.DataArray, coord_type: str) -> bool:
     standard_name = str(coord.attrs.get("standard_name", "")).lower()
     axis = str(coord.attrs.get("axis", "")).upper()
 
-    # A coordinate in metres is Cartesian whatever it is called: some model output
-    # labels metric x, y "longitude", "latitude"
+    # A coordinate in metres is Cartesian whatever it is called: some model output labels metric
+    # x, y with long_name "longitude", "latitude"
     if _coord_is_meter(coord):
         return False
 

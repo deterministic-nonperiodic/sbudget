@@ -12,10 +12,10 @@ from .numeric_tools import domain_mean, is_periodic
 # -----------------------------
 # Global spectral configuration
 # -----------------------------
-# Defaults: no taper and Errico end-point
-# detrending along non-periodic axes. A taper weights the domain, so the transfers it gives
-# include the energy flux into the window, <F . grad W^2>/<W^2>;
-# Errico detrending removes the edge jump (the leakage tail of the spectra) without it.
+# Defaults: no taper and Errico end-point detrending along non-periodic axes (none along
+# periodic ones). A taper weights the domain, so the transfers it gives include the energy flux
+# into the window, <F . grad W^2>/<W^2>, which can exceed the inter-scale transfer; Errico
+# detrending removes the edge jump (the leakage tail of the spectra) without it.
 SPECTRAL_CFG = {
     "taper": {
         "enabled": False,

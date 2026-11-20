@@ -1334,7 +1334,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         # With a distributed client, pass a small *recipe* for the geometry instead of a
         # scattered future: each worker process rebuilds it once from the coordinates and caches
         # it (_increments_from_spec). A scattered future embedded in the task arguments deadlocked
-        # the scheduler on Levante (32 workers): the graph never reached the workers and nothing
+        # the scheduler with 32 workers: the graph never reached the workers and nothing
         # was logged.
         increments_data = _geometry_spec(x_coord, y_coord, kwargs)
         print("[transfer] Shift geometry will be rebuilt once per worker process.")

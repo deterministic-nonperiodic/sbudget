@@ -265,9 +265,9 @@ def test_compute_cli_conservative_periodic(tmp_path=None):
 
 
 def test_spatial_dims_from_units_and_axes():
-    """Horizontal dimensions are found from units and CF axes, not names: model output may
-    label metric x, y "longitude"/"latitude" (Cartesian), degree x, y are geographic, and
-    lat/lon may come in either order."""
+    """Horizontal dimensions are found from units and CF axes, not names: metric x, y with
+    long_name "longitude"/"latitude" are Cartesian, degree x, y are geographic, and lat/lon may
+    come in either order."""
     from budget.cf_coords import get_spatial_dims, is_geographic_grid
     n = np.arange(4.0)
 
@@ -277,11 +277,11 @@ def test_spatial_dims_from_units_and_axes():
         da = xr.DataArray(np.zeros((2, 4, 4)), dims=("height",) + dims, coords=coords)
         return da, get_spatial_dims(da)
 
-    icon = ({"long_name": "latitude", "units": "m", "axis": "Y"},
-            {"long_name": "longitude", "units": "m", "axis": "X"})
-    da, dims = case(("y", "x"), icon)
+    metric = ({"long_name": "latitude", "units": "m", "axis": "Y"},
+              {"long_name": "longitude", "units": "m", "axis": "X"})
+    da, dims = case(("y", "x"), metric)
     assert dims == ("y", "x") and not is_geographic_grid(da.x, da.y)
-    da, dims = case(("x", "y"), icon[::-1])                                 # transposed
+    da, dims = case(("x", "y"), metric[::-1])                                 # transposed
     assert dims == ("y", "x")
     deg = ({"standard_name": "latitude", "units": "degrees_north"},
            {"standard_name": "longitude", "units": "degrees_east"})
@@ -291,7 +291,7 @@ def test_spatial_dims_from_units_and_axes():
     assert dims == ("lat", "lon")
     da, dims = case(("rlat", "rlon"), ({"axis": "Y", "units": "m"}, {"axis": "X", "units": "m"}))
     assert dims == ("rlat", "rlon")                                          # any names, by axis
-    print("  metric x/y, degree x/y, lat/lon, axis-only: dimensions resolved")
+    print("  metric x/y named lon/lat, degree x/y, lat/lon, axis-only: dimensions resolved")
 
 
 def test_errico_detrend():
@@ -1725,8 +1725,8 @@ def test_vke_budget_synthetic_gravity_wave():
 
 def test_staggered_outputs_have_zarr_compatible_chunks():
     """Shifted half-level slices must not leave irregular dask chunks along the vertical.
-    On Levante, 501 half levels chunked (251, 250) gave vf_vke chunks (250, 1, 249) on the 500
-    full levels, which zarr refuses."""
+    501 half levels chunked (251, 250) gave vf_vke chunks (250, 1, 249) on the 500 full levels,
+    which zarr refuses."""
     import tempfile
     from budget.vertical import (half_to_full_mean, diff_half_to_full, interp_full_to_half,
                                  diff_full_to_half)
@@ -1750,7 +1750,7 @@ def test_staggered_outputs_have_zarr_compatible_chunks():
 
 
 def test_write_guard_makes_any_chunks_zarr_safe():
-    """The Levante div_hke pattern (z chunks 11, ..., 9, 2, 11, ..., 5) is rechunked before the
+    """An irregular div_hke pattern (z chunks 11, ..., 9, 2, 11, ..., 5) is rechunked before the
     zarr write; values are unchanged and uniform variables are left alone."""
     import tempfile
     from budget.io_utils import zarr_safe_chunks

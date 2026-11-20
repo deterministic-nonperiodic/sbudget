@@ -54,7 +54,7 @@ def _detect_resources(cfg: Optional[Any] = None) -> Dict[str, Union[int, float, 
     n_workers = get_current_worker_count(verbose=False, total=False)
 
     # Workstation without client or SLURM: physical cores. Hyperthreads add memory but no
-    # speed for the FFT-bound scale transfer (12-level UA-ICON benchmark, i7-14650HX:
+    # speed for the FFT-bound scale transfer (12-level benchmark, i7-14650HX:
     # 16 physical cores 17.0 s / 3.0 GB, 24 logical 18.3 s / 4.3 GB).
     if "SLURM_JOB_ID" not in os.environ:
         try:
@@ -113,7 +113,7 @@ def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
         "optimization.fuse.max-width": 256,
     }
 
-    # Rechunk with plain tasks, not the distributed P2P shuffle: on Levante (32 worker processes)
+    # Rechunk with plain tasks, not the distributed P2P shuffle: with 32 worker processes
     # the P2P rechunk in the scale-transfer graph hung indefinitely (> 20 min, idle workers);
     # with "tasks" the same run finishes in 53 s. An explicit environment setting wins.
     if "DASK_ARRAY__RECHUNK__METHOD" not in os.environ:

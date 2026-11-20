@@ -82,16 +82,17 @@ relies on the product rule and leaves a residual of a few per cent of $\max|\Pi|
 fields (more if there is energy near the grid scale); both forms converge to the same transfer.
 
 Periodic axes are detected from the data by default (`periodic_axes: auto`): the RMS jump
-between the last and first points is compared with the RMS neighbour difference, about 1 on a
-periodic axis, about 0 when the last point repeats the first (it is then dropped), and well above 2 on a bounded axis. `periodic_axes:
-[x]`, `[x, y]` or `none` override the test; a global longitude is always periodic. Along periodic
-axes derivatives wrap around, and spectra are neither tapered nor detrended. Along non-periodic axes the default is Errico (1985) end-point detrending (the mean
-and the linear trend joining the two edges are removed, the mean restored at $k = 0$), which
-removes the edge jump of the periodic extension and its leakage tail, and no taper. A taper
-(`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy flux into the
-window, $\langle \mathbf{F}\cdot\nabla W^2\rangle / \langle W^2\rangle$ with
-$\mathbf{F} = \mathbf{u}\,|\mathbf{u}|^2/2$, which projects onto the largest scales and grows with
-the mean wind along the tapered axis.
+between the last and first points is compared with the RMS neighbour difference. It is about 1
+on a periodic axis, about 0 when the last point repeats the first (that point is then dropped),
+and well above 2 on a bounded axis. `periodic_axes: [x]`, `[x, y]` or `none` override the test;
+a global longitude is always periodic. Along periodic axes derivatives wrap around, and spectra
+are neither tapered nor detrended. Along bounded axes the default is Errico (1985) end-point
+detrending (the mean and the linear trend joining the two edges are removed, the mean restored
+at $k = 0$), which removes the edge jump of the periodic extension and its leakage tail, and no
+taper. A taper (`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy
+flux into the window, $\langle \mathbf{F}\cdot\nabla W^2\rangle / \langle W^2\rangle$ with
+$\mathbf{F} = \mathbf{u}\,|\mathbf{u}|^2/2$, which projects onto the largest scales, grows with
+the mean wind along the tapered axis and can exceed the inter-scale transfer itself.
 
 Defaults: `transfer_form: conservative`, `periodic_axes: auto`, Errico detrending along bounded
 axes, no taper. They give exact conservation on periodic axes and leakage-free spectra on
@@ -155,7 +156,7 @@ the exact lattice sum, for any boundary treatment of that kind. Plane means are 
 
 Cost per plane and scale: 12 inverse real FFTs of the padded plane (11 forward FFTs of products
 of the fields per plane, kernel spectra cached per process), i.e. $O(n_\ell\, N \log N)$ instead
-of $O(N_{\rm shifts}\, N)$ for a direct sum over shifts. Measured on UA-ICON nests (16 cores):
+of $O(N_{\rm shifts}\, N)$ for a direct sum over shifts. Measured with 16 cores:
 10× faster than the direct sum on a 267×267 grid (20,592 shifts, 24 scales) and 23× faster on a
 267×889 grid (174,000 shifts, 66 scales). Tested against a brute-force lattice sum (agreement
 better than $10^{-5}$) for periodic, reflect, mixed and edge/symmetric boundaries. A
@@ -281,7 +282,7 @@ reserve). On a workstation, sbudget uses the physical cores and 85% of the memor
 start-up (`threads` mode: at least 0.5 GB per thread; `distributed`: at least 4 GB per process).
 `--n-workers` and `--threads-per-worker` override the core count.
 
-Measured on a workstation (i7-14650HX, 16 physical / 24 logical cores, 62 GB), UA-ICON 267×267
+Measured on a workstation (i7-14650HX, 16 physical / 24 logical cores, 62 GB), 267×267
 lon–lat grid, 12 levels × 8 times, 24 scales (wall time incl. start-up and I/O, peak memory of
 all processes; identical results in every configuration):
 

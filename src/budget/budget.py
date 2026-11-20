@@ -136,8 +136,9 @@ def periodic_dims(ds: xr.Dataset, axes=None) -> list[str]:
 # Seam test: RMS jump between the last and first points over the RMS neighbour difference.
 # A periodic axis sampled without its end point gives ~1 (the seam is one more neighbour pair),
 # one that repeats its first point at the end gives ~0, a bounded (cut) axis gives >> 1 (smooth
-# synthetic fields: 0.97-1.13 periodic, 2.6-3.7 cut). An axis misread as periodic has a seam
-# jump of at most two neighbour differences, which the wrap-around derivative tolerates.
+# synthetic fields: 0.97-1.13 periodic, 2.6-3.7 cut; fields with small-scale structure give
+# larger values when cut). An axis misread as periodic has a seam jump of at most two
+# neighbour differences, which the wrap-around derivative tolerates.
 SEAM_DUPLICATE_MAX = 0.25
 SEAM_PERIODIC_MAX = 2.0
 
