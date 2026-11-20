@@ -245,11 +245,13 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
         ds["u"] = ds["u"] - ds["u"].mean((y_d, x_d))
         ds["v"] = ds["v"] - ds["v"].mean((y_d, x_d))
 
-    # The vertical-advection term of scale_transfer needs ∂z u, ∂z v on the selected levels:
-    # differentiate the full column first (same centred operator as the spectral budget)
+    # The vertical-advection term of scale_transfer needs ∂z of each velocity component on the
+    # selected levels: differentiate the full column first (the centred operator of the
+    # spectral budget)
     if mode == "scale_transfer" and getattr(cfg.compute, "vertical_advection", False):
-        ds["dzu"] = vertical_derivative(ds["u"], "z")
-        ds["dzv"] = vertical_derivative(ds["v"], "z")
+        for v in ("u", "v", "w"):
+            if v in ds:
+                ds[f"dz{v}"] = vertical_derivative(ds[v], "z")
 
     # select specified vertical levels
     if levels is not None and mode == "scale_transfer":

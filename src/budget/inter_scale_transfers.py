@@ -294,7 +294,10 @@ def delta_u_cubed_geographic(
 ) -> xr.DataArray:
     """
     Compute (δu ⋅ r̂) |δu|² using angle and distance from geographic scale increments.
-    TODO: investigate w contribution
+
+    The filter is horizontal, so only the horizontal increments are projected on r̂; w enters
+    through |δu|² only. With w, D_ℓ is the transfer of horizontal plus vertical kinetic energy by
+    horizontal advection (the counterpart of the HKE + VKE transfers; see transfer_correction).
     """
     ds_increment = ds_shifted - ds
     delta_u = ds_increment["u"]
@@ -819,16 +822,17 @@ def _dilatational_exchange(b: Dict[str, np.ndarray], bar: Dict[str, np.ndarray],
     return 0.25 * c
 
 
-def _vertical_exchange(b: Dict[str, np.ndarray], bar: Dict[str, np.ndarray]) -> np.ndarray:
+def _vertical_exchange(b: Dict[str, np.ndarray], bar: Dict[str, np.ndarray],
+                       names: list) -> np.ndarray:
     """
-    Vertical exchange on one plane, with U = (u, v):
+    Vertical exchange on one plane, with u over the components `names`:
 
-        V_ℓ = ½ w (Ū·∂z U - U·∂z Ū)
+        V_ℓ = ½ w (ū·∂z u - u·∂z ū)
 
-    b holds the unfiltered fields ("u", "v", "w_adv", "dzu", "dzv"), bar the filtered ones.
+    b holds the unfiltered fields (components, "w_adv" and "dz<component>"), bar the filtered
+    ones under the same keys.
     """
-    return 0.5 * b["w_adv"] * (bar["u"] * b["dzu"] + bar["v"] * b["dzv"]
-                               - b["u"] * bar["dzu"] - b["v"] * bar["dzv"])
+    return 0.5 * b["w_adv"] * sum(bar[v] * b[f"dz{v}"] - b[v] * bar[f"dz{v}"] for v in names)
 
 
 def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, p: float,
@@ -847,7 +851,8 @@ def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.nda
     Returns (accumulator (scale, ..., y, x) float64, work dims).
     """
     names = list(components)
-    extra = (["div"] if divergence else []) + (["w_adv", "dzu", "dzv"] if vertical else [])
+    shear = [f"dz{v}" for v in names]
+    extra = (["div"] if divergence else []) + (["w_adv"] + shear if vertical else [])
     data, work_dims = _block_planes(field_chunk, names + extra, x_dim, y_dim)
     shape = data["u"].shape
     padding = _Padding.for_lattice(lattice, shape[-2:], y_mode, x_mode)
@@ -864,7 +869,7 @@ def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.nda
             filtered["div"] = a["div"]
             filtered["|u|^2"] = sum(a[v] ** 2 for v in names)
         if vertical:
-            filtered.update(dzu=a["dzu"], dzv=a["dzv"])
+            filtered.update({k: a[k] for k in shear})
         spectra = np.stack([_rfft2(f) for f in filtered.values()])
         keys = list(filtered)
         del a, filtered
@@ -876,7 +881,7 @@ def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.nda
             if divergence:
                 accumulator[(n,) + idx] -= _dilatational_exchange(b, bar, names)
             if vertical:
-                accumulator[(n,) + idx] += _vertical_exchange(b, bar)
+                accumulator[(n,) + idx] += _vertical_exchange(b, bar, names)
 
     return accumulator, work_dims
 
@@ -899,7 +904,7 @@ def _block_transfer_correction(
     ----------
     field_chunk : xr.Dataset
         A block of whole horizontal planes with the velocity components and the fields of the
-        requested terms ("div"; "w_adv", "dzu", "dzv").
+        requested terms ("div"; "w_adv" and "dz<component>").
     increments : Dict | Future
         Grid information containing precomputed scale increments and angle grids.
     x_dim, y_dim : str
@@ -1123,24 +1128,30 @@ def transfer_correction(
 
         N = (U·∇)u + ½ δ u + ½ [w ∂z u + ∂z (w u)],    δ = ∂x u + ∂y v,  U = (u, v),
 
+    with u the components of the increments,
+
     and the domain mean of D*_ℓ equals Σ_k T(k) [1 - Ĝ(kℓ)], Ĝ the transfer function of the
     filter of D_ℓ, with
 
         C_ℓ = ¼ δ (u·ū) + ¼ u·(δu)‾ - ¼ |u|² δ̄ - ¼ δ (|u|²)‾     (dilatational exchange)
-        V_ℓ = ½ w (Ū·∂z U - U·∂z Ū)                             (vertical exchange)
+        V_ℓ = ½ w (ū·∂z u - u·∂z ū)                             (vertical exchange)
 
     C_ℓ follows from the exact local identity -½ [ū·N_h + u·N̄_h] = -∇·J_ℓ - (D_ℓ - C_ℓ), J_ℓ the
     Duchon-Robert spatial flux; V_ℓ is the part of ū·N_v that is not a vertical flux divergence.
     C_ℓ vanishes for δ = 0 and V_ℓ for w = 0; both vanish as ℓ → 0. Unlike D_ℓ, they depend on a
     uniform background velocity, as T(k) does. With components ("u", "v"), D*_ℓ is the
-    counterpart of the HKE transfer Π_h. Derivation, tests and validation:
+    counterpart of the HKE transfer Π_h; with ("u", "v", "w"), of the HKE plus VKE transfers
+    (the VKE transfer of the spectral budget has the same flux form, with w advected). In D_ℓ
+    the filter and r̂ are horizontal, so w enters through |δu|² only. Derivation, tests and
+    validation:
     docs/corrected_transfer.md.
 
     Parameters
     ----------
     field : xr.Dataset
         Velocity components `components`, the horizontal divergence "div" (if divergence) and
-        the vertical velocity "w_adv" with the shear "dzu", "dzv" (if vertical).
+        the vertical velocity "w_adv" with the shear "dz<component>" of every component (if
+        vertical).
     increments: dict, Dask Future
         Grid information containing precomputed scale increments and angle grids.
     length_scale : xr.DataArray
@@ -1192,7 +1203,7 @@ def transfer_correction(
     return correction.rename(name)
 
 
-def _correction_inputs(wind: xr.Dataset, divergence: bool, vertical: bool,
+def _correction_inputs(wind: xr.Dataset, components: list, divergence: bool, vertical: bool,
                        kwargs: Dict) -> Dict[str, xr.DataArray]:
     """
     Fields of the transfer correction besides the velocity components:
@@ -1201,9 +1212,9 @@ def _correction_inputs(wind: xr.Dataset, divergence: bool, vertical: bool,
                                 divergence if it also holds the vorticity (the rule of the
                                 spectral budget, so that both diagnostics use the same δ);
                                 else centred differences (horizontal_divergence).
-        "w_adv", "dzu", "dzv"   w and ∂z u, ∂z v, if vertical: the shear from kwargs or the
-                                dataset (the reader differentiates the full column before
-                                selecting levels), else centred differences along z
+        "w_adv", "dz<c>"        w and ∂z of every component c, if vertical: the shear from
+                                kwargs or the dataset (the reader differentiates the full column
+                                before selecting levels), else centred differences along z
                                 (vertical_derivative).
     """
     fields = {}
@@ -1219,7 +1230,7 @@ def _correction_inputs(wind: xr.Dataset, divergence: bool, vertical: bool,
         if "w" not in wind:
             raise ValueError("vertical_advection needs the vertical velocity w.")
         fields["w_adv"] = wind["w"]
-        for v in ("u", "v"):
+        for v in components:
             key = f"dz{v}"
             if kwargs.get(key) is not None:
                 fields[key] = kwargs[key]
@@ -1244,7 +1255,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         Additional keyword arguments passed to scale_increments and scale_transfer functions.
         For the corrected transfer D*_ℓ (see transfer_correction): divergence_correction,
         vertical_advection, perturbation (bool), increment_components (default: all present),
-        and optionally the fields divergence, dzu, dzv.
+        and optionally the fields divergence and dzu, dzv (dzw).
     Returns
     -------
     xr.Dataset
@@ -1253,7 +1264,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     """
 
     # Validate input dataset: components entering the increments of D_ℓ (default: all present).
-    # increment_components=("u", "v") gives the counterpart of the HKE transfer Π_h.
+    # increment_components=("u", "v") gives the counterpart of the HKE transfer Π_h; with w, of
+    # the HKE plus VKE transfers.
     present = [v for v in ["u", "v", "w"] if v in wind]
     velocity_vars = list(kwargs.get("increment_components") or present)
     if not {"u", "v"} <= set(velocity_vars) or not set(velocity_vars) <= set(present):
@@ -1273,8 +1285,8 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         wind = wind.assign(u=wind["u"] - wind["u"].mean((y_d, x_d)),
                            v=wind["v"] - wind["v"].mean((y_d, x_d)))
 
-    correction_fields = _correction_inputs(wind, divergence_correction, vertical_advection,
-                                           kwargs) if corrected else {}
+    correction_fields = _correction_inputs(wind, velocity_vars, divergence_correction,
+                                           vertical_advection, kwargs) if corrected else {}
 
     # Ensure velocity components are float32 for memory efficiency
     wind = wind[velocity_vars].astype({v: "float32" for v in velocity_vars})

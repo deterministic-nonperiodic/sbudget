@@ -142,7 +142,7 @@ It is written to `energy_transfer_corrected`; `energy_transfer` is unchanged.
 
 ```bash
 sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection \
-    --increment-components u,v      # u, v increments: counterpart of the HKE transfer
+    --increment-components u,v      # HKE transfer; u,v,w: HKE + VKE transfers
     # --perturbation                # remove the level-mean wind first
 ```
 

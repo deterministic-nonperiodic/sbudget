@@ -728,7 +728,7 @@ def _spectral_3d_case(n=64, L=64e3, H=8e3, u0=6.0, seed=23):
     d = L / n
     x = np.arange(n) * d
     X, Y = np.meshgrid(x, x, indexing="xy")
-    f = {k: np.zeros((n, n)) for k in ("u", "v", "w", "dzu", "dzv")}
+    f = {k: np.zeros((n, n)) for k in ("u", "v", "w", "dzu", "dzv", "dzw")}
     for _ in range(14):
         kx, ky = rng.integers(-4, 5, 2)
         m = 2 * np.pi / H * rng.uniform(0.5, 2.0)
@@ -736,8 +736,7 @@ def _spectral_3d_case(n=64, L=64e3, H=8e3, u0=6.0, seed=23):
         for c, amp in (("u", 1.0), ("v", 1.0), ("w", 0.6)):
             a, phase = rng.normal() * amp, rng.uniform(0, 2 * np.pi)
             f[c] += a * np.cos(ph + phase)                 # value at z = 0 of cos(ph + m z + phase)
-            if c != "w":
-                f[f"dz{c}"] += -a * m * np.sin(ph + phase)
+            f[f"dz{c}"] += -a * m * np.sin(ph + phase)
     f["u"] += u0
     f["v"] += 0.5 * u0
     k1 = 2 * np.pi * np.fft.fftfreq(n, d)
@@ -804,6 +803,53 @@ def test_corrected_transfer_equals_kernel_weighted_spectral_transfer():
               f"   {d_plain / spec:7.3f}")
         assert err < (5e-3 if factor < 8 else 1e-3), (factor, err)
         assert abs(d_hor / spec - 1) > 0.05 and abs(d_plain / spec - 1) > 0.05
+
+
+def test_corrected_transfer_with_w_equals_hke_plus_vke():
+    """With increments of (u, v, w), <D*_ell> == sum_k [T_h(k) + T_w(k)] [1 - G^(k)].
+
+    T_w is the flux-form VKE transfer of the spectral budget,
+        T_w = -<w, U.grad w + 1/2 div w + 1/2 w dz w>_k + 1/2 <dz w, w w>_k,
+    the HKE form with w advected, so C_ell and V_ell sum over u, v and w. D_ell itself sees w only
+    through |du|^2 (horizontal filter). Same fields and independent Fourier-space evaluation as
+    test_corrected_transfer_equals_kernel_weighted_spectral_transfer.
+    """
+    f, x, d, ddx, ddy = _spectral_3d_case()
+    n = x.size
+    u, v, w, dzu, dzv, dzw = (f[k] for k in ("u", "v", "w", "dzu", "dzv", "dzw"))
+    div = ddx(u) + ddy(v)
+
+    hat = lambda g: np.fft.fft2(g) / n ** 2
+    cross = lambda a, b: np.real(np.conj(hat(a)) * hat(b))
+    au = u * ddx(u) + v * ddy(u) + 0.5 * div * u + 0.5 * w * dzu
+    av = u * ddx(v) + v * ddy(v) + 0.5 * div * v + 0.5 * w * dzv
+    aw = u * ddx(w) + v * ddy(w) + 0.5 * div * w + 0.5 * w * dzw
+    t_h = -(cross(u, au) + cross(v, av)) + 0.5 * (cross(dzu, w * u) + cross(dzv, w * v))
+    t_w = -cross(w, aw) + 0.5 * cross(dzw, w * w)
+    assert abs(t_w.sum()) < 1e-10 * np.abs(t_w).sum()                  # conservative
+
+    da = lambda g: xr.DataArray(np.repeat(g[None], 3, 0), dims=("z", "y", "x"),
+                                coords={"z": [-1.0, 0.0, 1.0], "y": x, "x": x})
+    ds = xr.Dataset({"u": da(u), "v": da(v), "w": da(w)})
+    def corrected_mean(ell, shear_w):
+        out = inter_scale_kinetic_energy_transfer(
+            ds, scales=np.array([ell]), x_coord_boundary="periodic", y_coord_boundary="periodic",
+            allow_rechunk=False, increment_components=("u", "v", "w"), divergence=da(div),
+            divergence_correction=True, vertical_advection=True, dzu=da(dzu), dzv=da(dzv),
+            dzw=da(shear_w)).isel(z=1, scale=0)
+        return float(out["energy_transfer_corrected"].mean())
+
+    print("  ell/dx   spectral (h+w)   D*/spec-1   without w in V_ell   T_h only / (h+w)")
+    for factor, tol in ((5.0, 5e-3), (8.0, 1e-3), (12.0, 1e-3)):
+        ell = factor * d
+        weight = 1.0 - _lattice_filter_response(n, d, ell)
+        spec, spec_h = float(((t_h + t_w) * weight).sum()), float((t_h * weight).sum())
+        err = abs(corrected_mean(ell, dzw) / spec - 1)
+        err_no_vw = abs(corrected_mean(ell, np.zeros_like(dzw)) / spec - 1)   # V_ell over u, v
+        print(f"  {factor:5.1f}  {spec: .4e}  {err:12.1e}   {err_no_vw:16.1e}   "
+              f"{spec_h / spec:12.3f}")
+        assert err < tol, (factor, err)
+        assert err_no_vw > 10 * err and abs(spec_h / spec - 1) > 10 * err   # discriminates
 
 
 def test_perturbation_frame():
@@ -1415,6 +1461,7 @@ if __name__ == "__main__":
              test_divergence_correction_matches_increment_form,
              test_divergence_corrected_dell_closes_local_budget,
              test_corrected_transfer_equals_kernel_weighted_spectral_transfer,
+             test_corrected_transfer_with_w_equals_hke_plus_vke,
              test_perturbation_frame,
              test_corrected_transfer_closed_form_triad,
              test_corrected_transfer_closed_form_boussinesq_wave,
