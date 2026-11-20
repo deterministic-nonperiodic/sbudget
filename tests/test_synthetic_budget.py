@@ -1348,6 +1348,112 @@ def test_compute_budget_with_half_level_w():
     print(f"  metadata of all {len(out.data_vars)} outputs from the table (staggered, collocated)")
 
 
+def _vke_wave(dz, n, lam_z=20e3, z0=60e3, depth=24e3, lam_x=60e3, U=40.0, W0=2.0, H=7e3,
+              theta0=300.0, N=0.02, harmonic=0.5, beta=0.7):
+    """Gravity wave whose VKE budget terms are known exactly.
+
+    theta_bar = theta0 exp(a z) (N constant), pi_bar exactly hydrostatic, uniform wind U. w and
+    Phi = c_p theta_bar pi' grow as exp(z / 2H) and carry a second harmonic (so that the cubic
+    terms have a non-zero mean); theta' = (theta_bar / g)(c_p theta_bar dz pi' + U dx w), so that
+    the linear w equation holds and B + P = (w, U dx w) = 0 while B and P are large.
+    Returns the full and half levels, x, and a function of z giving the fields and their exact
+    derivatives.
+    """
+    from budget.constants import cp, g
+    a = N ** 2 / g
+    zh = np.arange(z0 - depth / 2, z0 + depth / 2 + 0.5 * dz, dz)
+    zf = 0.5 * (zh[1:] + zh[:-1])
+    x = np.arange(n) * 2 * lam_x / n
+    k, m = 2 * np.pi / lam_x, 2 * np.pi / lam_z
+    F0 = U * (m / k) * W0
+
+    def fields(z):
+        Z, Y, X = np.meshgrid(z, x, x, indexing="ij")
+        ph = k * X + m * Z
+        grow = np.exp((Z - z0) / (2 * H))
+        cos_ = np.cos(ph) + harmonic * np.cos(2 * ph + beta)
+        sin_ = np.sin(ph) + 2 * harmonic * np.sin(2 * ph + beta)
+        th_bar = theta0 * np.exp(a * Z)
+        w = W0 * grow * cos_
+        dxw = -k * W0 * grow * sin_
+        phi = F0 * grow * cos_
+        dz_pi = (F0 * grow * (cos_ / (2 * H) - m * sin_) - a * phi) / (cp * th_bar)
+        return dict(w=w, dzw=W0 * grow * (cos_ / (2 * H) - m * sin_), dxw=dxw,
+                    u=U - (m / k) * w, th_bar=th_bar, pi_bar=1.0 + g / (cp * theta0 * a)
+                    * (np.exp(-a * Z) - 1.0), pi_p=phi / (cp * th_bar), dz_pi_p=dz_pi,
+                    th_p=th_bar / g * (cp * th_bar * dz_pi + U * dxw))
+
+    return zf, zh, x, fields
+
+
+def test_vke_budget_synthetic_gravity_wave():
+    """The VKE terms of compute_budget converge to their exact values at second order.
+
+    VKE equation (dry): d/dt (w, w)/2 = (w, -u.grad w - w dz w - c_p theta dz pi - g)_k, split as
+    advection pi_vke + vfd_vke + j_vke + div_vke = -(w, u.grad w + w dz w)_k,
+    caz = B + P = (g/theta_bar)(w, theta') - c_p theta_bar (w, dz pi'), np_vke = -c_p (w, theta' dz pi').
+    In the test wave B + P = 0 exactly while B and P are large, as in mountain waves, so the
+    error of caz is the discretization error of a near-cancellation. Halving dz and dx must
+    reduce every error by about 4, for native half-level w (staggered) and interpolated w.
+    """
+    from types import SimpleNamespace
+    from budget.budget import compute_budget
+    from budget.constants import cp, g, Rd
+
+    def exact(zf, x, fields):
+        f = fields(zf)
+        pert = lambda q: q - q.mean((1, 2), keepdims=True)
+        mean = lambda q: q.mean((1, 2))
+        w, th_bar = pert(f["w"]), f["th_bar"][:, 0, 0]
+        return dict(adv=-mean(w * pert(f["u"] * f["dxw"] + f["w"] * f["dzw"])),
+                    P=-cp * th_bar * mean(w * pert(f["dz_pi_p"])),
+                    BP=g / th_bar * mean(w * pert(f["th_p"])) - cp * th_bar * mean(w * pert(f["dz_pi_p"])),
+                    N=-cp * mean(w * pert(f["th_p"] * f["dz_pi_p"])))
+
+    def computed(zf, zh, x, fields, staggered):
+        f, fh = fields(zf), fields(zh)
+        da = lambda a: xr.DataArray(a, dims=("z", "y", "x"), coords={"z": zf, "y": x, "x": x})
+        theta, exner = f["th_bar"] + f["th_p"], f["pi_bar"] + f["pi_p"]
+        pres = 1e5 * exner ** (cp / Rd)
+        w_half = xr.DataArray(fh["w"], dims=("z_half", "y", "x"),
+                              coords={"z_half": zh, "y": x, "x": x})
+        ds = xr.Dataset({"u": da(f["u"]), "v": da(np.zeros_like(f["u"])),
+                         "w": _collocated(w_half, zf), "theta": da(theta), "pressure": da(pres),
+                         "density": da(pres / (Rd * theta * exner))})
+        if staggered:
+            ds["w_half"] = w_half
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=x[1] - x[0], dy=x[1] - x[0],
+                                                      cumulative=True, transfer_form="flux",
+                                                      rechunk_spatial=False))
+        with _NoTaper():
+            out = compute_budget(ds, cfg).compute()
+        tot = {k: out[k].isel(wavenumber=0).values for k in
+               ("pi_vke", "vfd_vke", "j_vke", "div_vke", "caz", "np_vke")}
+        return dict(adv=tot["pi_vke"] + tot["vfd_vke"] + tot["j_vke"] + tot["div_vke"],
+                    BP=tot["caz"], N=tot["np_vke"])
+
+    errors = {}
+    for dz, n in ((500.0, 96), (250.0, 192)):
+        zf, zh, x, fields = _vke_wave(dz, n)
+        ex = exact(zf, x, fields)
+        inner = (zf > 54e3) & (zf < 66e3)
+        p_scale = np.abs(ex["P"][inner]).mean()
+        for staggered in (True, False):
+            got = computed(zf, zh, x, fields, staggered)
+            for key in ("adv", "N", "BP"):
+                scale = p_scale if key == "BP" else np.abs(ex[key][inner]).mean()
+                errors[dz, staggered, key] = float(np.abs(got[key] - ex[key])[inner].mean() / scale)
+    for staggered in (True, False):
+        label = "staggered " if staggered else "collocated"
+        coarse = [errors[500.0, staggered, k] for k in ("adv", "N", "BP")]
+        fine = [errors[250.0, staggered, k] for k in ("adv", "N", "BP")]
+        print(f"  {label}: errors at dz = 500 / 250 m (advection, N, B + P relative to |P|): "
+              + ", ".join(f"{c:.4f} / {f:.4f}" for c, f in zip(coarse, fine)))
+        for c, f in zip(coarse, fine):
+            assert c / f > 3.0, (label, c, f)                  # second-order convergence
+            assert f < 0.015, (label, f)
+
+
 def test_staggered_outputs_have_zarr_compatible_chunks():
     """Shifted half-level slices must not leave irregular dask chunks along the vertical.
     On Levante, 501 half levels chunked (251, 250) gave vf_vke chunks (250, 1, 249) on the 500
@@ -1490,6 +1596,7 @@ if __name__ == "__main__":
              test_vertical_operators_exact_for_linear_profiles,
              test_staggered_conversions_and_dwdz_more_accurate,
              test_staggered_flux_divergence_telescopes, test_compute_budget_with_half_level_w,
+             test_vke_budget_synthetic_gravity_wave,
              test_staggered_outputs_have_zarr_compatible_chunks,
              test_write_guard_makes_any_chunks_zarr_safe,
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
