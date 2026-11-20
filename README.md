@@ -127,81 +127,30 @@ better than $10^{-5}$) for periodic, reflect, mixed and edge/symmetric boundarie
 
 #### Counterpart of the spectral transfer: $\mathcal{T}^*_\ell$ (`--divergence-correction`, `--vertical-advection`)
 
-$\mathcal{T}_\ell$ closes the local budget of the mixed energy $\tfrac12\mathbf{u}\cdot\bar{\mathbf{u}}$
-only for non-divergent flow advected horizontally. The spectral budget's nonlinear transfer uses
-the flux (skew-symmetric) form of the advection,
+$\mathcal{T}_\ell$ assumes non-divergent flow advected horizontally. To compare it scale by scale
+with the spectral budget in divergent flow with vertical motion (e.g. gravity waves), the
+corrected transfer
 
-$$\mathbf{N} = (\mathbf{U}\cdot\nabla_h)\mathbf{u} + \tfrac12\,\delta\,\mathbf{u}
-+ \tfrac12\left[w\,\partial_z\mathbf{u} + \partial_z(w\,\mathbf{u})\right], \qquad
-\delta = \partial_x u + \partial_y v,$$
-
-and its physical-space counterpart is $\mathcal{T}^*_\ell = \mathcal{T}_\ell - C_\ell + V_\ell$ with
-
-$$C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}}
+$$\mathcal{T}^*_\ell = \mathcal{T}_\ell - C_\ell + V_\ell, \qquad
+C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}}
 - \tfrac14\,|\mathbf{u}|^2\,\bar\delta - \tfrac14\,\delta\,\overline{|\mathbf{u}|^2}, \qquad
-V_\ell = \tfrac12\,w\left(\bar{\mathbf{U}}\cdot\partial_z\mathbf{U} - \mathbf{U}\cdot\partial_z\bar{\mathbf{U}}\right),$$
+V_\ell = \tfrac12\,w\left(\bar{\mathbf{u}}\cdot\partial_z\mathbf{u} - \mathbf{u}\cdot\partial_z\bar{\mathbf{u}}\right)$$
 
-(bar: the same lattice filter as $\mathcal{T}_\ell$; $\mathbf{U} = (u, v)$). $C_\ell$, the dilatational
-exchange, follows from the Duchon–Robert derivation without $\delta = 0$; locally
-$-\tfrac12[\bar{\mathbf{u}}\cdot\mathbf{N}_h + \mathbf{u}\cdot\bar{\mathbf{N}}_h] = -\nabla_h\cdot\mathbf{J}_\ell
-- (\mathcal{T}_\ell - C_\ell)$ exactly. $V_\ell$, the vertical exchange, is what remains of the
-vertical advection after the vertical flux $\tfrac12 w\,\mathbf{U}\cdot\bar{\mathbf{U}}$. On a periodic
-domain the domain mean of $\mathcal{T}^*_\ell$ equals the kernel-weighted spectral transfer
-$\sum_k T(k)\,[1-\hat G(k\ell)]$. Use `--increment-components u,v` for the counterpart of the HKE
-transfer $\Pi_h$. The output gains `energy_transfer_corrected`; `energy_transfer` is unchanged.
-The same options exist as `compute:` keys in the YAML (`divergence_correction`,
-`vertical_advection`, `perturbation`, `increment_components`); from Python, the correction alone
-is `inter_scale_transfers.transfer_correction`. $\delta$ is chosen as in the spectral budget: the
-dataset's `divergence` when it also provides `vorticity`, otherwise centred differences.
-$\partial_z\mathbf{u}$ uses the budget's centred differences on the full column, before
-`--levels` is applied.
+($\delta$ the horizontal divergence, bar the filter of $\mathcal{T}_\ell$) has a domain mean equal
+to the flux-form spectral transfer seen through the same filter, $\sum_k T(k)\,[1-\hat G(k\ell)]$.
+It is written to `energy_transfer_corrected`; `energy_transfer` is unchanged.
 
-The increment form of $C_\ell$ is, for unit density and without pressure, the $G_\ell$-weighted
-average of the divergence terms in the point-split kinetic-energy identity of Galtier and Banerjee
-(2011), as written by Eyink and Drivas (2018, their Eq. 131). Eyink and Drivas show that such
-terms are not regularized as $\ell\to 0$ at infinite Reynolds number, so $\mathcal{T}^*_\ell$ is a
-diagnostic of the resolved transfer at a given $\ell$ (for comparison with the spectral budget),
-not a measure of anomalous dissipation.
+```bash
+sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection \
+    --increment-components u,v      # u, v increments: counterpart of the HKE transfer
+    # --perturbation                # remove the level-mean wind first
+```
 
-`--perturbation` removes the level-mean horizontal wind first. $\mathcal{T}_\ell$ does not change,
-but $C_\ell$, $V_\ell$ and the flux-form spectral transfer are not Galilean invariant: a mean wind
-$\mathbf{c}$ couples to every wavenumber through $\tfrac12\delta\,\mathbf{c}$ and $w\,\partial_z\mathbf{c}$
-(exchange with the mean flow, not between scales), so the transfer itself depends on the frame.
-Compare $\mathcal{T}^*_\ell$ with a spectral transfer computed from the same fields. On an open
-limited-area domain the mean of the mixed-energy tendency $\langle\bar{\mathbf{u}}\cdot\mathbf{N}\rangle$
-contains the boundary flux $\langle\nabla_h\cdot\mathbf{J}_\ell\rangle$ of the mean wind, but neither
-$\langle\mathcal{T}^*_\ell\rangle$ nor the FFT-based spectral transfer does, so they still agree.
-
-Derivation in brief: (i) expanding $(\mathbf{b}-\mathbf{a})|\mathbf{b}-\mathbf{a}|^2$ with
-$\int\nabla G = 0$ gives $4\mathcal{T}_\ell = -\nabla_h\cdot\overline{\mathbf{u}|\mathbf{u}|^2}
-+ 2u_j\partial_i\overline{u_iu_j} - |\mathbf{u}|^2\bar\delta + \mathbf{u}\cdot\nabla_h\overline{|\mathbf{u}|^2}
-- 2u_iu_j\partial_i\bar u_j$ for any $\delta$; eliminating the same combination from the advective
-tendency of $E_\ell$ written with $(\mathbf{u}\cdot\nabla_h)\mathbf{u} = \nabla_h\cdot(\mathbf{u}\otimes\mathbf{u})
-- \delta\mathbf{u}$ leaves $C_\ell$. (ii) $t_h + \partial_z F_h = -(\mathbf{u},\mathbf{N})_k$ with
-$F_h = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, and $\langle\mathbf{a}\cdot\bar{\mathbf{b}}\rangle =
-\sum_k(\mathbf{a},\mathbf{b})_k\hat G_\ell(k)$, give $\sum_k t_h[1-\hat G_\ell] =
-\langle\bar{\mathbf{u}}\cdot\mathbf{N}\rangle - \tfrac12\partial_z\langle w\,\mathbf{u}\cdot\bar{\mathbf{u}}\rangle$.
-(iii) $\bar{\mathbf{u}}\cdot\mathbf{N}_v = \partial_z(\tfrac12 w\,\mathbf{u}\cdot\bar{\mathbf{u}}) + V_\ell$.
-
-Tests (`tests/test_synthetic_budget.py`): the FFT evaluation of $C_\ell$ equals its increment form
-to $10^{-4}$ (reflect, periodic, edge/symmetric boundaries); the local identity above closes to
-$4\times10^{-4}$ of $\max|\mathcal{T}_\ell|$; with divergent flow, vertical advection and a
-background wind, the domain mean of $\mathcal{T}^*_\ell$ equals an independent Fourier-space
-computation of the kernel-weighted transfer to $2\times10^{-4}$ ($\ell = 5\,\Delta x$),
-$10^{-5}$ ($8\,\Delta x$) and $2\times10^{-6}$ ($12\,\Delta x$), where $\mathcal{T}_\ell$ alone
-gives 0–12% of it. Two closed forms: a divergent triad $u = c + A\cos kx + B\cos(2kx+\beta)$, for
-which $\langle\mathcal{T}_\ell - C_\ell\rangle = \tfrac38 kA^2B\sin\beta\,[\hat G(2k)-\hat G(k)]$
-(reproduced to $8\times10^{-4}$ at $8\,\Delta x$ and $1.4\times10^{-6}$ at $16\,\Delta x$, the
-error being the quadrature of $\nabla G$), and a steady Boussinesq gravity wave in a uniform wind
-$\mathbf{c}$ (exact linear solution, conservative or damped by Rayleigh friction and Newtonian
-cooling), for which $\langle\mathcal{T}_\ell\rangle = \langle C_\ell\rangle = 0$ but
-$\langle\mathcal{T}^*_\ell\rangle = \tfrac12[1-\hat G(k)]\,\mathbf{c}\cdot\partial_z\langle\mathbf{u}'w\rangle$:
-zero for the conservative wave (constant stress, Eliassen and Palm 1961) although
-$C_\ell$ and $V_\ell$ are not zero pointwise, positive for the damped wave (the mean wind loses
-energy to it), and zero in the perturbation frame (reproduced to $10^{-5}$). The command-line run (YAML and flags,
-stretched vertical grid, level selection, perturbation frame) equals the direct computation on the
-full column exactly; results do not depend on the dask chunking; invalid requests fail before
-any computation. Cost: up to $2n+4$ extra inverse FFTs per plane and scale.
+The same options are `compute:` keys in the YAML (`divergence_correction`, `vertical_advection`,
+`perturbation`, `increment_components`). Unlike $\mathcal{T}_\ell$, the correction (like the
+spectral transfer) depends on the frame: a mean wind adds wave–mean-flow exchange, which
+`--perturbation` removes. Derivation, implementation, tests (including closed-form solutions)
+and validation on simulations: [docs/corrected_transfer.md](docs/corrected_transfer.md).
 
 ### References:
 
@@ -215,11 +164,6 @@ any computation. Cost: up to $2n+4$ extra inverse FFTs per plane and scale.
 - J. Duchon, and R. Robert (2000). Inertial energy dissipation for weak solutions of
   incompressible Euler and Navier-Stokes equations. Nonlinearity, 13(1), 249.
   https://doi.org/10.1088/0951-7715/13/1/312
-- S. Galtier, and S. Banerjee (2011). Exact relation for correlation functions in compressible
-  isothermal turbulence. Phys. Rev. Lett., 107, 134501.
-  https://doi.org/10.1103/PhysRevLett.107.134501
-- G. L. Eyink, and T. D. Drivas (2018). Cascades and dissipative anomalies in compressible fluid
-  turbulence. Phys. Rev. X, 8, 011022. https://doi.org/10.1103/PhysRevX.8.011022
 
 ### Install
 

@@ -1117,8 +1117,8 @@ def transfer_correction(
     Duchon-Robert spatial flux; V_ℓ is the part of ū·N_v that is not a vertical flux divergence.
     C_ℓ vanishes for δ = 0 and V_ℓ for w = 0; both vanish as ℓ → 0. Unlike D_ℓ, they depend on a
     uniform background velocity, as T(k) does. With components ("u", "v"), D*_ℓ is the
-    counterpart of the HKE transfer Π_h. Derivation and tests: README ('Counterpart of the
-    spectral transfer') and tests/test_synthetic_budget.py.
+    counterpart of the HKE transfer Π_h. Derivation, tests and validation:
+    docs/corrected_transfer.md.
 
     Parameters
     ----------
