@@ -382,9 +382,9 @@ def main(argv: list[str] | None = None) -> None:
     p_compute.add_argument("--dx", type=float, help="Grid spacing in x-direction (meters).")
     p_compute.add_argument("--dy", type=float, help="Grid spacing in y-direction (meters).")
     p_compute.add_argument("--transfer-form", choices=["invariant", "flux", "conservative"],
-                           help="Formulation of the nonlinear spectral transfers: 'flux' "
-                                "(default), 'conservative' (skew-symmetric: sums to zero over "
-                                "wavenumbers on periodic axes) or 'invariant'.")
+                           help="Formulation of the nonlinear spectral transfers: "
+                                "'conservative' (default; skew-symmetric: sums to zero over "
+                                "wavenumbers on periodic axes), 'flux' or 'invariant'.")
     p_compute.add_argument("--periodic-axes", type=_csv_or_list,
                            help="Horizontal axes on which the data are periodic, e.g. 'x' or "
                                 "'x,y': wrap-around derivatives, no taper and no linear detrend "

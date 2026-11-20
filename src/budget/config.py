@@ -25,8 +25,8 @@ class ComputeConfig:
     norm: str | None = None  # None or "ortho"
     dx: float | None = None
     dy: float | None = None
-    # "flux", "conservative" (skew-symmetric: sums to zero over wavenumbers) or "invariant"
-    transfer_form: str | None = "flux"
+    # "conservative" (skew-symmetric: sums to zero over wavenumbers), "flux" or "invariant"
+    transfer_form: str | None = "conservative"
     # horizontal axes on which the data are periodic ("x", "y"); a global longitude always is
     periodic_axes: list[str] | None = None
     shape_parameter: float = 1.0  # Shape parameter p for the mollifier filter

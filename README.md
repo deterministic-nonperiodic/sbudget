@@ -76,10 +76,10 @@ choice matters there only for telescoping and closure.
 Every nonlinear transfer sums to zero over wavenumbers on a periodic domain. On the grid this
 holds only if the advection is written in skew-symmetric form, $\tfrac12[(\mathbf{u}\cdot\nabla)a
 + \nabla\cdot(\mathbf{u}\,a)]$, with a centred difference that wraps around:
-`transfer_form: conservative` uses this form for the HKE, VKE and APE transfers, and its sum is
-zero to round-off. The default `flux` form, $(\mathbf{u}\cdot\nabla)a + \tfrac12\delta\,a$, relies
-on the product rule and leaves a residual of a few per cent of $\max|\Pi|$ for smooth fields
-(more if there is energy near the grid scale); both forms converge to the same transfer.
+`transfer_form: conservative` (the default) uses this form for the HKE, VKE and APE transfers, and
+its sum is zero to round-off. The `flux` form, $(\mathbf{u}\cdot\nabla)a + \tfrac12\delta\,a$,
+relies on the product rule and leaves a residual of a few per cent of $\max|\Pi|$ for smooth
+fields (more if there is energy near the grid scale); both forms converge to the same transfer.
 
 `periodic_axes: [x]` (or `[x, y]`) marks the axes on which the data are periodic; a global
 longitude always is. Along them derivatives wrap around, and spectra are neither tapered nor

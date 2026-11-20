@@ -840,8 +840,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     ape_1d = isotropize(ape_2d, dx, dy, cumulative=False)  # non-cumulative APE spectra
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
-    # "flux" | "conservative" (skew-symmetric, sums to zero on periodic axes) | "invariant"
-    transfer_mode = getattr(cfg.compute, "transfer_form", None) or "flux"
+    # "conservative" (default; skew-symmetric, sums to zero on periodic axes) | "flux" | "invariant"
+    transfer_mode = getattr(cfg.compute, "transfer_form", None) or "conservative"
     if transfer_mode not in ("flux", "conservative", "invariant"):
         raise ValueError(f"transfer_form {transfer_mode!r}: expected flux, conservative or "
                          "invariant")

@@ -15,7 +15,8 @@ compute:
   dx: null                  # only for Cartesian grids; lon/lat inferred
   dy: null
   cumulative: true          # default; set false for raw (non-accumulated) spectra
-  transfer_form: flux       # invariant, flux. Method for computing nonlinear spectral transfers
+  transfer_form: conservative  # conservative (skew-symmetric), flux or invariant spectral transfers
+  periodic_axes: null       # e.g. [x] or [x, y]: no taper or linear detrend, wrapping derivatives
   # FFT stability & memory control
   rechunk_spatial: false    # ensure single spatial chunks (y, x) for FFTs, and convolutions
   chunk_size: 512           # constraint on largest chunk size [MB] for a horizontal plane (y, x)
