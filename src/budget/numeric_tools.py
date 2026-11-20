@@ -96,10 +96,29 @@ def _coordinate_derivative(da: xr.DataArray, dim: str) -> xr.DataArray:
     coord = da[dim]
     if not is_periodic(coord):
         return da.differentiate(dim, edge_order=2)
-    spacing = np.diff(coord.values)
-    if not np.allclose(spacing, spacing[0], rtol=1e-6):
+    delta = uniform_spacing(coord)
+    if delta is None:
         raise ValueError(f"periodic derivative along '{dim}' needs uniform spacing")
-    return (da.roll({dim: -1}) - da.roll({dim: 1})) / (2.0 * float(spacing[0]))
+    return (da.roll({dim: -1}) - da.roll({dim: 1})) / (2.0 * delta)
+
+
+def uniform_spacing(coord: xr.DataArray, rtol: float = 1e-6) -> float | None:
+    """The spacing of a uniform coordinate, (x[-1] - x[0]) / (n - 1), or None if it is not uniform.
+
+    A coordinate stored in single precision (common in model output) carries rounding errors of
+    a few units in the last place of its largest value, ~1e-4 m for x ~ 1e3 km, so its
+    differences scatter by ~1e-5 of the spacing. That scatter is tolerated; a stretched grid is not.
+    """
+    values = np.asarray(coord.values)
+    if values.size < 2:
+        return None
+    resolution = np.finfo(values.dtype).eps if np.issubdtype(values.dtype, np.floating) else 0.0
+    values = values.astype(np.float64)
+    delta = (values[-1] - values[0]) / (values.size - 1)
+    tolerance = rtol * abs(delta) + 4.0 * resolution * np.abs(values).max()
+    if delta == 0.0 or np.abs(np.diff(values) - delta).max() > tolerance:
+        return None
+    return float(delta)
 
 
 def first_derivative(da: xr.DataArray, dim: str, delta: float | None = None) -> xr.DataArray:
