@@ -40,14 +40,28 @@ _BUDGET_META = {
     "caz": ("conversion_ape_vke",
             "Conversion from available potential energy to vertical kinetic energy", _BUDGET_UNITS),
     "pi_nke": ("nonlinear_hke_transfer",
-               "Nonlinear spectral transfer of horizontal kinetic energy", _BUDGET_UNITS),
+               "Nonlinear spectral transfer of horizontal kinetic energy (interior part: sums to "
+               "zero over wavenumbers on any domain)", _BUDGET_UNITS),
     "pi_lke": ("linear_hke_transfer",
                "Linear spectral transfer of horizontal kinetic energy due to Coriolis",
                _BUDGET_UNITS),
     "pi_vke": ("nonlinear_vke_transfer",
-               "Nonlinear spectral transfer of vertical kinetic energy", _BUDGET_UNITS),
+               "Nonlinear spectral transfer of vertical kinetic energy (interior part)",
+               _BUDGET_UNITS),
     "pi_ape": ("nonlinear_ape_transfer",
-               "Nonlinear spectral transfer of available potential energy", _BUDGET_UNITS),
+               "Nonlinear spectral transfer of available potential energy (interior part)",
+               _BUDGET_UNITS),
+    "lf_hke": ("lateral_hke_flux_divergence",
+               "Lateral (horizontal) flux divergence of horizontal kinetic energy: transport "
+               "through the side boundaries, zero on periodic axes", _BUDGET_UNITS),
+    "lf_vke": ("lateral_vke_flux_divergence",
+               "Lateral (horizontal) flux divergence of vertical kinetic energy", _BUDGET_UNITS),
+    "lf_ape": ("lateral_ape_flux_divergence",
+               "Lateral (horizontal) flux divergence of available potential energy",
+               _BUDGET_UNITS),
+    "lf_pres": ("lateral_pressure_flux_divergence",
+                "Lateral (horizontal) divergence of pressure work: pressure flux through the "
+                "side boundaries, zero on periodic axes", _BUDGET_UNITS),
     "vfd_dke": ("vertical_dke_flux_divergence",
                 "Vertical flux divergence of horizontal kinetic energy", _BUDGET_UNITS),
     "vfd_vke": ("vertical_vke_flux_divergence",
@@ -380,6 +394,65 @@ def nonlinear_ape_transfer(
     pi_ape = gamma * (t_adv + t_shear)
 
     return pi_ape.rename(name)
+
+
+# --------------------------------------------------------------------------------------------------
+# Lateral fluxes: the horizontal counterpart of the vertical flux split
+#
+# The vertical advection of a quantity X is split into an antisymmetric transfer,
+# ½[(∂z X, w X)_k - (X, w ∂z X)_k], which sums to zero over wavenumbers at every point, and the
+# flux divergence ∂z F_X. The same split of the horizontal advection by U = (u, v) is
+#     -(X, ½[(U·∇)X + ∇·(U X)])_k = ½[(∇X, U X)_k - (X, (U·∇)X)_k] + L_X(k),
+#     L_X(k) = -½[(X, ∇·(U X))_k + (∇X, U X)_k],
+# exact at every k (both sides are built from the same fields; cross-spectra are bilinear). The
+# first term sums to zero over wavenumbers on any domain, because ∇X·U X = X U·∇X pointwise. L_X
+# sums to -⟨∇·(U X²/2)⟩, the flux of X²/2 through the side boundaries divided by the area, and
+# vanishes at every k along periodic axes, where the wrap-around centred difference is
+# skew-adjoint at each wavenumber. compute_budget returns the interior part as pi_* and L as
+# lf_*: their sum is the full transfer of the chosen form. For the pressure work,
+#     -c_p θ̄ (U, ∇π')_k = c_p θ̄ (∇·U, π')_k + L_p(k),   L_p(k) = -c_p θ̄ [(U, ∇π')_k + (∇·U, π')_k],
+# where the first term is what the vertical pressure flux, conversion and divergence terms
+# decompose; L_p sums to the pressure flux through the side boundaries.
+# --------------------------------------------------------------------------------------------------
+def _lateral_flux_spectrum(scalar: xr.DataArray, u: xr.DataArray,
+                           v: xr.DataArray) -> xr.DataArray:
+    """L_X(k) = -½[(X, ∇·(U X))_k + (∇X, U X)_k] for X = scalar, U = (u, v)."""
+    flux = stack_vector(u * scalar, v * scalar, name="flux")
+    grad = stack_vector(*horizontal_gradient(scalar), name="grad")
+    return -0.5 * (scalar_cross_spectrum(scalar, horizontal_divergence(u * scalar, v * scalar))
+                   + vector_cross_spectrum(grad, flux))
+
+
+@budget_metadata
+def lateral_hke_flux(u: xr.DataArray, v: xr.DataArray, name="lf_hke") -> xr.DataArray:
+    """Lateral flux divergence of HKE: L_u(k) + L_v(k) (see _lateral_flux_spectrum)."""
+    return (_lateral_flux_spectrum(u, u, v) + _lateral_flux_spectrum(v, u, v)).rename(name)
+
+
+@budget_metadata
+def lateral_vke_flux(u: xr.DataArray, v: xr.DataArray, w: xr.DataArray,
+                     name="lf_vke") -> xr.DataArray:
+    """Lateral flux divergence of VKE: L_w(k)."""
+    return _lateral_flux_spectrum(w, u, v).rename(name)
+
+
+@budget_metadata
+def lateral_ape_flux(u: xr.DataArray, v: xr.DataArray, theta_prime: xr.DataArray,
+                     gamma: xr.DataArray, name="lf_ape") -> xr.DataArray:
+    """Lateral flux divergence of APE: γ L_θ'(k)."""
+    return (gamma * _lateral_flux_spectrum(theta_prime, u, v)).rename(name)
+
+
+@budget_metadata
+def lateral_pressure_flux(u: xr.DataArray, v: xr.DataArray, theta_mean: xr.DataArray,
+                          exner: xr.DataArray, name="lf_pres") -> xr.DataArray:
+    """Lateral divergence of pressure work: -c_p θ̄ [(U, ∇π')_k + (∇·U, π')_k], with ∇·U the
+    finite-difference divergence (so that it vanishes at every k on periodic axes)."""
+    wind = stack_vector(u, v, name="wind")
+    grad = stack_vector(*horizontal_gradient(exner), name="grad")
+    lf = -cp * theta_mean * (vector_cross_spectrum(wind, grad)
+                             + scalar_cross_spectrum(horizontal_divergence(u, v), exner))
+    return lf.rename(name)
 
 
 @budget_metadata
@@ -844,18 +917,29 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         pi_nke_2d = nonlinear_hke_transfer_flux(u, v, w, divergence, conservative=conservative,
                                                 name="pi_nke")
 
+    # Lateral split: pi_* is the interior transfer (sums to zero over wavenumbers on any domain),
+    # lf_* the lateral flux divergence (zero on periodic axes); pi_* + lf_* is the full transfer.
+    lf_hke_2d = lateral_hke_flux(u, v, name="lf_hke")
+    pi_nke_2d = (pi_nke_2d - lf_hke_2d).rename("pi_nke")
     pi_nke = isotropize(pi_nke_2d, dx, dy, cumulative=cumulative)
+    lf_hke = isotropize(lf_hke_2d, dx, dy, cumulative=cumulative)
 
     pi_lke_2d = coriolis_linear_transfer(u, v, name="pi_lke")
     pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
 
     pi_vke_2d = nonlinear_vke_transfer(u, v, w, divergence, conservative=conservative,
                                        name="pi_vke")
+    lf_vke_2d = lateral_vke_flux(u, v, w, name="lf_vke")
+    pi_vke_2d = (pi_vke_2d - lf_vke_2d).rename("pi_vke")
     pi_vke = isotropize(pi_vke_2d, dx, dy, cumulative=cumulative)
+    lf_vke = isotropize(lf_vke_2d, dx, dy, cumulative=cumulative)
 
     pi_ape_2d = nonlinear_ape_transfer(u, v, w, theta_prime, gamma, divergence,
                                        conservative=conservative, name="pi_ape")
+    lf_ape_2d = lateral_ape_flux(u, v, theta_prime, gamma, name="lf_ape")
+    pi_ape_2d = (pi_ape_2d - lf_ape_2d).rename("pi_ape")
     pi_ape = isotropize(pi_ape_2d, dx, dy, cumulative=cumulative)
+    lf_ape = isotropize(lf_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE PERTURBATION (Exner deviation from the hydrostatic reference) ---
     exner_surface = domain_mean(exner.sel(z=exner.z.min()))
@@ -919,10 +1003,15 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     caz = isotropize(caz_2d.rename("caz"), dx, dy, cumulative=cumulative)
 
     # Pressure work by the anelastic-departure divergence (div_pres) and by θ' (np_hke, np_vke):
-    # with these, ∂z F_p + J_p + C_{A→h} + Div_p + N_h is the exact horizontal pressure work.
+    # with these, ∂z F_p + J_p + C_{A→h} + Div_p + N_h + L_p is the exact horizontal pressure work
+    # (L_p = lf_pres, zero on periodic axes).
     div_pres_2d = pressure_divergence_work(u, v, w, divergence, rho, theta_mean, exner_prime,
                                            dzw=dzw, name="div_pres")
     div_pres = isotropize(div_pres_2d, dx, dy, cumulative=cumulative)
+
+    # Lateral pressure flux: with it, the horizontal pressure work closes on bounded axes too
+    lf_pres_2d = lateral_pressure_flux(u, v, theta_mean, exner_prime, name="lf_pres")
+    lf_pres = isotropize(lf_pres_2d, dx, dy, cumulative=cumulative)
 
     np_hke_2d = nonlinear_pressure_work_hke(u, v, theta_prime, exner_prime, name="np_hke")
     np_hke = isotropize(np_hke_2d, dx, dy, cumulative=cumulative)
@@ -949,7 +1038,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
               pi_nke, pi_lke, pi_vke, pi_ape, vfd_dke, vfd_vke, vfd_ape,
               j_hke, j_vke, j_ape, vf_hke, vf_vke, vf_ape, cad, caz,
               vf_pres, vfd_pres, j_pres, div_pres, np_hke, np_vke,
-              div_hke, div_vke, div_ape]
+              div_hke, div_vke, div_ape, lf_hke, lf_vke, lf_ape, lf_pres]
 
     # Filter out None and assemble into Dataset. Metadata by output name: terms built outside the
     # decorated functions (staggered vertical terms, flux divergences) would otherwise keep the

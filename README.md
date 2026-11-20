@@ -13,20 +13,28 @@ suitable for studying spectral energy transfers across scales. The budget is for
 [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1),
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
-$$\partial_t E_h(k)=T_h(k)+L_h(k)+\partial_z F_{h\uparrow}(k)+J_h(k)+\mathrm{Div}_h(k)
-+\partial_z F_{p\uparrow}(k)+J_p(k)+C_{A\to h}(k)+\mathrm{Div}_p(k)+N_h(k)+H_h(k)+D_h(k),$$
+$$\partial_t E_h(k)=T_h(k)+L_h(k)+\nabla_h\cdot F_h(k)+\partial_z F_{h\uparrow}(k)+J_h(k)
++\mathrm{Div}_h(k)+\nabla_h\cdot F_p(k)+\partial_z F_{p\uparrow}(k)+J_p(k)+C_{A\to h}(k)
++\mathrm{Div}_p(k)+N_h(k)+H_h(k)+D_h(k),$$
+the budget of vertical kinetic energy (VKE) as:
+$$\partial_t E_z(k)=T_z(k)+\nabla_h\cdot F_z(k)+\partial_z F_{z\uparrow}(k)+J_z(k)
++\mathrm{Div}_z(k)+C_{A\to z}(k)+N_z(k)+D_z(k),$$
 and the budget of available potential energy (APE) as:
-$$\partial_t E_A(k)=-C_A(k)+T_A(k)+\partial_z F_{A\uparrow}(k)+J_A(k)+\mathrm{Div}_A(k)+H_A
-(k)+D_A(k).$$
+$$\partial_t E_A(k)=-C_A(k)+T_A(k)+\nabla_h\cdot F_A(k)+\partial_z F_{A\uparrow}(k)+J_A(k)
++\mathrm{Div}_A(k)+H_A(k)+D_A(k).$$
 
-Where subscripts $h$ and $A$ denote terms for HKE and APE, respectively, and $(a,b)_k$ is the
-co-spectrum summed over the wavenumber shell $k$:
-* $E_h(k), E_A(k)$ — isotropic spectrum of energy at wavenumber $k$.
-* $T_h(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales); sums to zero over
-  $k$ on a periodic domain.
+Where subscripts $h$, $z$ and $A$ denote terms for HKE, VKE and APE, respectively, and
+$(a,b)_k$ is the co-spectrum summed over the wavenumber shell $k$:
+* $E_h(k), E_z(k), E_A(k)$ — isotropic spectrum of energy at wavenumber $k$.
+* $T_h(k), T_z(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales), interior
+  part: sums to zero over $k$ on any domain (see *Lateral fluxes* below).
 * $L_h(k)$ — linear **spectral transfer** of HKE due to Coriolis.
-* $F_{h\uparrow} = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, $F _{A\uparrow}$ — **vertical flux** of energy
-  (positive downward, so $\partial_z F > 0$ is a gain).
+* $\nabla_h\cdot F _h(k)$, $\nabla_h\cdot F _z(k)$, $\nabla_h\cdot F _A(k)$, $\nabla_h\cdot F _p(k)$ —
+  **lateral flux** divergence of energy and of pressure work: transport through the side
+  boundaries, zero on periodic axes (see *Lateral fluxes* below).
+* $F_{h\uparrow} = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, $F _{z\uparrow} = -\tfrac12(w, ww)_k$,
+  $F _{A\uparrow}$ — **vertical flux** of energy (positive downward, so $\partial_z F > 0$ is a
+  gain).
 * $F_{p\uparrow} = -c_p\bar\theta(w,\pi')_k$ — vertical **pressure** flux.
 * $J_h = F_{h\uparrow}\partial_z\ln\bar\rho$, $J_A = F_{A\uparrow}\partial_z\ln(\bar\rho/\gamma)$,
   $J_p = F_{p\uparrow}\partial_z\ln(\bar\rho/\bar\theta)$ — **reference-profile** terms; with them,
@@ -34,8 +42,10 @@ co-spectrum summed over the wavenumber shell $k$:
   integrals reduce to boundary fluxes.
 * $\mathrm{Div}_X = \tfrac12(X, X D)_k$, $\mathrm{Div}_p = c_p\bar\theta(\pi', D)_k$ — **compressibility**
   terms, with $D = \bar\rho^{-1}\nabla\cdot(\bar\rho\mathbf{v})$ (zero for anelastic flow).
-* $C_{A\to h} = c_p\bar\theta(w,\partial_z\pi')_k$ — **conversion** from APE to HKE (pressure work);
-  $C_A = (g/\bar\theta)(w,\theta')_k$ is the total APE→KE conversion.
+* $C_{A\to h} = c_p\bar\theta(w,\partial_z\pi') _k$ — **conversion** from APE to HKE (pressure work);
+  $C _{A\to z} = (g/\bar\theta)(w,\theta') _k - c_p\bar\theta(w,\partial_z\pi') _k$ — conversion to
+  VKE (buoyancy minus vertical pressure work); $C _A = (g/\bar\theta)(w,\theta') _k$ is the total
+  APE→KE conversion, $C _A = C _{A\to h} + C _{A\to z}$.
 * $N_h = -c_p(\mathbf{u}, \theta'\nabla_h\pi')_k$ — pressure work by $\theta'$ (and
   $N_z = -c_p(w, \theta'\partial_z\pi')_k$ for VKE).
 * $H_h(k), H_A(k)$ — **diabatic** tendency (heating/cooling).
@@ -114,12 +124,41 @@ sbudget compute config.yaml --mode spectral_budget                       # defau
 sbudget compute config.yaml --mode spectral_budget --periodic-axes x     # declare x periodic
 ```
 
-On a domain bounded in $y$, the sum over all wavenumbers ($k = 0$ included) is the energy flux
-through the walls,
+#### Lateral fluxes on bounded domains
 
-$$\sum_k T(k) = -\frac{1}{L_y}\Big[\big\langle \tfrac12\, v\,|\mathbf{u}|^2 \big\rangle_x\Big]_{y_S}^{y_N},$$
+On a bounded domain the horizontal advection also carries energy through the side boundaries,
+and a transfer computed from it no longer sums to zero over wavenumbers. sbudget splits it the
+way the vertical advection is split. For a quantity $X$ advected by $\mathbf{u} = (u, v)$, at
+every $k$,
 
-and $\Pi(k_{min})$ is the part of it that reaches $k > 0$.
+$$-\big(X, \tfrac12[(\mathbf{u}\cdot\nabla)X + \nabla\cdot(\mathbf{u}X)]\big)_k
+= \underbrace{\tfrac12\big[(\nabla X, \mathbf{u}X)_k - (X, (\mathbf{u}\cdot\nabla)X)_k\big]}_{\text{interior transfer}}
+\underbrace{-\tfrac12\big[(X, \nabla\cdot(\mathbf{u}X))_k + (\nabla X, \mathbf{u}X)_k\big]}_{\nabla_h\cdot F _X(k)}.$$
+
+* The interior transfer sums to zero over wavenumbers on **any** domain: its two terms are equal
+  point by point ($\nabla X\cdot\mathbf{u}X = X\,\mathbf{u}\cdot\nabla X$), as are those of the
+  vertical part $\tfrac12[(\partial_z X, wX)_k - (X, w\,\partial_z X)_k]$.
+* The lateral term sums to $-\langle\nabla\cdot(\tfrac12\mathbf{u}X^2)\rangle$, the flux of
+  $\tfrac12 X^2$ through the side boundaries divided by the area. It vanishes at every $k$ along
+  periodic axes, where the wrap-around centred difference is skew-adjoint wavenumber by
+  wavenumber.
+
+For the pressure work,
+
+$$-c_p\bar\theta(\mathbf{u}, \nabla\pi') _k = c_p\bar\theta(\nabla\cdot\mathbf{u}, \pi') _k
+-c_p\bar\theta\big[(\mathbf{u}, \nabla\pi') _k + (\nabla\cdot\mathbf{u}, \pi') _k\big]:$$
+
+the first term is what $\partial_z F _{p\uparrow} + J _p + C _{A\to h} + \mathrm{Div} _p$
+decompose, and the second, $\nabla_h\cdot F _p(k)$, closes the pressure work at every $k$ on
+bounded axes.
+
+Outputs: `pi_nke`, `pi_vke`, `pi_ape` are the interior transfers; `lf_hke`, `lf_vke`, `lf_ape`,
+`lf_pres` the lateral flux divergences (cumulative, like the other terms). The full transfer of
+the chosen form is their sum, e.g. `pi_nke + lf_hke`; on periodic axes `lf_*` is zero and
+`pi_*` is the full transfer. How the boundary flux spreads over $k$ depends on the Fourier basis
+of the bounded domain, as does every spectrum there; their sum over $k$ is the boundary flux. The cumulative
+outputs exclude the domain-mean mode $k = 0$, so $\Pi(k_{min}) = -T(0)$: the exchange between
+the fluctuations and the domain-mean flow, not zero even on a periodic domain.
 
 #### Features
 
