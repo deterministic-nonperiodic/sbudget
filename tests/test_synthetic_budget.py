@@ -897,52 +897,75 @@ def test_corrected_transfer_closed_form_triad():
         assert abs(d_plain / exact - 1) > 0.05
 
 
-def test_corrected_transfer_closed_form_plane_wave():
-    """Closed form for the vertical exchange: one plane wave in a uniform wind.
+def _boussinesq_wave(damping, n=64, L=64e3, N=0.02, amp=1.0):
+    """Steady internal gravity wave in a uniform wind c, exact linear Boussinesq solution.
 
-    u = c + a cos(theta), w = a_w cos(theta + phi), dz u = -m a sin(theta) at z = 0 (theta =
-    k.x + m z). D_ell and C_ell average to zero, while the flux-form transfer moves energy
-    between the wave and the mean flow:
-        <D*_ell> = <V_ell> = 1/4 m a_w sin(phi) (a.c) [1 - G^(k)].
-    In the perturbation frame (c removed) it vanishes. C_ell is not zero pointwise: adding it
-    changes D*_ell everywhere but not its mean.
+    Rayleigh friction and Newtonian cooling at the rate `damping` give
+    m^2 = N^2 k^2 / (k.c - i r)^2 - k^2; the root with Im m >= 0 decays upwards. The horizontal
+    velocity is along k (no rotation) and w = -|k| u^ / m from continuity. Returns the fields at
+    z = 0 with exact derivatives, the wavevector and 1/2 c . dz<u'w>, the closed-form prefactor.
     """
-    n, L, H = 64, 64e3, 6e3
     d = L / n
     x = np.arange(n) * d
     X, Y = np.meshgrid(x, x, indexing="xy")
     kv = 2 * np.pi / L * np.array([2.0, 1.0])
-    m, a, c, a_w, phi = 2 * np.pi / H, np.array([1.0, -0.6]), np.array([5.0, 3.0]), 0.4, 1.1
-    th = kv[0] * X + kv[1] * Y
-    fields = {"u": c[0] + a[0] * np.cos(th), "v": c[1] + a[1] * np.cos(th),
-              "w": a_w * np.cos(th + phi), "dzu": -m * a[0] * np.sin(th),
-              "dzv": -m * a[1] * np.sin(th), "div": -(kv @ a) * np.sin(th)}
-    f = _planes(fields, x)
-    ds = xr.Dataset({k: f[k] for k in ("u", "v", "w")})
-    kw = dict(x_coord_boundary="periodic", y_coord_boundary="periodic", allow_rechunk=False,
-              increment_components=("u", "v"), divergence_correction=True,
-              vertical_advection=True, divergence=f["div"], dzu=f["dzu"], dzv=f["dzv"])
-    for factor in (6.0, 10.0):
-        ell = factor * d
-        exact = 0.25 * m * a_w * np.sin(phi) * (a @ c) * (1 - _lattice_filter_at(*kv, d, ell))
-        ground = inter_scale_kinetic_energy_transfer(ds, scales=np.array([ell]),
-                                                     **kw).isel(z=1, scale=0)
-        pert = inter_scale_kinetic_energy_transfer(ds, scales=np.array([ell]), perturbation=True,
-                                                   **kw).isel(z=1, scale=0)
-        no_c = inter_scale_kinetic_energy_transfer(ds, scales=np.array([ell]),
-                                                   **dict(kw, divergence_correction=False))
-        no_c = no_c.isel(z=1, scale=0)["energy_transfer_corrected"]
-        d_star = float(ground["energy_transfer_corrected"].mean())
-        d_plain = float(ground["energy_transfer"].mean())
-        d_pert = float(pert["energy_transfer_corrected"].mean())
-        c_max = float(np.abs(ground["energy_transfer_corrected"] - no_c).max())
-        print(f"  ell = {factor:.0f} dx: closed form {exact:.4e}, <D*> {d_star:.4e} "
-              f"(error {abs(d_star / exact - 1):.1e}); <D> {d_plain:.1e}, perturbation <D*> "
-              f"{d_pert:.1e}; max |C| {c_max:.1e}")
-        assert abs(d_star / exact - 1) < 1e-4, (factor, d_star, exact)
-        assert abs(d_plain) < 1e-4 * abs(exact) and abs(d_pert) < 1e-4 * abs(exact)
-        assert abs(float(no_c.mean()) / exact - 1) < 1e-4, float(no_c.mean())
-        assert c_max > 0.1 * abs(exact), c_max
+    kh = float(np.hypot(*kv))
+    khat = kv / kh
+    c = np.array([20.0, 5.0])
+    m = np.sqrt(N ** 2 * kh ** 2 / (kv @ c - 1j * damping) ** 2 - kh ** 2 + 0j)
+    if m.imag < 0 or (m.imag == 0 and m.real < 0):
+        m = -m
+    phase = np.exp(1j * (kv[0] * X + kv[1] * Y))
+    up = np.real(amp * phase)                       # wave velocity along k
+    dz_up = np.real(1j * m * amp * phase)           # exact dz, including the decay
+    fields = {"u": c[0] + khat[0] * up, "v": c[1] + khat[1] * up,
+              "w": np.real(-kh * amp / m * phase), "dzu": khat[0] * dz_up,
+              "dzv": khat[1] * dz_up, "div": np.real(1j * kh * amp * phase)}
+    dz_stress = m.imag * kh * amp ** 2 * m.real / abs(m) ** 2      # dz<u'w> along k at z = 0
+    return fields, x, d, kv, 0.5 * float(c @ khat) * dz_stress
+
+
+def test_corrected_transfer_closed_form_boussinesq_wave():
+    """Closed form for the vertical exchange: a steady Boussinesq gravity wave in a uniform wind.
+
+    One horizontal wavenumber, so <D_ell> = <C_ell> = 0, while the flux-form transfer exchanges
+    energy between the wave and the mean wind c:
+        <D*_ell> = <V_ell> = 1/2 [1 - G^(k)] c . <w dz u'> = 1/2 [1 - G^(k)] c . dz<u'w>
+    (Boussinesq continuity). A conservative wave has a constant stress (Eliassen and Palm 1961)
+    and <D*> = 0, although C_ell and V_ell are not zero pointwise; a damped wave decays with
+    height, its stress converges, and the mean wind loses energy to it (<D*> > 0). In the
+    perturbation frame both vanish.
+    """
+    damping = 0.2 * abs(np.array([2.0, 1.0]) @ np.array([20.0, 5.0])) * 2 * np.pi / 64e3
+    for label, r in (("conservative", 0.0), ("damped", damping)):
+        fields, x, d, kv, unit = _boussinesq_wave(r)
+        f = _planes(fields, x)
+        ds = xr.Dataset({k: f[k] for k in ("u", "v", "w")})
+        kw = dict(x_coord_boundary="periodic", y_coord_boundary="periodic", allow_rechunk=False,
+                  increment_components=("u", "v"), divergence_correction=True,
+                  vertical_advection=True, divergence=f["div"], dzu=f["dzu"], dzv=f["dzv"])
+        w_dzu = float((f["w"] * (f["dzu"] * kv[0] + f["dzv"] * kv[1])).isel(z=1).mean())
+        assert abs(w_dzu) < 1e-12 if r == 0 else w_dzu > 0              # <w dz u'> along k
+        for factor in (6.0, 10.0):
+            ell = factor * d
+            exact = unit * (1 - _lattice_filter_at(*kv, d, ell))
+            ground = inter_scale_kinetic_energy_transfer(ds, scales=np.array([ell]),
+                                                         **kw).isel(z=1, scale=0)
+            pert = inter_scale_kinetic_energy_transfer(ds, scales=np.array([ell]),
+                                                       perturbation=True, **kw).isel(z=1, scale=0)
+            d_star = float(ground["energy_transfer_corrected"].mean())
+            d_plain = float(ground["energy_transfer"].mean())
+            d_pert = float(pert["energy_transfer_corrected"].mean())
+            corr_max = float(np.abs(ground["energy_transfer_corrected"]
+                                    - ground["energy_transfer"]).max())
+            scale = abs(exact) if r else corr_max
+            print(f"  {label:12s} ell = {factor:.0f} dx: closed form {exact: .4e}, <D*> {d_star: .4e};"
+                  f" <D> {d_plain: .1e}, perturbation <D*> {d_pert: .1e}, max |V - C| {corr_max:.1e}")
+            assert abs(d_star - exact) < 1e-4 * scale, (label, factor, d_star, exact)
+            assert abs(d_plain) < 1e-6 * scale and abs(d_pert) < 1e-6 * scale
+            assert corr_max > 0.1 * scale                    # the corrections are not zero pointwise
+        if r:
+            assert exact > 0                                 # mean wind loses energy to the wave
 
 
 def test_correction_divergence_source():
@@ -1394,7 +1417,7 @@ if __name__ == "__main__":
              test_corrected_transfer_equals_kernel_weighted_spectral_transfer,
              test_perturbation_frame,
              test_corrected_transfer_closed_form_triad,
-             test_corrected_transfer_closed_form_plane_wave,
+             test_corrected_transfer_closed_form_boussinesq_wave,
              test_correction_divergence_source, test_correction_error_paths,
              test_correction_geographic_grid,
              test_correction_independent_of_chunking,

@@ -192,10 +192,13 @@ $10^{-5}$ ($8\,\Delta x$) and $2\times10^{-6}$ ($12\,\Delta x$), where $\mathcal
 gives 0–12% of it. Two closed forms: a divergent triad $u = c + A\cos kx + B\cos(2kx+\beta)$, for
 which $\langle\mathcal{T}_\ell - C_\ell\rangle = \tfrac38 kA^2B\sin\beta\,[\hat G(2k)-\hat G(k)]$
 (reproduced to $8\times10^{-4}$ at $8\,\Delta x$ and $1.4\times10^{-6}$ at $16\,\Delta x$, the
-error being the quadrature of $\nabla G$), and a single plane wave in a uniform wind $\mathbf{c}$, for which
-$\langle\mathcal{T}_\ell\rangle = \langle C_\ell\rangle = 0$ but
-$\langle\mathcal{T}^*_\ell\rangle = \tfrac14 m a_w\sin\phi\,(\mathbf{a}\cdot\mathbf{c})[1-\hat G(k)]$,
-zero in the perturbation frame (reproduced to $10^{-5}$). The command-line run (YAML and flags,
+error being the quadrature of $\nabla G$), and a steady Boussinesq gravity wave in a uniform wind
+$\mathbf{c}$ (exact linear solution, conservative or damped by Rayleigh friction and Newtonian
+cooling), for which $\langle\mathcal{T}_\ell\rangle = \langle C_\ell\rangle = 0$ but
+$\langle\mathcal{T}^*_\ell\rangle = \tfrac12[1-\hat G(k)]\,\mathbf{c}\cdot\partial_z\langle\mathbf{u}'w\rangle$:
+zero for the conservative wave (constant stress, Eliassen and Palm 1961) although
+$C_\ell$ and $V_\ell$ are not zero pointwise, positive for the damped wave (the mean wind loses
+energy to it), and zero in the perturbation frame (reproduced to $10^{-5}$). The command-line run (YAML and flags,
 stretched vertical grid, level selection, perturbation frame) equals the direct computation on the
 full column exactly; results do not depend on the dask chunking; invalid requests fail before
 any computation. Cost: up to $2n+4$ extra inverse FFTs per plane and scale.
