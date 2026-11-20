@@ -194,11 +194,15 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
     weights: {xarray.DataArray, None}
         Weight data before detrending and apply normalization
 
-    detrend_type : {'constant', 'linear'}
+    detrend_type : {'constant', 'linear', 'errico'}
         If ``constant``, a constant offset will be removed from each dim.
         If ``linear``, a linear least-squares fit will be estimated and removed
         from the data. Along a periodic coordinate (see numeric_tools.mark_periodic) a linear
         trend is not part of the field and is not fitted.
+        If ``errico``, along each non-periodic axis the linear trend joining the two end values
+        is removed (Errico 1985, MWR 113, 1554-1562): the field then matches across the
+        boundary of the periodic extension, without a jump, and the trend is centred so the
+        domain mean is unchanged.
 
     Returns
     -------
@@ -209,7 +213,7 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
     -----
     This function will act lazily in the presence of dask arrays on the input.
     """
-    detrend_types = ["constant", "linear", None]
+    detrend_types = ["constant", "linear", "errico", None]
     if detrend_type not in detrend_types:
         raise NotImplementedError(f"Unknown  '{detrend_type}'. Expecting one of {detrend_types}")
 
@@ -227,6 +231,9 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
         da_shape = tuple(da.sizes[dim] for dim in dims)
         weights = xr.DataArray(np.ones(da_shape), dims=dims,
                                coords={dim: da.coords[dim] for dim in dims})
+
+    if detrend_type == "errico":
+        return _errico_detrend(da, dims)
 
     # Calculate the fit (constant or plane)
     fit_to_remove = 0
@@ -255,6 +262,20 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
     return da - fit_to_remove
 
 
+def _errico_detrend(da: xr.DataArray, dims) -> xr.DataArray:
+    """Remove, along each non-periodic axis in ``dims``, the centred linear trend joining the end
+    values: f(j) - (f[N-1] - f[0]) (j - (N - 1)/2) / (N - 1), so that f[0] = f[N-1] after it."""
+    out = da
+    for dim in dims:
+        n = da.sizes[dim]
+        if is_periodic(da[dim]) or n < 2:
+            continue
+        ramp = xr.DataArray((np.arange(n) - 0.5 * (n - 1)) / (n - 1), dims=dim)
+        jump = out.isel({dim: -1}, drop=True) - out.isel({dim: 0}, drop=True)
+        out = out - jump * ramp
+    return out
+
+
 def _apply_weighting(field: xr.DataArray) -> tuple[xr.DataArray, float, xr.DataArray]:
     """Apply taper and sqrt(area) weighting, detrend, and return weighted field, taper ms, and (mean)^2."""
 
@@ -276,7 +297,7 @@ def _apply_weighting(field: xr.DataArray) -> tuple[xr.DataArray, float, xr.DataA
     # -- Mean to restore at DC: only what the detrending removed (without detrending the mean is
     # still in the field, and restoring it would count the k = 0 product twice) --
     mu_restore = domain_mean(field)
-    if detrend_type is None:
+    if detrend_type not in ("constant", "linear"):          # None, errico: mean left in place
         mu_restore = xr.zeros_like(mu_restore)
 
     # -- Apply the final total window (f_w = f' * W_total) --

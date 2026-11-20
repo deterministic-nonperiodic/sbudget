@@ -277,6 +277,33 @@ def test_spatial_dims_from_units_and_axes():
     print("  metric x/y, degree x/y, lat/lon, axis-only: dimensions resolved")
 
 
+def test_errico_detrend():
+    """Errico detrending removes the end-to-end jump along non-periodic axes only, keeps the mean,
+    leaves periodic content alone, and the cross spectrum still sums to <a' b'> + 0."""
+    n, L = 32, 320e3
+    x = np.arange(n) * L / n
+    Y, X = np.meshgrid(x, x, indexing="ij")
+    periodic = np.cos(2 * np.pi * X / L) * np.sin(4 * np.pi * Y / L)
+    da = xr.DataArray(periodic + 3e-5 * Y + 1e-5 * X + 7.0, dims=("y", "x"),
+                      coords={"y": x, "x": x})
+    (da,) = _periodic(da, dims=("x",))                       # x periodic: only y is detrended
+    out = sp.detrend(da, detrend_type="errico")
+    assert np.allclose(out.isel(y=0), out.isel(y=-1))                     # no jump in y
+    assert not np.allclose(out.isel(x=0), out.isel(x=-1))                 # x left alone
+    assert np.isclose(float(out.mean()), float(da.mean()))                # mean kept
+    # a purely periodic field in y (sampled without the end point) keeps a small jump term only
+    resid = out - (periodic + 1e-5 * X + 7.0)
+    assert float(np.abs(resid - resid.mean("y")).max()) < 0.2
+    saved = (sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
+    try:
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = False, "errico"
+        got = float(sp.scalar_cross_spectrum(da, 2 * da).sum(("ky", "kx")))
+        assert np.isclose(got, float((out * 2 * out).mean()), rtol=1e-12)
+    finally:
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = saved
+    print("  jump in y removed, x and the mean unchanged, Parseval holds")
+
+
 def test_cross_spectrum_parseval_with_mean_and_no_detrend():
     """Sum over all modes of the cross spectrum equals the domain mean of the product, with a
     non-zero mean and detrending off (the mean was once restored at k = 0 a second time)."""
@@ -1795,7 +1822,8 @@ if __name__ == "__main__":
              test_compute_budget_conservative_periodic_axes,
              test_cross_spectrum_parseval_with_mean_and_no_detrend,
              test_compute_cli_conservative_periodic,
-             test_spatial_dims_from_units_and_axes]
+             test_spatial_dims_from_units_and_axes,
+             test_errico_detrend]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")
