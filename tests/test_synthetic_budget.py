@@ -735,6 +735,45 @@ def test_spectrum_parseval_and_cumulative_convention():
         assert np.allclose(cum.isel(wavenumber=0), e1d.sum("wavenumber"))
 
 
+def test_isotropize_conserves_variance_on_any_grid():
+    """Summed over all bins (DC and the corners beyond the Nyquist circle included), the
+    isotropic spectrum equals the 2-D sum, i.e. the domain mean: on even and odd grids, square
+    and not. The last bin edge used to sit below the resolution of the largest |k|, which dropped
+    the corner mode (and, with the Nyquist cut-off, the Nyquist column): 1e-6 of white noise, but
+    several % of a transfer on interpolated model output, whose 2-dx checkerboard sits there."""
+    rng = np.random.default_rng(0)
+    dx = 600.0
+    with _NoTaper():
+        for ny, nx in ((40, 40), (41, 40), (40, 41), (41, 41), (301, 751), (300, 751), (301, 750)):
+            co = {"y": np.arange(ny) * dx, "x": np.arange(nx) * dx}
+            a = xr.DataArray(rng.normal(size=(ny, nx)) + 3.0, dims=("y", "x"), coords=co)
+            checker = xr.DataArray(np.outer((-1.0) ** np.arange(ny), (-1.0) ** np.arange(nx)),
+                                   dims=("y", "x"), coords=co)
+            for f in (a, a + 5.0 * checker):
+                s2d = sp.scalar_spectrum(f)
+                total = float(isotropize(s2d, dx, dx, nyquist=False, include_dc=True).sum())
+                expect = float((f ** 2).mean())
+                assert abs(total / expect - 1) < 1e-12, (ny, nx, total / expect - 1)
+        print("  variance conserved to 1e-12 on 40/41 x 40/41 and 300/301 x 750/751 grids")
+
+
+def test_isotropize_odd_grid_wavenumbers():
+    """On an odd grid the rFFT length nx // 2 + 1 equals that of nx - 1; the spectra carry the
+    physical nx, so a pure mode lands in its own bin: on a 7 x 7 grid, cos(2 pi 2 x / L) has
+    |k| = 2 * 2 pi / L (reading nx as 6 put it at 2.33 x 2 pi / L)."""
+    n, dx = 7, 1000.0
+    x = np.arange(n) * dx
+    L = n * dx
+    f = xr.DataArray(np.cos(2 * np.pi * 2 * x / L)[None, :].repeat(n, 0), dims=("y", "x"),
+                     coords={"y": x, "x": x})
+    with _NoTaper():
+        e = isotropize(sp.scalar_spectrum(f), dx, dx, nyquist=False, include_dc=True)
+    peak = float(e.wavenumber[int(e.argmax())])
+    print(f"  pure mode at 2 x 2 pi / L: peak bin at {peak * L / (2 * np.pi):.3f} x 2 pi / L")
+    assert abs(peak * L / (2 * np.pi) - 2.0) < 1e-9
+    assert "nx_grid" not in e.coords
+
+
 # ------------------------------------------------------------------------------------------------
 # Density-weighted closure of the advective and pressure terms (reference profiles rho(z), theta(z))
 # ------------------------------------------------------------------------------------------------
@@ -1938,6 +1977,8 @@ if __name__ == "__main__":
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
              test_cartesian_grid_is_not_global,
              test_periodic_derivative_float32_coordinates,
+             test_isotropize_conserves_variance_on_any_grid,
+             test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,
              test_conservative_and_flux_forms_converge,
              test_periodic_axes_skip_taper_and_linear_detrend,

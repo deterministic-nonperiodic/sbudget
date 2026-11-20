@@ -462,7 +462,8 @@ def scalar_spectrum(field: xr.DataArray) -> xr.DataArray:
         # Add the mean
         power = power + mean_product.where(kdc_mask, other=0.0)
 
-    return power
+    # the rFFT length nx // 2 + 1 does not tell an odd nx from the even nx - 1: keep it
+    return power.assign_coords(nx_grid=nx)
 
 
 def scalar_cross_spectrum(field1: xr.DataArray, field2: xr.DataArray) -> xr.DataArray:
@@ -522,7 +523,8 @@ def scalar_cross_spectrum(field1: xr.DataArray, field2: xr.DataArray) -> xr.Data
         # Add the mean
         power = power + mean_product.where(kdc_mask, other=0.0)
 
-    return power
+    # the rFFT length nx // 2 + 1 does not tell an odd nx from the even nx - 1: keep it
+    return power.assign_coords(nx_grid=nx)
 
 
 def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray) -> xr.DataArray:
@@ -537,7 +539,8 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray) -> xr.DataArra
     return u_term + v_term
 
 
-def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True, include_dc=False):
+def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True, include_dc=False,
+               nx: int | None = None):
     """
     Precompute bin index. Non-overlapping, variance-conserving radial bins.
 
@@ -553,6 +556,9 @@ def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True, include
         Physical spacing along y (meters)
     nyquist : bool
         Whether to explicitly cut off at the Nyquist wavenumber.
+    nx : int, optional
+        Physical size along x. nx_fft = nx // 2 + 1 holds for nx and nx + 1 alike (odd nx); without
+        it, nx = 2 (nx_fft - 1) is assumed, which shifts every kx of an odd grid by nx / (nx - 1).
     Returns
     -------
     centers : (n_bins,) float64
@@ -566,8 +572,11 @@ def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True, include
       - Δ = 2π / min(dx*Nx_full, dy*ny)  (legacy center spacing)
       - centers at nΔ (drop inner < Δ/2 ring), identical to legacy layout
     """
-    # reconstruct physical Nx from rFFT spectral size
-    nx = 2 * (nx_fft - 1)
+    # physical Nx: given, or reconstructed from the rFFT size (exact for even Nx only)
+    if nx is None:
+        nx = 2 * (nx_fft - 1)
+    elif nx // 2 + 1 != nx_fft:
+        raise ValueError(f"nx = {nx} does not match the rFFT size {nx_fft}")
 
     kh_grid = horizontal_wavenumber_magnitude(nx, ny, dx, dy)
 
@@ -585,13 +594,23 @@ def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True, include
 
     # bin edges and centers
     edges = start + np.arange(0, n_bins, dtype=np.float64) * delta
-    edges = np.concatenate([edges, [max(k_cut + epsilon * delta, start + n_bins * delta)]])
+    # last edge just above k_cut: modes exactly at k_cut (the Nyquist column, or the corner mode
+    # with nyquist=False) belong to the last bin. epsilon * delta alone is below the resolution of
+    # k_cut, which dropped them.
+    last = max(k_cut, start + n_bins * delta)
+    edges = np.concatenate([edges, [last * (1.0 + 1e-9)]])
 
     centers = 0.5 * (edges[:-1] + edges[1:])
     centers = delta * np.rint(centers / delta)
 
+    # On a non-square domain, Δ follows the shorter side, so the first modes along the longer side
+    # have 0 < |k| < Δ/2: they belong to the first bin (dropping them lost their variance). The DC
+    # pixel stays out unless include_dc.
+    edges[0] = 0.0
+
     # 2-D bin index array
     bin_idx2d = np.digitize(kh_grid, edges, right=False) - 1
+    bin_idx2d[ny // 2, 0] = -1
 
     if include_dc:
         # Insert DC bin at index 0 for the single pixel (ky0, kx0)
@@ -661,9 +680,13 @@ def isotropize(spectrum: xr.DataArray, dx: float, dy: float,
 
     # Get kappa bins and 2D bin index array
     nky, nkx = int(spectrum.sizes["ky"]), int(spectrum.sizes["kx"])
+    # physical length along x, carried by the 2-D spectra (scalar_spectrum, scalar_cross_spectrum)
+    nx_grid = int(spectrum["nx_grid"]) if "nx_grid" in spectrum.coords else None
+    spectrum = spectrum.drop_vars("nx_grid", errors="ignore")
 
     # bins & index
-    wavenumber, idx2d = _prep_bins(nkx, nky, dx, dy, nyquist=nyquist, include_dc=include_dc)
+    wavenumber, idx2d = _prep_bins(nkx, nky, dx, dy, nyquist=nyquist, include_dc=include_dc,
+                                   nx=nx_grid)
     idx2d = xr.DataArray(idx2d, dims=("ky", "kx"))
 
     # Apply binning of 2D to 1D spectrum
