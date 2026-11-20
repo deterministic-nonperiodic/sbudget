@@ -128,8 +128,8 @@ and $\Pi(k_{min})$ is the part of it that reaches $k > 0$.
 ### Inter-scale transfer mode (```--mode scale_transfer```)
 
 This mode computes local scale-to-scale transfers at specified wavelengths based on third-order
-structure functions. This code is largely based on [LoSSETT](https://github.com/ElliotMG/LoSSETT)
-. The energy transfer from scales larger than $\ell$ to scales smaller than $\ell$ is derived in
+structure functions. The energy transfer from scales larger than $\ell$ to scales smaller than
+$\ell$ is derived in
 [Duchon & Robert (2000)](https://iopscience.iop.org/article/10.1088/0951-7715/13/1/312) as:
 
 $$\mathcal{T}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta \mathbf{u}
@@ -137,7 +137,13 @@ $$\mathcal{T}_{\ell} := \frac{1}{4} \int \nabla G _\ell(\mathbf{r}) \cdot \delta
 
 where, $\delta\mathbf{u}:=\mathbf{u}(x + r)-\mathbf{u}(x)$ is a velocity increment,
 and $G_{\ell}(r)$
-is a filter kernel with characteristic length scale $\ell$. See refences for more details.
+is a filter kernel with characteristic length scale $\ell$. See references for more details.
+
+The first implementation followed [LoSSETT](https://github.com/ElliotMG/LoSSETT), which evaluates
+the integral as an explicit loop over shifts. sbudget now evaluates the same lattice sum by FFT
+correlation: the result is unchanged, but the cost is no longer proportional to the number of
+shifts (10-23 times faster on the grids measured below), which makes large domains and many
+scales affordable.
 
 #### How $\mathcal{T}_\ell$ is computed: exact lattice sum by FFT correlation
 
