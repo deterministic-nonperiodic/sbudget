@@ -1,6 +1,6 @@
 import argparse
+import asyncio
 import os
-import re
 import resource
 import time
 import warnings
@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import dask
-import asyncio
 import psutil
 from dask.distributed import Client, LocalCluster, get_client
 
@@ -31,7 +30,6 @@ _MIN_WORKER_MEM_GB = 4.0  # Minimum memory per worker in GiB
 _DEFAULT_THREADS_PER_WORKER = 4  # distributed mode without SLURM/explicit settings
 _MIN_THREAD_MEM_GB = 0.5  # threads mode: memory floor per thread
 _WORKSTATION_MEMORY_FRACTION = 0.85  # share of currently available memory used without SLURM
-
 
 
 # --- Helper function definitions (omitted for brevity) ---
@@ -63,7 +61,7 @@ def _detect_resources(cfg: Optional[Any] = None) -> Dict[str, Union[int, float, 
             get_client()
         except ValueError:
             n_workers = psutil.cpu_count(logical=False) or n_workers
-    
+
     # Determine threads per worker
     if "SLURM_CPUS_PER_TASK" in os.environ:
         n_threads = int(os.environ["SLURM_CPUS_PER_TASK"])
@@ -100,15 +98,15 @@ def auto_configure_dask(cfg: Optional[Any] = None) -> Tuple[int, int]:
     # Only override Dask's default chunk size (usually 128MiB) if explicitly requested.
     # The previous heuristic (512MB/2048MB) was often too aggressive for 'auto' chunking.
     chunk_mb = getattr(cfg.compute, "chunk_size", None)
-    
+
     dask_config = {
         "array.slicing.split_large_chunks": False,
 
         # Worker spilling ENABLED for stability
         "distributed.worker.memory.target": 0.65,  # Start garbage collection
-        "distributed.worker.memory.spill": 0.85,   # Spilling to disk
-        "distributed.worker.memory.pause": 0.95,   # Pause worker
-        "distributed.worker.memory.terminate": 0.98, # Kill worker
+        "distributed.worker.memory.spill": 0.85,  # Spilling to disk
+        "distributed.worker.memory.pause": 0.95,  # Pause worker
+        "distributed.worker.memory.terminate": 0.98,  # Kill worker
 
         # DAG fusion optimizations
         "optimization.fuse.ave-width": 24,
@@ -152,7 +150,7 @@ def init_dask_client(cfg: Any, scheduler_address: Optional[str] = None) -> Clien
     # Get initial SLURM/Local core count and total memory pool
     # Note: auto_configure_dask now handles config overrides via cfg
     num_workers_detected, threads_per_worker_detected = auto_configure_dask(cfg)
-    
+
     # Set threading environment variables to avoid oversubscription
     # This is critical when using numpy/scipy with Dask
     for env_var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"]:
@@ -277,7 +275,7 @@ def _cmd_compute(args) -> None:
 
             # Extract kwargs for scale_increments and scale_transfer
             kwargs = {
-                "scales": getattr(cfg.compute, "scales", None), 
+                "scales": getattr(cfg.compute, "scales", None),
                 "verbose": True,
                 "p": getattr(cfg.compute, "shape_parameter", 1),
                 "divergence_correction": bool(getattr(cfg.compute, "divergence_correction",
@@ -313,7 +311,7 @@ def _cmd_compute(args) -> None:
             try:
                 cluster = getattr(client, 'cluster', None)
                 client.close()
-                
+
                 if cluster:
                     cluster.close()
             except (asyncio.CancelledError, Exception):
@@ -385,7 +383,7 @@ def main(argv: list[str] | None = None) -> None:
     p_compute.add_argument("--dy", type=float, help="Grid spacing in y-direction (meters).")
     p_compute.add_argument("--transfer-form", choices=["invariant", "flux", "conservative"],
                            help="Formulation of transfer term to compute.")
-                           
+
     p_compute.add_argument("--shape-parameter", type=float,
                            help="Shape parameter p for the mollifier filter. Default is 1.")
 
@@ -400,12 +398,12 @@ def main(argv: list[str] | None = None) -> None:
         choices=["threads", "distributed"],
         help="Execution backend for Dask computations."
     )
-    
+
     p_compute.add_argument(
         "--n-workers", type=int,
         help="Number of Dask workers (overrides auto-detection)."
     )
-    
+
     p_compute.add_argument(
         "--threads-per-worker", type=int,
         help="Number of threads per Dask worker (overrides auto-detection)."

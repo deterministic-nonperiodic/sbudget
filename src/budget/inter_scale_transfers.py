@@ -73,25 +73,24 @@ def _evaluate_mollifier_derivative(radial_positions: np.ndarray,
 
 def _compute_half_power_cutoff(p_val: float) -> float:
     """Dynamically compute the normalized half-power cutoff wavenumber (kc * ell)."""
-    import scipy.integrate as integrate
     from scipy.special import j0
     from scipy.optimize import root_scalar
 
     # Use normalized ell=1 for calculation
     r = np.linspace(0, 2.0, 5000)
-    
+
     # Get spatial kernel using the production function
     G = _evaluate_mollifier(r, np.array([1.0]), p=p_val)[0, :]
-    
+
     # Normalize
     norm = np.trapz(G * 2 * np.pi * r, r)
     G /= norm
-    
+
     # Function to find root of: |G_hat(k)|^2 - 0.5 = 0
     def power_diff(k):
         integrand = G * j0(k * r) * 2 * np.pi * r
-        return np.trapz(integrand, r)**2 - 0.5
-        
+        return np.trapz(integrand, r) ** 2 - 0.5
+
     res = root_scalar(power_diff, bracket=[0.1, 5.0], method='brentq')
     return float(res.root)
 
@@ -114,11 +113,11 @@ def lattice_kernel_weights(r: xr.DataArray, bin_area: xr.DataArray, scales: xr.D
     ell = np.asarray(scales.values, dtype=float)
     area = np.asarray(bin_area.values, dtype=float)
 
-    g = _evaluate_mollifier(r_vals, ell, p=p)                  # (scale, r)
+    g = _evaluate_mollifier(r_vals, ell, p=p)  # (scale, r)
     g0 = _evaluate_mollifier(np.array([0.0]), ell, p=p)[:, 0]  # (scale,)
-    dg = _evaluate_mollifier_derivative(r_vals, ell, p=p)      # (scale, r)
+    dg = _evaluate_mollifier_derivative(r_vals, ell, p=p)  # (scale, r)
 
-    norm = g0 * cell_area + g @ area                           # Σ G ΔA over the lattice
+    norm = g0 * cell_area + g @ area  # Σ G ΔA over the lattice
     weights = 0.25 * dg / np.clip(norm, epsilon, None)[:, None]
 
     s_name = scales.name or "scale"
@@ -704,10 +703,10 @@ def _dell_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, 
             kx, ky, sum_kx, sum_ky = _kernel_spectra(lattice, (my, mx), ell, p)
             kh = {"u": kx, "v": ky}
 
-            specs = [f_us2["u"] * kx + f_us2["v"] * ky]                         # T1
+            specs = [f_us2["u"] * kx + f_us2["v"] * ky]  # T1
             specs += [f_uu[("u", j)] * kx + f_uu[("v", j)] * ky for j in names]  # T2_j
-            specs += [f_s2 * kh[i] for i in hor]                                 # T4_i
-            specs += [f_u[j] * kh[i] for i in hor for j in names]                # T5_ij
+            specs += [f_s2 * kh[i] for i in hor]  # T4_i
+            specs += [f_u[j] * kh[i] for i in hor for j in names]  # T5_ij
             fields = sfft.irfft2(np.stack(specs), s=(my, mx), axes=(-2, -1),
                                  workers=1)[(slice(None),) + inner]
 
@@ -1389,7 +1388,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # ----------------------------------------------------------------------------
     p_val = float(kwargs.get("p", 1.0))
     kc_ell = _compute_half_power_cutoff(p_val)
-    
+
     lambda_factor = 2 * np.pi / kc_ell
 
     equivalent_wavelength = lambda_factor * length_scale
@@ -1433,7 +1432,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         ).assign_coords(**coord_dict)
 
         terms = (["- C_ell (dilatational exchange)"] if divergence_correction else []) \
-            + (["+ V_ell (vertical exchange)"] if vertical_advection else [])
+                + (["+ V_ell (vertical exchange)"] if vertical_advection else [])
         corrected_rate = energy_transfer_rate["energy_transfer"] + correction
         corrected_rate.attrs.update({
             'units': "W / kg",

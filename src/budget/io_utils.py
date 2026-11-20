@@ -47,7 +47,8 @@ def ensure_vertical_consistent(ds: xr.Dataset | xr.DataArray, target_name="z",
                     z_half = convert_units(z_half, "km", "m")
                 w_half = (ds["w"].rename({z_dim: "z_half"})
                           .assign_coords(z_half=("z_half", np.asarray(z_half.values, dtype=float))))
-                print(f"Keeping native half-level w ({z_dim} -> z_half, {w_half.sizes['z_half']} levels)")
+                print(
+                    f"Keeping native half-level w ({z_dim} -> z_half, {w_half.sizes['z_half']} levels)")
                 break
 
     for z_dim in z_candidate:
@@ -329,7 +330,7 @@ def zarr_safe_chunks(ds: xr.Dataset) -> xr.Dataset:
         print(f"[I/O] Rechunked {len(fixes)} variable(s) to uniform chunks for zarr: "
               f"{', '.join(sorted(fixes))}")
         ds = ds.assign(fixes)
-    for name in ds.data_vars:            # stale encodings would re-impose the old chunks
+    for name in ds.data_vars:  # stale encodings would re-impose the old chunks
         ds[name].encoding.pop("chunks", None)
         ds[name].encoding.pop("preferred_chunks", None)
     return ds

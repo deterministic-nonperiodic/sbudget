@@ -12,9 +12,9 @@ from .numeric_tools import horizontal_divergence, relative_vorticity
 from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize
 from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
 from .thermodynamics import hydrostatic_exner_function
+from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
 from .vertical import (is_lorenz_staggered, interp_full_to_half, diff_full_to_half,
                        half_to_full_mean, diff_half_to_full)
-from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
 
 # --------------------------------------------------------------------------------------------------
 # Global spectral options
@@ -780,7 +780,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     if w_half is not None and not staggered:
         print("[budget] w_half present but not Lorenz-staggered with z: using collocated w")
     dzw = diff_half_to_full(w_half, u["z"]) if staggered else None
-    print(f"[budget] Vertical discretization: {'Lorenz-staggered (native half-level w)' if staggered else 'collocated (centred differences)'}")
+    print(
+        f"[budget] Vertical discretization: {'Lorenz-staggered (native half-level w)' if staggered else 'collocated (centred differences)'}")
 
     # ----------------------------------------------------------------------------------------------
     # Spectral energy budget terms
