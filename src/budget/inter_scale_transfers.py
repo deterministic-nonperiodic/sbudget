@@ -1144,7 +1144,7 @@ def transfer_correction(
     (the VKE transfer of the spectral budget has the same flux form, with w advected). In D_ℓ
     the filter and r̂ are horizontal, so w enters through |δu|² only. Derivation, tests and
     validation:
-    docs/corrected_transfer.md.
+    docs/generalized_transfer.md.
 
     Parameters
     ----------
@@ -1253,14 +1253,14 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         Dataset containing 3D velocity components (u, v, w).
     **kwargs
         Additional keyword arguments passed to scale_increments and scale_transfer functions.
-        For the corrected transfer D*_ℓ (see transfer_correction): divergence_correction,
+        For the generalized transfer D*_ℓ (see transfer_correction): divergence_correction,
         vertical_advection, perturbation (bool), increment_components (default: u, v),
         and optionally the fields divergence and dzu, dzv (dzw).
     Returns
     -------
     xr.Dataset
         Dataset containing the specific kinetic energy transfer rate across scales, and
-        energy_transfer_corrected if a correction is requested.
+        energy_transfer_generalized if a correction is requested.
     """
 
     # Validate input dataset: components advected in D_ℓ (in the increments). The default (u, v)
@@ -1275,7 +1275,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Optional correction D*_ℓ = D_ℓ - C_ℓ + V_ℓ (see transfer_correction)
     divergence_correction = bool(kwargs.get("divergence_correction", False))
     vertical_advection = bool(kwargs.get("vertical_advection", False))
-    corrected = divergence_correction or vertical_advection
+    generalized = divergence_correction or vertical_advection
 
     # Perturbation frame: remove the level-mean horizontal wind (D_ℓ is unchanged; C_ℓ, V_ℓ and
     # the flux-form spectral transfer are not Galilean invariant). Given dzu, dzv must then be
@@ -1286,7 +1286,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
                            v=wind["v"] - wind["v"].mean((y_d, x_d)))
 
     correction_fields = _correction_inputs(wind, velocity_vars, divergence_correction,
-                                           vertical_advection, kwargs) if corrected else {}
+                                           vertical_advection, kwargs) if generalized else {}
 
     # Ensure velocity components are float32 for memory efficiency
     wind = wind[velocity_vars].astype({v: "float32" for v in velocity_vars})
@@ -1317,7 +1317,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     length_scale = increments['scale']
 
     # The correction is evaluated by FFT only: fail before building the graph
-    if corrected:
+    if generalized:
         _correction_pad_modes(increments.attrs.get("x_boundary_type", "periodic"),
                               increments.attrs.get("y_boundary_type", "reflect"))
 
@@ -1447,7 +1447,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Physical-space counterpart of the flux-form spectral transfer (optional):
     #     D*_ℓ = D_ℓ - C_ℓ + V_ℓ    (see transfer_correction)
     # ----------------------------------------------------------------------------
-    if corrected:
+    if generalized:
         correction = transfer_correction(
             field=wind.fillna(0.0),
             increments=increments_data,
@@ -1462,16 +1462,16 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
 
         terms = (["- C_ell (dilatational exchange)"] if divergence_correction else []) \
                 + (["+ V_ell (vertical exchange)"] if vertical_advection else [])
-        corrected_rate = energy_transfer_rate["energy_transfer"] + correction
-        corrected_rate.attrs.update({
+        generalized_rate = energy_transfer_rate["energy_transfer"] + correction
+        generalized_rate.attrs.update({
             'units': "W / kg",
-            'long_name': "Corrected transfer rate of kinetic energy across scales",
+            'long_name': "Generalized transfer rate of kinetic energy across scales",
             'description': f"D_ell {' '.join(terms)}, increments of {', '.join(velocity_vars)}: "
                            "counterpart of the flux-form spectral transfer (its domain mean is "
                            "the kernel-weighted spectral transfer). Positive means forward "
                            "energy transfer towards smaller scales"
         })
-        energy_transfer_rate["energy_transfer_corrected"] = corrected_rate
+        energy_transfer_rate["energy_transfer_generalized"] = generalized_rate
 
     # Transpose to have 'scale' as the last dimension
     energy_transfer_rate = energy_transfer_rate.transpose(..., "scale")

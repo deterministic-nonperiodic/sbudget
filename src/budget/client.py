@@ -418,12 +418,12 @@ def main(argv: list[str] | None = None) -> None:
 
     _add_bool_pair(p_compute, "divergence-correction", "divergence_correction",
                    "scale_transfer: subtract the dilatational exchange C_ell of horizontally "
-                   "divergent flow (output energy_transfer_corrected).",
+                   "divergent flow (output energy_transfer_generalized).",
                    "scale_transfer: no divergence correction (default).")
 
     _add_bool_pair(p_compute, "vertical-advection", "vertical_advection",
                    "scale_transfer: add the vertical exchange V_ell of vertical advection "
-                   "(output energy_transfer_corrected; needs w).",
+                   "(output energy_transfer_generalized; needs w).",
                    "scale_transfer: no vertical-advection term (default).")
 
     _add_bool_pair(p_compute, "perturbation", "perturbation",

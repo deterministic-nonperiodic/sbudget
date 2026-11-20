@@ -27,7 +27,7 @@ class ComputeConfig:
     dy: float | None = None
     transfer_form: str | None = "flux"  # one of ["invariant", "flux"]
     shape_parameter: float = 1.0  # Shape parameter p for the mollifier filter
-    # scale_transfer: corrected transfer D*_ell = D_ell - C_ell + V_ell, the counterpart of the
+    # scale_transfer: generalized transfer D*_ell = D_ell - C_ell + V_ell, the counterpart of the
     # flux-form spectral transfer (see inter_scale_transfers.transfer_correction)
     divergence_correction: bool = False  # subtract the dilatational exchange C_ell
     vertical_advection: bool = False  # add the vertical exchange V_ell (needs w)

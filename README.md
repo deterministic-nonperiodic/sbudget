@@ -129,7 +129,7 @@ better than $10^{-5}$) for periodic, reflect, mixed and edge/symmetric boundarie
 
 $\mathcal{T}_\ell$ assumes non-divergent flow advected horizontally. To compare it scale by scale
 with the spectral budget in divergent flow with vertical motion (e.g. gravity waves), the
-corrected transfer
+generalized transfer
 
 $$\mathcal{T}^*_\ell = \mathcal{T}_\ell - C_\ell + V_\ell, \qquad
 C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}}
@@ -138,7 +138,7 @@ V_\ell = \tfrac12\,w\left(\bar{\mathbf{u}}\cdot\partial_z\mathbf{u} - \mathbf{u}
 
 ($\delta$ the horizontal divergence, bar the filter of $\mathcal{T}_\ell$) has a domain mean equal
 to the flux-form spectral transfer seen through the same filter, $\sum_k T(k)\,[1-\hat G(k\ell)]$.
-It is written to `energy_transfer_corrected`; `energy_transfer` is unchanged.
+It is written to `energy_transfer_generalized`; `energy_transfer` is unchanged.
 
 ```bash
 sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection
@@ -152,7 +152,7 @@ The same options are `compute:` keys in the YAML (`divergence_correction`, `vert
 `perturbation`, `increment_components`). Unlike $\mathcal{T}_\ell$, the correction (like the
 spectral transfer) depends on the frame: a mean wind adds wave–mean-flow exchange, which
 `--perturbation` removes. Derivation, implementation, tests (including closed-form solutions)
-and validation on simulations: [docs/corrected_transfer.md](docs/corrected_transfer.md).
+and validation on simulations: [docs/generalized_transfer.md](docs/generalized_transfer.md).
 
 ### References:
 
