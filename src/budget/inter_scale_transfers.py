@@ -1254,7 +1254,7 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     **kwargs
         Additional keyword arguments passed to scale_increments and scale_transfer functions.
         For the corrected transfer D*_ℓ (see transfer_correction): divergence_correction,
-        vertical_advection, perturbation (bool), increment_components (default: all present),
+        vertical_advection, perturbation (bool), increment_components (default: u, v),
         and optionally the fields divergence and dzu, dzv (dzw).
     Returns
     -------
@@ -1263,11 +1263,11 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         energy_transfer_corrected if a correction is requested.
     """
 
-    # Validate input dataset: components entering the increments of D_ℓ (default: all present).
-    # increment_components=("u", "v") gives the counterpart of the HKE transfer Π_h; with w, of
-    # the HKE plus VKE transfers.
+    # Validate input dataset: components advected in D_ℓ (in the increments). The default (u, v)
+    # gives the HKE transfer, the counterpart of Π_h; w then enters only as advecting velocity
+    # (V_ℓ). With w the result also contains the VKE transfer, a separate reservoir.
     present = [v for v in ["u", "v", "w"] if v in wind]
-    velocity_vars = list(kwargs.get("increment_components") or present)
+    velocity_vars = list(kwargs.get("increment_components") or ("u", "v"))
     if not {"u", "v"} <= set(velocity_vars) or not set(velocity_vars) <= set(present):
         raise ValueError(f"increment_components {velocity_vars} must contain u, v and be a "
                          f"subset of the velocity components present {present}.")

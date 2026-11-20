@@ -141,10 +141,12 @@ to the flux-form spectral transfer seen through the same filter, $\sum_k T(k)\,[
 It is written to `energy_transfer_corrected`; `energy_transfer` is unchanged.
 
 ```bash
-sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection \
-    --increment-components u,v      # HKE transfer; u,v,w: HKE + VKE transfers
-    # --perturbation                # remove the level-mean wind first
+sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection
 ```
+
+The increments contain $u, v$ by default, so $\mathcal{T}_\ell$ and $\mathcal{T}^*_\ell$ are HKE
+transfers and $w$ enters only as advecting velocity; `--increment-components u,v,w` adds the
+transfer of vertical kinetic energy (the counterpart of the spectral HKE + VKE transfers).
 
 The same options are `compute:` keys in the YAML (`divergence_correction`, `vertical_advection`,
 `perturbation`, `increment_components`). Unlike $\mathcal{T}_\ell$, the correction (like the

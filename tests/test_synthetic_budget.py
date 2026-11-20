@@ -560,17 +560,23 @@ def _nonperiodic_case():
 
 
 def test_fft_path_matches_exact_lattice_nonperiodic():
-    """FFT path == exact lattice sum with reflect, periodic/reflect and edge/symmetric boundaries."""
+    """FFT path == exact lattice sum with reflect, periodic/reflect and edge/symmetric boundaries,
+    for increments of (u, v, w) and for the default (u, v)."""
     ds, fields, d, scales = _nonperiodic_case()
+    horizontal = {k: fields[k] for k in ("u", "v")}
     for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
-        out = inter_scale_kinetic_energy_transfer(
-            ds, scales=scales, x_coord_boundary=xb, y_coord_boundary=yb,
-            allow_rechunk=False)["energy_transfer"].transpose("scale", "z", "y", "x").values
-        for k, ell in enumerate(scales):
-            ref = _brute_force_dell_padded(fields, d, d, ell, xb, yb)
-            err = float(np.abs(out[k] - ref).max() / np.abs(ref).max())
-            assert err < 1e-5, (xb, yb, ell, err)
-        print(f"  boundaries x={xb:8s} y={yb:9s}: FFT path matches the exact lattice sum (<1e-5)")
+        for label, components, ref_fields in (("u, v, w", ("u", "v", "w"), fields),
+                                              ("default u, v", None, horizontal)):
+            out = inter_scale_kinetic_energy_transfer(
+                ds, scales=scales, x_coord_boundary=xb, y_coord_boundary=yb,
+                allow_rechunk=False, increment_components=components)["energy_transfer"]
+            out = out.transpose("scale", "z", "y", "x").values
+            for k, ell in enumerate(scales):
+                ref = _brute_force_dell_padded(ref_fields, d, d, ell, xb, yb)
+                err = float(np.abs(out[k] - ref).max() / np.abs(ref).max())
+                assert err < 1e-5, (xb, yb, label, ell, err)
+        print(f"  boundaries x={xb:8s} y={yb:9s}: FFT path matches the exact lattice sum (<1e-5) "
+              f"for (u, v, w) and the default (u, v)")
 
 
 def test_shift_fallback_close_to_exact():
@@ -582,7 +588,8 @@ def test_shift_fallback_close_to_exact():
         ist._FFT_PAD_MODES.clear()  # force the shift path
         out = inter_scale_kinetic_energy_transfer(
             ds, scales=scales, x_coord_boundary="reflect", y_coord_boundary="reflect",
-            allow_rechunk=False)["energy_transfer"].transpose("scale", "z", "y", "x").values
+            allow_rechunk=False, increment_components=("u", "v", "w"))["energy_transfer"]
+        out = out.transpose("scale", "z", "y", "x").values
     finally:
         ist._FFT_PAD_MODES.update(saved)
     for k, ell in enumerate(scales):
@@ -631,7 +638,8 @@ def test_divergence_correction_matches_increment_form():
     div = xr.DataArray(div_np.astype(np.float32), dims=("z", "y", "x"), coords=ds["u"].coords)
     div_np = div.values.astype(np.float64)
     for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
-        kw = dict(scales=scales, x_coord_boundary=xb, y_coord_boundary=yb, allow_rechunk=False)
+        kw = dict(scales=scales, x_coord_boundary=xb, y_coord_boundary=yb, allow_rechunk=False,
+                  increment_components=("u", "v", "w"))
         out = inter_scale_kinetic_energy_transfer(ds, divergence_correction=True, divergence=div,
                                                   **kw).transpose("scale", "z", "y", "x")
         plain = inter_scale_kinetic_energy_transfer(ds, **kw).transpose("scale", "z", "y", "x")

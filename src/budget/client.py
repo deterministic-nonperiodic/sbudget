@@ -432,8 +432,8 @@ def main(argv: list[str] | None = None) -> None:
                    "scale_transfer: use the full wind (default).")
 
     p_compute.add_argument("--increment-components", type=_csv_or_list,
-                           help="scale_transfer: velocity components in the increments, e.g. "
-                                "'u,v' for the counterpart of the HKE transfer (default: all).")
+                           help="scale_transfer: velocity components in the increments "
+                                "(default 'u,v': HKE transfer; 'u,v,w' adds the VKE transfer).")
 
     _add_bool_pair(p_compute, "client", "client",
                    "Execute local cluster with active dask client (default).",

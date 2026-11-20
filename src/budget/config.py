@@ -32,7 +32,7 @@ class ComputeConfig:
     divergence_correction: bool = False  # subtract the dilatational exchange C_ell
     vertical_advection: bool = False  # add the vertical exchange V_ell (needs w)
     perturbation: bool = False  # remove the level-mean horizontal wind first
-    increment_components: list[str] | None = None  # e.g. ["u", "v"]; None = all present
+    increment_components: list[str] | None = None  # None = ["u", "v"] (HKE); w adds VKE
     cumulative: bool = True  # Aggregate scale transfers cumulatively up to each scale
     rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
     # Dask scheduler: "threads", "distributed", or None = automatic ("distributed" under SLURM,
