@@ -172,15 +172,15 @@ def lorenz_parameter(
     """
     if N2 is None:
         N2 = brunt_vaisala_squared(theta, vertical_dim=vertical_dim, edge_order=edge_order)
-    
-    return cn.g**2 / (N2 * theta**2)
+
+    return cn.g ** 2 / (N2 * theta ** 2)
 
 
 def hydrostatic_exner_function(
-    theta: xr.DataArray,
-    pi_sfc: xr.DataArray,
-    vertical_dim: str = "z",
-    name: str = "exner_hydrostatic",
+        theta: xr.DataArray,
+        pi_sfc: xr.DataArray,
+        vertical_dim: str = "z",
+        name: str = "exner_hydrostatic",
 ) -> xr.DataArray:
     """
     Compute the hydrostatic Exner pressure Π(z) by upward integration.

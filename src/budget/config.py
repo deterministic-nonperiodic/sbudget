@@ -27,6 +27,12 @@ class ComputeConfig:
     dy: float | None = None
     transfer_form: str | None = "flux"  # one of ["invariant", "flux"]
     shape_parameter: float = 1.0  # Shape parameter p for the mollifier filter
+    # scale_transfer: generalized transfer D*_ell = D_ell - C_ell + V_ell, the counterpart of the
+    # flux-form spectral transfer (see inter_scale_transfers.transfer_correction)
+    divergence_correction: bool = False  # subtract the dilatational exchange C_ell
+    vertical_advection: bool = False  # add the vertical exchange V_ell (needs w)
+    perturbation: bool = False  # remove the level-mean horizontal wind first
+    increment_components: list[str] | None = None  # None = ["u", "v"] (HKE); w adds VKE
     cumulative: bool = True  # Aggregate scale transfers cumulatively up to each scale
     rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
     # Dask scheduler: "threads", "distributed", or None = automatic ("distributed" under SLURM,
@@ -142,6 +148,22 @@ def apply_overrides(cfg, args):
     sp = _get(args, "shape_parameter")
     if sp is not None:
         _set_nested(cfg, ["compute", "shape_parameter"], float(sp))
+
+    dc = _get(args, "divergence_correction")
+    if dc is not None:
+        _set_nested(cfg, ["compute", "divergence_correction"], bool(dc))
+
+    pt = _get(args, "perturbation")
+    if pt is not None:
+        _set_nested(cfg, ["compute", "perturbation"], bool(pt))
+
+    va = _get(args, "vertical_advection")
+    if va is not None:
+        _set_nested(cfg, ["compute", "vertical_advection"], bool(va))
+
+    ic = _get(args, "increment_components")
+    if ic:
+        _set_nested(cfg, ["compute", "increment_components"], [str(c) for c in ic])
 
     rs = _get(args, "rechunk_spatial")
     if rs is not None:

@@ -125,6 +125,35 @@ of $O(N_{\rm shifts}\, N)$ for a direct sum over shifts. Measured on UA-ICON nes
 better than $10^{-5}$) for periodic, reflect, mixed and edge/symmetric boundaries. A
 `constant` (NaN-filled) boundary falls back to a direct sum over shift-distance bins.
 
+#### Counterpart of the spectral transfer: $\mathcal{T}^*_\ell$ (`--divergence-correction`, `--vertical-advection`)
+
+$\mathcal{T}_\ell$ assumes non-divergent flow advected horizontally. To compare it scale by scale
+with the spectral budget in divergent flow with vertical motion (e.g. gravity waves), the
+generalized transfer
+
+$$\mathcal{T}^*_\ell = \mathcal{T}_\ell - C_\ell + V_\ell, \qquad
+C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}}
+- \tfrac14\,|\mathbf{u}|^2\,\bar\delta - \tfrac14\,\delta\,\overline{|\mathbf{u}|^2}, \qquad
+V_\ell = \tfrac12\,w\left(\bar{\mathbf{u}}\cdot\partial_z\mathbf{u} - \mathbf{u}\cdot\partial_z\bar{\mathbf{u}}\right)$$
+
+($\delta$ the horizontal divergence, bar the filter of $\mathcal{T}_\ell$) has a domain mean equal
+to the flux-form spectral transfer seen through the same filter, $\sum_k T(k)\,[1-\hat G(k\ell)]$.
+It is written to `energy_transfer_generalized`; `energy_transfer` is unchanged.
+
+```bash
+sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection
+```
+
+The increments contain $u, v$ by default, so $\mathcal{T}_\ell$ and $\mathcal{T}^*_\ell$ are HKE
+transfers and $w$ enters only as advecting velocity; `--increment-components u,v,w` adds the
+transfer of vertical kinetic energy (the counterpart of the spectral HKE + VKE transfers).
+
+The same options are `compute:` keys in the YAML (`divergence_correction`, `vertical_advection`,
+`perturbation`, `increment_components`). Unlike $\mathcal{T}_\ell$, the correction (like the
+spectral transfer) depends on the frame: a mean wind adds wave–mean-flow exchange, which
+`--perturbation` removes. Closed-form and synthetic tests are in
+[tests/test_synthetic_budget.py](tests/test_synthetic_budget.py).
+
 ### References:
 
 - J. Peng, L. Zhang, and J. Guan (2015). Applications of a Moist Nonhydrostatic Formulation of the

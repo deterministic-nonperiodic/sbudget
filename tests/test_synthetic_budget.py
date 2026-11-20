@@ -560,17 +560,23 @@ def _nonperiodic_case():
 
 
 def test_fft_path_matches_exact_lattice_nonperiodic():
-    """FFT path == exact lattice sum with reflect, periodic/reflect and edge/symmetric boundaries."""
+    """FFT path == exact lattice sum with reflect, periodic/reflect and edge/symmetric boundaries,
+    for increments of (u, v, w) and for the default (u, v)."""
     ds, fields, d, scales = _nonperiodic_case()
+    horizontal = {k: fields[k] for k in ("u", "v")}
     for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
-        out = inter_scale_kinetic_energy_transfer(
-            ds, scales=scales, x_coord_boundary=xb, y_coord_boundary=yb,
-            allow_rechunk=False)["energy_transfer"].transpose("scale", "z", "y", "x").values
-        for k, ell in enumerate(scales):
-            ref = _brute_force_dell_padded(fields, d, d, ell, xb, yb)
-            err = float(np.abs(out[k] - ref).max() / np.abs(ref).max())
-            assert err < 1e-5, (xb, yb, ell, err)
-        print(f"  boundaries x={xb:8s} y={yb:9s}: FFT path matches the exact lattice sum (<1e-5)")
+        for label, components, ref_fields in (("u, v, w", ("u", "v", "w"), fields),
+                                              ("default u, v", None, horizontal)):
+            out = inter_scale_kinetic_energy_transfer(
+                ds, scales=scales, x_coord_boundary=xb, y_coord_boundary=yb,
+                allow_rechunk=False, increment_components=components)["energy_transfer"]
+            out = out.transpose("scale", "z", "y", "x").values
+            for k, ell in enumerate(scales):
+                ref = _brute_force_dell_padded(ref_fields, d, d, ell, xb, yb)
+                err = float(np.abs(out[k] - ref).max() / np.abs(ref).max())
+                assert err < 1e-5, (xb, yb, label, ell, err)
+        print(f"  boundaries x={xb:8s} y={yb:9s}: FFT path matches the exact lattice sum (<1e-5) "
+              f"for (u, v, w) and the default (u, v)")
 
 
 def test_shift_fallback_close_to_exact():
@@ -582,7 +588,8 @@ def test_shift_fallback_close_to_exact():
         ist._FFT_PAD_MODES.clear()  # force the shift path
         out = inter_scale_kinetic_energy_transfer(
             ds, scales=scales, x_coord_boundary="reflect", y_coord_boundary="reflect",
-            allow_rechunk=False)["energy_transfer"].transpose("scale", "z", "y", "x").values
+            allow_rechunk=False, increment_components=("u", "v", "w"))["energy_transfer"]
+        out = out.transpose("scale", "z", "y", "x").values
     finally:
         ist._FFT_PAD_MODES.update(saved)
     for k, ell in enumerate(scales):
@@ -596,6 +603,598 @@ def test_shift_fallback_close_to_exact():
         assert mean < 0.01, (ell, mean)
         if 2 * ell < 8 * d:
             assert point < 1e-5, (ell, point)
+
+
+# ------------------------------------------------------------------------------------------------
+# Generalized transfer D_ell - C_ell (horizontally divergent flow)
+# ------------------------------------------------------------------------------------------------
+def _brute_force_exchange_padded(fields, div, dx, dy, ell, x_mode, y_mode):
+    """-C_ell = 1/8 sum_s G(s) [(d(x) + d(x+s)) |du|^2 - d[d] d[|u|^2]] dA / sum G dA, padded."""
+    m_x, m_y = int(np.ceil(2 * ell / dx)), int(np.ceil(2 * ell / dy))
+    pad = lambda a: np.pad(np.pad(a, ((0, 0), (m_y, m_y), (0, 0)), mode=_NP_MODE[y_mode]),
+                           ((0, 0), (0, 0), (m_x, m_x)), mode=_NP_MODE[x_mode])
+    allf = dict(fields, div=div)
+    padded = {k: pad(a) for k, a in allf.items()}
+    nz, ny, nx = div.shape
+    sx, sy = np.meshgrid(np.arange(-m_x, m_x + 1), np.arange(-m_y, m_y + 1))
+    g = _mollifier(np.hypot(sx * dx, sy * dy), ell)
+    norm = g.sum() * dx * dy
+    k0 = sum(a ** 2 for a in fields.values())
+    acc = np.zeros((nz, ny, nx))
+    for i, j in zip(*np.nonzero(g)):
+        ys = slice(m_y + sy[i, j], m_y + sy[i, j] + ny)
+        xs = slice(m_x + sx[i, j], m_x + sx[i, j] + nx)
+        sh = {k: padded[k][:, ys, xs] for k in allf}
+        dq = sum((sh[k] - fields[k]) ** 2 for k in fields)
+        dk = sum(sh[k] ** 2 for k in fields) - k0
+        acc += g[i, j] * ((div + sh["div"]) * dq - (sh["div"] - div) * dk)
+    return 0.125 * acc * dx * dy / norm
+
+
+def test_divergence_correction_matches_increment_form():
+    """FFT C_ell == the increment form of the derivation, any boundary; D_ell itself unchanged."""
+    ds, fields, d, scales = _nonperiodic_case()
+    div_np = np.random.default_rng(5).normal(size=fields["u"].shape)
+    div = xr.DataArray(div_np.astype(np.float32), dims=("z", "y", "x"), coords=ds["u"].coords)
+    div_np = div.values.astype(np.float64)
+    for xb, yb in [("reflect", "reflect"), ("periodic", "reflect"), ("edge", "symmetric")]:
+        kw = dict(scales=scales, x_coord_boundary=xb, y_coord_boundary=yb, allow_rechunk=False,
+                  increment_components=("u", "v", "w"))
+        out = inter_scale_kinetic_energy_transfer(ds, divergence_correction=True, divergence=div,
+                                                  **kw).transpose("scale", "z", "y", "x")
+        plain = inter_scale_kinetic_energy_transfer(ds, **kw).transpose("scale", "z", "y", "x")
+        assert np.array_equal(out["energy_transfer"].values, plain["energy_transfer"].values)
+        minus_c = (out["energy_transfer_generalized"] - out["energy_transfer"]).values
+        for k, ell in enumerate(scales):
+            ref = _brute_force_exchange_padded(fields, div_np, d, d, ell, xb, yb)
+            err = float(np.abs(minus_c[k] - ref).max() / np.abs(ref).max())
+            assert err < 1e-4, (xb, yb, ell, err)
+        print(f"  boundaries x={xb:8s} y={yb:9s}: C_ell matches the increment form (<1e-4), "
+              f"D_ell unchanged")
+    zero = inter_scale_kinetic_energy_transfer(ds, divergence_correction=True,
+                                               divergence=xr.zeros_like(div), scales=scales,
+                                               allow_rechunk=False)
+    assert np.array_equal(zero["energy_transfer_generalized"].values,
+                          zero["energy_transfer"].values), "C_ell must vanish for div = 0"
+    print("  div = 0: D_ell^c == D_ell exactly")
+
+
+def _spectral_divergent_case(n=64, L=64e3, seed=17):
+    """Periodic trigonometric (u, v), both rotational and divergent, with exact derivatives."""
+    rng = np.random.default_rng(seed)
+    d = L / n
+    x = np.arange(n) * d
+    X, Y = np.meshgrid(x, x, indexing="xy")
+    u = np.zeros((n, n))
+    v = np.zeros((n, n))
+    for _ in range(14):
+        kx, ky = rng.integers(-4, 5, 2)
+        ph = 2 * np.pi * (kx * X + ky * Y) / L + rng.uniform(0, 2 * np.pi)
+        u += rng.normal() * np.cos(ph)
+        v += rng.normal() * np.cos(ph + rng.uniform(0, 2 * np.pi))
+    k1 = 2 * np.pi * np.fft.fftfreq(n, d)
+    KX, KY = np.meshgrid(k1, k1, indexing="xy")
+    ddx = lambda f: np.real(np.fft.ifft2(1j * KX * np.fft.fft2(f)))
+    ddy = lambda f: np.real(np.fft.ifft2(1j * KY * np.fft.fft2(f)))
+    return u, v, x, d, ddx, ddy
+
+
+def test_generalized_dell_closes_local_budget():
+    """Exact local identity -1/2 [ubar.N + u.Nbar] = -div J - D_ell^c for divergent flow.
+
+    N = (U.grad)U + 1/2 div(U) U (skew-symmetric, the flux-form Pi_h), J the Duchon-Robert flux,
+    bar the lattice filter. Derivatives are spectral (exact for these fields); the remaining
+    error is the lattice quadrature of grad G in D_ell (decreases with ell / dx). Plain D_ell
+    must fail the same identity.
+    """
+    u, v, x, d, ddx, ddy = _spectral_divergent_case()
+    div = ddx(u) + ddy(v)
+    assert np.abs(div).max() > 0.5 * np.abs(ddx(u)).max()          # strongly divergent
+    ell = 8 * d
+    ds = _as_dataset(u, v, x)
+    div_da = xr.DataArray(np.repeat(div[None], 3, 0), dims=("z", "y", "x"), coords=ds["u"].coords)
+    out = inter_scale_kinetic_energy_transfer(
+        ds, scales=np.array([ell]), x_coord_boundary="periodic", y_coord_boundary="periodic",
+        allow_rechunk=False, divergence_correction=True, divergence=div_da)
+    dell = out["energy_transfer"].isel(z=1, scale=0).transpose("y", "x").values.astype(float)
+    dc = out["energy_transfer_generalized"].isel(z=1, scale=0).transpose("y", "x").values
+    dc = dc.astype(float)
+
+    m = int(np.ceil(2 * ell / d))
+    sx, sy = np.meshgrid(np.arange(-m, m + 1), np.arange(-m, m + 1))
+    g = _mollifier(np.hypot(sx, sy) * d, ell)
+    g = g / g.sum()
+    bar = lambda f: sum(g[i, j] * np.roll(f, (-sy[i, j], -sx[i, j]), (0, 1))
+                        for i, j in zip(*np.nonzero(g)))
+    ub, vb = bar(u), bar(v)
+    k = u ** 2 + v ** 2
+    nu = u * ddx(u) + v * ddy(u) + 0.5 * div * u
+    nv = u * ddx(v) + v * ddy(v) + 0.5 * div * v
+    s_f = -0.5 * (ub * nu + vb * nv + u * bar(nu) + v * bar(nv))
+    jx = 0.5 * u * (u * ub + v * vb) + 0.25 * (bar(u * k) - u * bar(k))
+    jy = 0.5 * v * (u * ub + v * vb) + 0.25 * (bar(v * k) - v * bar(k))
+    div_j = ddx(jx) + ddy(jy)
+
+    scale = np.abs(dell).max()
+    res_c = float(np.abs(s_f + div_j + dc).max() / scale)
+    res_d = float(np.abs(s_f + div_j + dell).max() / scale)
+    mean_c = abs(dc.mean() + s_f.mean()) / abs(s_f.mean())
+    print(f"  ell = 8 dx: local residual with D_ell^c {res_c:.1e}, with D_ell {res_d:.2f};"
+          f" domain mean: |<D^c> + <S>| / |<S>| = {mean_c:.1e}")
+    assert res_c < 2e-3, res_c
+    assert res_d > 0.1, res_d                     # the test discriminates
+    assert mean_c < 2e-3, mean_c
+
+
+def _spectral_3d_case(n=64, L=64e3, H=8e3, u0=6.0, seed=23):
+    """Periodic (x, y) trigonometric u, v, w with vertical structure, exact derivatives at z = 0.
+
+    u and v include a uniform background u0 (the flux-form transfer depends on it when the flow
+    is divergent). Returns 2-D fields at z = 0 and the exact derivative operators.
+    """
+    rng = np.random.default_rng(seed)
+    d = L / n
+    x = np.arange(n) * d
+    X, Y = np.meshgrid(x, x, indexing="xy")
+    f = {k: np.zeros((n, n)) for k in ("u", "v", "w", "dzu", "dzv", "dzw")}
+    for _ in range(14):
+        kx, ky = rng.integers(-4, 5, 2)
+        m = 2 * np.pi / H * rng.uniform(0.5, 2.0)
+        ph = 2 * np.pi * (kx * X + ky * Y) / L
+        for c, amp in (("u", 1.0), ("v", 1.0), ("w", 0.6)):
+            a, phase = rng.normal() * amp, rng.uniform(0, 2 * np.pi)
+            f[c] += a * np.cos(ph + phase)                 # value at z = 0 of cos(ph + m z + phase)
+            f[f"dz{c}"] += -a * m * np.sin(ph + phase)
+    f["u"] += u0
+    f["v"] += 0.5 * u0
+    k1 = 2 * np.pi * np.fft.fftfreq(n, d)
+    KX, KY = np.meshgrid(k1, k1, indexing="xy")
+    ddx = lambda g: np.real(np.fft.ifft2(1j * KX * np.fft.fft2(g)))
+    ddy = lambda g: np.real(np.fft.ifft2(1j * KY * np.fft.fft2(g)))
+    return f, x, d, ddx, ddy
+
+
+def _lattice_filter_response(n, d, ell):
+    """G^(k) of the normalized lattice mollifier on the periodic n x n grid (real, symmetric)."""
+    m = int(np.ceil(2 * ell / d))
+    kernel = np.zeros((n, n))
+    for i in range(-m, m + 1):
+        for j in range(-m, m + 1):
+            kernel[j % n, i % n] += _mollifier(np.array([np.hypot(i, j) * d]), ell)[0]
+    return np.real(np.fft.fft2(kernel / kernel.sum()))
+
+
+def test_generalized_transfer_equals_kernel_weighted_spectral_transfer():
+    """<D_ell - C_ell + V_ell> == sum_k T(k) [1 - G^(k)]: the spectral counterpart, computed
+    independently in Fourier space with exact derivatives.
+
+    T(k) is the flux-form HKE transfer of sbudget's spectral budget,
+        T = -<U, (U.grad)U + 1/2 div U + 1/2 w dz U>_k + 1/2 <dz U, w U>_k,
+    with divergent flow, vertical advection and a uniform background flow. The physical-space
+    side uses increments of (u, v) only. The remaining error is the lattice quadrature of grad G
+    in D_ell, which decreases with ell / dx. D_ell alone and D_ell - C_ell (no vertical term)
+    must both miss the spectral value.
+    """
+    f, x, d, ddx, ddy = _spectral_3d_case()
+    n = x.size
+    u, v, w, dzu, dzv = (f[k] for k in ("u", "v", "w", "dzu", "dzv"))
+    div = ddx(u) + ddy(v)
+
+    # spectral side (Fourier space, exact derivatives)
+    hat = lambda g: np.fft.fft2(g) / n ** 2
+    cross = lambda a, b: np.real(np.conj(hat(a)) * hat(b))            # sums to mean(a b)
+    au = u * ddx(u) + v * ddy(u) + 0.5 * div * u + 0.5 * w * dzu
+    av = u * ddx(v) + v * ddy(v) + 0.5 * div * v + 0.5 * w * dzv
+    t2d = -(cross(u, au) + cross(v, av)) + 0.5 * (cross(dzu, w * u) + cross(dzv, w * v))
+    assert abs(t2d.sum()) < 1e-10 * np.abs(t2d).sum()                # conservative
+
+    da = lambda g: xr.DataArray(np.repeat(g[None], 3, 0), dims=("z", "y", "x"),
+                                coords={"z": [-1.0, 0.0, 1.0], "y": x, "x": x})
+    ds = xr.Dataset({"u": da(u), "v": da(v), "w": da(w)})
+    print("  ell/dx   spectral      D*        D*/spec-1   (D - C)/spec   D/spec")
+    for factor in (5.0, 8.0, 12.0):
+        ell = factor * d
+        spec = float((t2d * (1.0 - _lattice_filter_response(n, d, ell))).sum())
+        kw = dict(scales=np.array([ell]), x_coord_boundary="periodic",
+                  y_coord_boundary="periodic", allow_rechunk=False,
+                  increment_components=("u", "v"), divergence=da(div))
+        full = inter_scale_kinetic_energy_transfer(ds, divergence_correction=True,
+                                                   vertical_advection=True, dzu=da(dzu),
+                                                   dzv=da(dzv), **kw).isel(z=1, scale=0)
+        hor = inter_scale_kinetic_energy_transfer(ds, divergence_correction=True,
+                                                  **kw).isel(z=1, scale=0)
+        d_star = float(full["energy_transfer_generalized"].mean())
+        d_hor = float(hor["energy_transfer_generalized"].mean())
+        d_plain = float(full["energy_transfer"].mean())
+        err = abs(d_star / spec - 1)
+        print(f"  {factor:5.1f}  {spec: .4e}  {d_star: .4e}  {err:9.1e}   {d_hor / spec:9.3f}"
+              f"   {d_plain / spec:7.3f}")
+        assert err < (5e-3 if factor < 8 else 1e-3), (factor, err)
+        assert abs(d_hor / spec - 1) > 0.05 and abs(d_plain / spec - 1) > 0.05
+
+
+def test_generalized_transfer_with_w_equals_hke_plus_vke():
+    """With increments of (u, v, w), <D*_ell> == sum_k [T_h(k) + T_w(k)] [1 - G^(k)].
+
+    T_w is the flux-form VKE transfer of the spectral budget,
+        T_w = -<w, U.grad w + 1/2 div w + 1/2 w dz w>_k + 1/2 <dz w, w w>_k,
+    the HKE form with w advected, so C_ell and V_ell sum over u, v and w. D_ell itself sees w only
+    through |du|^2 (horizontal filter). Same fields and independent Fourier-space evaluation as
+    test_generalized_transfer_equals_kernel_weighted_spectral_transfer.
+    """
+    f, x, d, ddx, ddy = _spectral_3d_case()
+    n = x.size
+    u, v, w, dzu, dzv, dzw = (f[k] for k in ("u", "v", "w", "dzu", "dzv", "dzw"))
+    div = ddx(u) + ddy(v)
+
+    hat = lambda g: np.fft.fft2(g) / n ** 2
+    cross = lambda a, b: np.real(np.conj(hat(a)) * hat(b))
+    au = u * ddx(u) + v * ddy(u) + 0.5 * div * u + 0.5 * w * dzu
+    av = u * ddx(v) + v * ddy(v) + 0.5 * div * v + 0.5 * w * dzv
+    aw = u * ddx(w) + v * ddy(w) + 0.5 * div * w + 0.5 * w * dzw
+    t_h = -(cross(u, au) + cross(v, av)) + 0.5 * (cross(dzu, w * u) + cross(dzv, w * v))
+    t_w = -cross(w, aw) + 0.5 * cross(dzw, w * w)
+    assert abs(t_w.sum()) < 1e-10 * np.abs(t_w).sum()                  # conservative
+
+    da = lambda g: xr.DataArray(np.repeat(g[None], 3, 0), dims=("z", "y", "x"),
+                                coords={"z": [-1.0, 0.0, 1.0], "y": x, "x": x})
+    ds = xr.Dataset({"u": da(u), "v": da(v), "w": da(w)})
+    def generalized_mean(ell, shear_w):
+        out = inter_scale_kinetic_energy_transfer(
+            ds, scales=np.array([ell]), x_coord_boundary="periodic", y_coord_boundary="periodic",
+            allow_rechunk=False, increment_components=("u", "v", "w"), divergence=da(div),
+            divergence_correction=True, vertical_advection=True, dzu=da(dzu), dzv=da(dzv),
+            dzw=da(shear_w)).isel(z=1, scale=0)
+        return float(out["energy_transfer_generalized"].mean())
+
+    print("  ell/dx   spectral (h+w)   D*/spec-1   without w in V_ell   T_h only / (h+w)")
+    for factor, tol in ((5.0, 5e-3), (8.0, 1e-3), (12.0, 1e-3)):
+        ell = factor * d
+        weight = 1.0 - _lattice_filter_response(n, d, ell)
+        spec, spec_h = float(((t_h + t_w) * weight).sum()), float((t_h * weight).sum())
+        err = abs(generalized_mean(ell, dzw) / spec - 1)
+        err_no_vw = abs(generalized_mean(ell, np.zeros_like(dzw)) / spec - 1)   # V_ell over u, v
+        print(f"  {factor:5.1f}  {spec: .4e}  {err:12.1e}   {err_no_vw:16.1e}   "
+              f"{spec_h / spec:12.3f}")
+        assert err < tol, (factor, err)
+        assert err_no_vw > 10 * err and abs(spec_h / spec - 1) > 10 * err   # discriminates
+
+
+def test_perturbation_frame():
+    """perturbation=True: transfer of the perturbation about the level-mean wind.
+
+    D_ell is unchanged (Galilean invariant); D_ell* equals the kernel-weighted spectral transfer
+    of the perturbation fields and differs from the ground-frame value, as the flux-form
+    spectral transfer does (the 1/2 div c term couples the mean flow c to every wavenumber).
+    """
+    f, x, d, ddx, ddy = _spectral_3d_case()
+    n = x.size
+    u, v, w, dzu, dzv = (f[k] for k in ("u", "v", "w", "dzu", "dzv"))
+    up, vp = u - u.mean(), v - v.mean()
+    div = ddx(u) + ddy(v)
+    hat = lambda g: np.fft.fft2(g) / n ** 2
+    cross = lambda a, b: np.real(np.conj(hat(a)) * hat(b))
+
+    def spectral(uu, vv, ell):
+        au = uu * ddx(uu) + vv * ddy(uu) + 0.5 * div * uu + 0.5 * w * dzu
+        av = uu * ddx(vv) + vv * ddy(vv) + 0.5 * div * vv + 0.5 * w * dzv
+        t = -(cross(uu, au) + cross(vv, av)) + 0.5 * (cross(dzu, w * uu) + cross(dzv, w * vv))
+        return float((t * (1.0 - _lattice_filter_response(n, d, ell))).sum())
+
+    da = lambda g: xr.DataArray(np.repeat(g[None], 3, 0), dims=("z", "y", "x"),
+                                coords={"z": [-1.0, 0.0, 1.0], "y": x, "x": x})
+    ds = xr.Dataset({"u": da(u), "v": da(v), "w": da(w)})
+    ell = 8 * d
+    kw = dict(scales=np.array([ell]), x_coord_boundary="periodic", y_coord_boundary="periodic",
+              allow_rechunk=False, increment_components=("u", "v"), divergence=da(div),
+              divergence_correction=True, vertical_advection=True, dzu=da(dzu), dzv=da(dzv))
+    ground = inter_scale_kinetic_energy_transfer(ds, **kw).isel(z=1, scale=0)
+    pert = inter_scale_kinetic_energy_transfer(ds, perturbation=True, **kw).isel(z=1, scale=0)
+    assert np.allclose(pert["energy_transfer"], ground["energy_transfer"], rtol=0,
+                       atol=1e-5 * float(np.abs(ground["energy_transfer"]).max()))
+    s_g, s_p = spectral(u, v, ell), spectral(up, vp, ell)
+    d_g = float(ground["energy_transfer_generalized"].mean())
+    d_p = float(pert["energy_transfer_generalized"].mean())
+    print(f"  ground frame: D* = {d_g:.4e}, spectral {s_g:.4e};  perturbation: D* = {d_p:.4e}, "
+          f"spectral {s_p:.4e}  (frames differ by {abs(s_g / s_p - 1):.0%})")
+    assert abs(d_p / s_p - 1) < 1e-3 and abs(d_g / s_g - 1) < 1e-3
+    assert abs(s_g / s_p - 1) > 0.05
+
+
+def _lattice_filter_at(kx, ky, d, ell):
+    """G^(k) = sum_s G(s) cos(k.s) / sum_s G(s) of the lattice mollifier at one wavevector."""
+    m = int(np.ceil(2 * ell / d))
+    sx, sy = np.meshgrid(np.arange(-m, m + 1), np.arange(-m, m + 1))
+    g = _mollifier(np.hypot(sx, sy) * d, ell)
+    return float((g * np.cos(kx * sx * d + ky * sy * d)).sum() / g.sum())
+
+
+def _planes(fields, x, nz=3):
+    """Stack 2-D periodic fields into (z, y, x) DataArrays with nz identical levels."""
+    co = {"z": np.arange(nz, dtype=float), "y": x, "x": x}
+    return {k: xr.DataArray(np.repeat(a[None], nz, 0), dims=("z", "y", "x"), coords=co)
+            for k, a in fields.items()}
+
+
+def test_generalized_transfer_closed_form_triad():
+    """Closed form for the dilatational exchange: a divergent triad along x.
+
+    u = c + A cos(kx) + B cos(2kx + b), v = w = 0. The flux-form transfer is
+    t(k) = -t(2k) = 3/8 k A^2 B sin b (c drops out in 1-D), so
+        <D_ell - C_ell> = 3/8 k A^2 B sin b [G^(2k) - G^(k)],
+    with G^ the lattice filter. The remaining error is the lattice quadrature of grad G in D_ell,
+    which falls steeply with ell / dx. D_ell alone must miss the closed form.
+    """
+    n, L = 64, 64e3
+    d = L / n
+    x = np.arange(n) * d
+    X = np.meshgrid(x, x, indexing="xy")[0]
+    k, A, B, b, c = 2 * np.pi / L, 1.3, 0.8, 0.9, 4.0
+    th = k * X
+    u = c + A * np.cos(th) + B * np.cos(2 * th + b)
+    div = -k * A * np.sin(th) - 2 * k * B * np.sin(2 * th + b)
+    f = _planes({"u": u, "v": np.zeros_like(u), "div": div}, x)
+    ds = xr.Dataset({"u": f["u"], "v": f["v"]})
+    print("  ell/dx   closed form   <D*>/closed-1   <D>/closed")
+    for factor, tol in ((6.0, 5e-3), (8.0, 1e-3), (12.0, 1e-4), (16.0, 1e-5)):
+        ell = factor * d
+        exact = 3 / 8 * k * A ** 2 * B * np.sin(b) * (_lattice_filter_at(2 * k, 0, d, ell)
+                                                     - _lattice_filter_at(k, 0, d, ell))
+        out = inter_scale_kinetic_energy_transfer(
+            ds, scales=np.array([ell]), x_coord_boundary="periodic", y_coord_boundary="periodic",
+            allow_rechunk=False, divergence_correction=True, divergence=f["div"]).isel(z=1, scale=0)
+        d_star = float(out["energy_transfer_generalized"].mean())
+        d_plain = float(out["energy_transfer"].mean())
+        err = abs(d_star / exact - 1)
+        print(f"  {factor:5.1f}  {exact: .4e}  {err:13.1e}   {d_plain / exact:9.3f}")
+        assert err < tol, (factor, err)
+        assert abs(d_plain / exact - 1) > 0.05
+
+
+def _boussinesq_wave(damping, n=64, L=64e3, N=0.02, amp=1.0):
+    """Steady internal gravity wave in a uniform wind c, exact linear Boussinesq solution.
+
+    Rayleigh friction and Newtonian cooling at the rate `damping` give
+    m^2 = N^2 k^2 / (k.c - i r)^2 - k^2; the root with Im m >= 0 decays upwards. The horizontal
+    velocity is along k (no rotation) and w = -|k| u^ / m from continuity. Returns the fields at
+    z = 0 with exact derivatives, the wavevector and 1/2 c . dz<u'w>, the closed-form prefactor.
+    """
+    d = L / n
+    x = np.arange(n) * d
+    X, Y = np.meshgrid(x, x, indexing="xy")
+    kv = 2 * np.pi / L * np.array([2.0, 1.0])
+    kh = float(np.hypot(*kv))
+    khat = kv / kh
+    c = np.array([20.0, 5.0])
+    m = np.sqrt(N ** 2 * kh ** 2 / (kv @ c - 1j * damping) ** 2 - kh ** 2 + 0j)
+    if m.imag < 0 or (m.imag == 0 and m.real < 0):
+        m = -m
+    phase = np.exp(1j * (kv[0] * X + kv[1] * Y))
+    up = np.real(amp * phase)                       # wave velocity along k
+    dz_up = np.real(1j * m * amp * phase)           # exact dz, including the decay
+    fields = {"u": c[0] + khat[0] * up, "v": c[1] + khat[1] * up,
+              "w": np.real(-kh * amp / m * phase), "dzu": khat[0] * dz_up,
+              "dzv": khat[1] * dz_up, "div": np.real(1j * kh * amp * phase)}
+    dz_stress = m.imag * kh * amp ** 2 * m.real / abs(m) ** 2      # dz<u'w> along k at z = 0
+    return fields, x, d, kv, 0.5 * float(c @ khat) * dz_stress
+
+
+def test_generalized_transfer_closed_form_boussinesq_wave():
+    """Closed form for the vertical exchange: a steady Boussinesq gravity wave in a uniform wind.
+
+    One horizontal wavenumber, so <D_ell> = <C_ell> = 0, while the flux-form transfer exchanges
+    energy between the wave and the mean wind c:
+        <D*_ell> = <V_ell> = 1/2 [1 - G^(k)] c . <w dz u'> = 1/2 [1 - G^(k)] c . dz<u'w>
+    (Boussinesq continuity). A conservative wave has a constant stress (Eliassen and Palm 1961)
+    and <D*> = 0, although C_ell and V_ell are not zero pointwise; a damped wave decays with
+    height, its stress converges, and the mean wind loses energy to it (<D*> > 0). In the
+    perturbation frame both vanish.
+    """
+    damping = 0.2 * abs(np.array([2.0, 1.0]) @ np.array([20.0, 5.0])) * 2 * np.pi / 64e3
+    for label, r in (("conservative", 0.0), ("damped", damping)):
+        fields, x, d, kv, unit = _boussinesq_wave(r)
+        f = _planes(fields, x)
+        ds = xr.Dataset({k: f[k] for k in ("u", "v", "w")})
+        kw = dict(x_coord_boundary="periodic", y_coord_boundary="periodic", allow_rechunk=False,
+                  increment_components=("u", "v"), divergence_correction=True,
+                  vertical_advection=True, divergence=f["div"], dzu=f["dzu"], dzv=f["dzv"])
+        w_dzu = float((f["w"] * (f["dzu"] * kv[0] + f["dzv"] * kv[1])).isel(z=1).mean())
+        assert abs(w_dzu) < 1e-12 if r == 0 else w_dzu > 0              # <w dz u'> along k
+        for factor in (6.0, 10.0):
+            ell = factor * d
+            exact = unit * (1 - _lattice_filter_at(*kv, d, ell))
+            ground = inter_scale_kinetic_energy_transfer(ds, scales=np.array([ell]),
+                                                         **kw).isel(z=1, scale=0)
+            pert = inter_scale_kinetic_energy_transfer(ds, scales=np.array([ell]),
+                                                       perturbation=True, **kw).isel(z=1, scale=0)
+            d_star = float(ground["energy_transfer_generalized"].mean())
+            d_plain = float(ground["energy_transfer"].mean())
+            d_pert = float(pert["energy_transfer_generalized"].mean())
+            corr_max = float(np.abs(ground["energy_transfer_generalized"]
+                                    - ground["energy_transfer"]).max())
+            scale = abs(exact) if r else corr_max
+            print(f"  {label:12s} ell = {factor:.0f} dx: closed form {exact: .4e}, <D*> {d_star: .4e};"
+                  f" <D> {d_plain: .1e}, perturbation <D*> {d_pert: .1e}, max |V - C| {corr_max:.1e}")
+            assert abs(d_star - exact) < 1e-4 * scale, (label, factor, d_star, exact)
+            assert abs(d_plain) < 1e-6 * scale and abs(d_pert) < 1e-6 * scale
+            assert corr_max > 0.1 * scale                    # the corrections are not zero pointwise
+        if r:
+            assert exact > 0                                 # mean wind loses energy to the wave
+
+
+def test_correction_divergence_source():
+    """The correction uses the divergence the spectral budget uses: an explicit `divergence`,
+    else the dataset's divergence when it also holds the vorticity, else centred differences."""
+    ds, fields, d, scales = _nonperiodic_case()
+    rng = np.random.default_rng(41)
+    given = xr.DataArray(rng.normal(size=fields["u"].shape).astype(np.float32),
+                         dims=("z", "y", "x"), coords=ds["u"].coords)
+    kw = dict(scales=scales[:1], allow_rechunk=False, divergence_correction=True)
+    generalized = lambda data, **extra: inter_scale_kinetic_energy_transfer(
+        data, **kw, **extra)["energy_transfer_generalized"].values
+
+    with_both = ds.assign(divergence=given, vorticity=xr.zeros_like(given))
+    with_div = ds.assign(divergence=given)
+    finite_diff = horizontal_divergence(ds["u"], ds["v"])
+    assert np.array_equal(generalized(with_both), generalized(ds, divergence=given))
+    assert np.array_equal(generalized(with_div), generalized(ds, divergence=finite_diff))
+    assert np.array_equal(generalized(with_both, divergence=finite_diff),
+                          generalized(ds, divergence=finite_diff))
+    assert not np.allclose(generalized(with_both), generalized(with_div))      # discriminates
+    print("  divergence + vorticity in the dataset: dataset divergence; divergence alone: "
+          "centred differences; explicit divergence overrides both")
+
+
+def test_correction_error_paths():
+    """Invalid requests fail with a clear error before any computation."""
+    from budget.inter_scale_transfers import transfer_correction
+    ds, fields, d, scales = _nonperiodic_case()
+    kw = dict(scales=scales[:1], allow_rechunk=False)
+    cases = [
+        ("w missing", ValueError,
+         lambda: inter_scale_kinetic_energy_transfer(ds[["u", "v"]], vertical_advection=True, **kw)),
+        ("u only", ValueError,
+         lambda: inter_scale_kinetic_energy_transfer(ds, increment_components=("u",), **kw)),
+        ("w requested, absent", ValueError,
+         lambda: inter_scale_kinetic_energy_transfer(ds[["u", "v"]],
+                                                     increment_components=("u", "v", "w"), **kw)),
+        ("2 levels, no shear", ValueError,
+         lambda: inter_scale_kinetic_energy_transfer(ds.isel(z=slice(0, 2)),
+                                                     vertical_advection=True, **kw)),
+        ("constant boundary", NotImplementedError,
+         lambda: inter_scale_kinetic_energy_transfer(ds, divergence_correction=True,
+                                                     x_coord_boundary="constant", **kw)),
+        ("no term requested", ValueError,
+         lambda: transfer_correction(ds, {}, xr.DataArray(scales, dims="scale"), "x", "y",
+                                     ["u", "v"], divergence=False, vertical=False)),
+    ]
+    for label, error, call in cases:
+        try:
+            call()
+        except error as e:
+            print(f"  {label:20s}: {error.__name__}: {e}")
+        else:
+            raise AssertionError(f"{label}: no {error.__name__}")
+    # without the correction, the shift path still handles the constant boundary
+    inter_scale_kinetic_energy_transfer(ds, x_coord_boundary="constant", **kw)
+
+
+def test_correction_geographic_grid():
+    """On a lon-lat grid the correction uses the lattice filter of D_ell and the spherical
+    divergence: finite, zero for non-divergent input, and non-zero otherwise."""
+    lon = xr.DataArray(np.arange(0.0, 16.0, 0.25), dims="lon", name="lon",
+                       attrs={"units": "degrees_east", "standard_name": "longitude"})
+    lat = xr.DataArray(np.arange(30.0, 42.0, 0.25), dims="lat", name="lat",
+                       attrs={"units": "degrees_north", "standard_name": "latitude"})
+    rng = np.random.default_rng(13)
+    shape = (3, lat.size, lon.size)
+    LON, LAT = np.meshgrid(np.deg2rad(lon.values), np.deg2rad(lat.values))
+    wave = lambda: sum(rng.normal() * np.cos(kx * LON * 20 + ky * LAT * 20 + rng.uniform(0, 6))
+                       for kx, ky in rng.integers(1, 4, (6, 2)))
+    co = {"z": [0.0, 1.0, 2.0], "lat": lat, "lon": lon}
+    da = lambda a: xr.DataArray(np.broadcast_to(a, shape).astype(np.float32),
+                                dims=("z", "lat", "lon"), coords=co)
+    ds = xr.Dataset({"u": da(5 + wave()), "v": da(wave())})
+    kw = dict(scales=np.array([80e3, 150e3]), allow_rechunk=False, divergence_correction=True)
+    out = inter_scale_kinetic_energy_transfer(ds, **kw)
+    zero = inter_scale_kinetic_energy_transfer(ds, divergence=xr.zeros_like(ds["u"]), **kw)
+    corr = (out["energy_transfer_generalized"] - out["energy_transfer"]).values
+    assert np.isfinite(out["energy_transfer_generalized"].values).all()
+    assert np.array_equal(zero["energy_transfer_generalized"].values, zero["energy_transfer"].values)
+    ratio = np.abs(corr).max() / np.abs(out["energy_transfer"].values).max()
+    print(f"  lon-lat grid: finite; max |C_ell| / max |D_ell| = {ratio:.2f}; C_ell = 0 for div = 0")
+    assert ratio > 1e-3
+
+
+def test_correction_independent_of_chunking():
+    """Blocks of one plane (chunked in time and z, with and without automatic rechunking) give
+    bitwise the same D_ell and D*_ell as one block."""
+    ds, fields, d, scales = _nonperiodic_case()
+    rng = np.random.default_rng(7)
+    ds = xr.concat([ds, ds + rng.normal(size=1).astype(np.float32)], "time")
+    ds = xr.concat([ds, ds.assign_coords(z=ds.z + 3)], "z").assign_coords(time=[0.0, 1.0])
+    kw = dict(scales=scales, divergence_correction=True, vertical_advection=True,
+              increment_components=("u", "v"))
+    whole = inter_scale_kinetic_energy_transfer(ds.load(), allow_rechunk=False, **kw).compute()
+    for label, data, rechunk in (("time, z chunks", ds.chunk({"time": 1, "z": 1}), False),
+                                 ("automatic rechunk", ds.chunk({"time": 1, "z": 2}), True)):
+        out = inter_scale_kinetic_energy_transfer(data, allow_rechunk=rechunk, **kw).compute()
+        for key in ("energy_transfer", "energy_transfer_generalized"):
+            assert np.array_equal(out[key].transpose(*whole[key].dims).values,
+                                  whole[key].values), (label, key)
+        print(f"  {label}: identical to one block")
+
+
+def _cli_case(tmp):
+    """Small netCDF file with a stretched vertical grid and a sheared mean wind."""
+    n, nz, d = 32, 9, 2000.0
+    x = np.arange(n) * d
+    z = 1000.0 * np.arange(1, nz + 1) ** 1.5
+    rng = np.random.default_rng(19)
+    X, Y = np.meshgrid(x, x, indexing="xy")
+    L = n * d
+
+    def field(amp, mean):
+        out = np.zeros((nz, n, n))
+        for _ in range(8):
+            kx, ky = rng.integers(-3, 4, 2)
+            m = 2 * np.pi / rng.uniform(5e3, 20e3)
+            ph = 2 * np.pi * (kx * X + ky * Y) / L + rng.uniform(0, 6.3)
+            out += rng.normal() * np.cos(ph[None] + m * z[:, None, None])
+        return (amp * out + mean * (z / z[-1])[:, None, None])[None].astype(np.float32)
+
+    dims = ("time", "height", "y", "x")
+    ds = xr.Dataset({"u": (dims, field(2.0, 15.0)), "v": (dims, field(2.0, -6.0)),
+                     "w": (dims, field(0.3, 0.0))},
+                    coords={"time": [0.0], "height": ("height", z, {"units": "m"}),
+                            "y": ("y", x, {"units": "m"}), "x": ("x", x, {"units": "m"})})
+    for name in ("u", "v", "w"):
+        ds[name].attrs["units"] = "m s-1"
+    path = tmp / "stretched.nc"
+    ds.to_netcdf(path)
+    return path, ds.rename(height="z"), z
+
+
+def test_compute_cli_generalized_transfer(tmp_path=None):
+    """budget compute with the generalized transfer, end to end: YAML and command-line options
+    reach the computation, the level mean is removed, and dz u is taken on the full column
+    before the levels are selected."""
+    import tempfile
+    from pathlib import Path
+    import yaml
+    from budget.client import main
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    path, ds, z = _cli_case(tmp)
+    levels, scales = [float(z[2]), float(z[4]), float(z[6])], [5000.0, 9000.0]
+    config = {"input": {"path": str(path), "dims": ["height", "y", "x"]},
+              "output": {"path": str(tmp / "out.nc"), "store": "netcdf"},
+              "compute": {"mode": "scale_transfer", "scales": scales, "levels": levels,
+                          "client": False, "divergence_correction": True},
+              "variables": {"u": "u", "v": "v", "w": "w"}}
+    with open(tmp / "config.yaml", "w") as fh:
+        yaml.safe_dump(config, fh)
+    main(["compute", str(tmp / "config.yaml"), "--no-client", "--vertical-advection",
+          "--perturbation", "--increment-components", "u,v"])
+    out = xr.open_dataset(tmp / "out.nc")
+
+    kw = dict(scales=np.array(scales), divergence_correction=True, vertical_advection=True,
+              increment_components=("u", "v"), allow_rechunk=False)
+    full = inter_scale_kinetic_energy_transfer(ds, perturbation=True, **kw).sel(z=levels)
+    selected = inter_scale_kinetic_energy_transfer(ds.sel(z=levels), perturbation=True, **kw)
+    ground = inter_scale_kinetic_energy_transfer(ds, **kw).sel(z=levels)
+
+    key = "energy_transfer_generalized"
+    got = out[key].transpose(*full[key].dims).values
+    size = float(np.abs(full[key]).max())
+    err = float(np.abs(got - full[key].values).max()) / size
+    off_levels = float(np.abs(got - selected[key].values).max()) / size
+    off_frame = float(np.abs(got - ground[key].values).max()) / size
+    print(f"  CLI vs full-column perturbation transfer: {err:.1e}; vs shear on selected levels: "
+          f"{off_levels:.2f}; vs ground frame: {off_frame:.2f}")
+    assert err < 1e-5, err
+    assert off_levels > 1e-2 and off_frame > 1e-2        # both choices are visible
+    assert np.allclose(out["energy_transfer"].transpose(*full[key].dims).values,
+                       full["energy_transfer"].values, rtol=0, atol=1e-6 * size)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -719,9 +1318,10 @@ def test_staggered_flux_divergence_telescopes():
 
 
 def test_compute_budget_with_half_level_w():
-    """compute_budget detects a Lorenz-staggered w_half and returns finite terms."""
+    """compute_budget detects a Lorenz-staggered w_half and returns finite terms; every output
+    carries its own metadata (staggered and collocated), not the attributes of its inputs."""
     from types import SimpleNamespace
-    from budget.budget import compute_budget
+    from budget.budget import compute_budget, _BUDGET_META
     n = 16
     f, full, half, zf, zh, dx = _lorenz_case(levels_per_lambda=8, n=n, depth=12000.0)
     theta = full(250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + f("t", zf))
@@ -733,10 +1333,125 @@ def test_compute_budget_with_half_level_w():
     ds["w"] = _collocated(ds["w_half"], zf)
     cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
                                                   transfer_form="flux", rechunk_spatial=False))
+    ds["theta"].attrs.update(standard_name="air_potential_temperature", units="K")
+    ds["w_half"].attrs.update(standard_name="upward_air_velocity", units="m s-1")
+    ds["w"].attrs.update(standard_name="upward_air_velocity", units="m s-1")
     out = compute_budget(ds, cfg).compute()
     assert all(bool(np.isfinite(out[k]).all()) for k in out.data_vars)
     for k in ("vf_hke", "vfd_dke", "vf_pres", "vfd_pres", "cad", "caz", "np_vke", "div_hke"):
         assert k in out
+    collocated = compute_budget(ds.drop_vars("w_half"), cfg)
+    for label, budget in (("staggered", out), ("collocated", collocated)):
+        for k, da in budget.data_vars.items():
+            want = dict(zip(("standard_name", "long_name", "units"), _BUDGET_META[k]))
+            assert da.attrs == want, (label, k, da.attrs)
+    print(f"  metadata of all {len(out.data_vars)} outputs from the table (staggered, collocated)")
+
+
+def _vke_wave(dz, n, lam_z=20e3, z0=60e3, depth=24e3, lam_x=60e3, U=40.0, W0=2.0, H=7e3,
+              theta0=300.0, N=0.02, harmonic=0.5, beta=0.7):
+    """Gravity wave whose VKE budget terms are known exactly.
+
+    theta_bar = theta0 exp(a z) (N constant), pi_bar exactly hydrostatic, uniform wind U. w and
+    Phi = c_p theta_bar pi' grow as exp(z / 2H) and carry a second harmonic (so that the cubic
+    terms have a non-zero mean); theta' = (theta_bar / g)(c_p theta_bar dz pi' + U dx w), so that
+    the linear w equation holds and B + P = (w, U dx w) = 0 while B and P are large.
+    Returns the full and half levels, x, and a function of z giving the fields and their exact
+    derivatives.
+    """
+    from budget.constants import cp, g
+    a = N ** 2 / g
+    zh = np.arange(z0 - depth / 2, z0 + depth / 2 + 0.5 * dz, dz)
+    zf = 0.5 * (zh[1:] + zh[:-1])
+    x = np.arange(n) * 2 * lam_x / n
+    k, m = 2 * np.pi / lam_x, 2 * np.pi / lam_z
+    F0 = U * (m / k) * W0
+
+    def fields(z):
+        Z, Y, X = np.meshgrid(z, x, x, indexing="ij")
+        ph = k * X + m * Z
+        grow = np.exp((Z - z0) / (2 * H))
+        cos_ = np.cos(ph) + harmonic * np.cos(2 * ph + beta)
+        sin_ = np.sin(ph) + 2 * harmonic * np.sin(2 * ph + beta)
+        th_bar = theta0 * np.exp(a * Z)
+        w = W0 * grow * cos_
+        dxw = -k * W0 * grow * sin_
+        phi = F0 * grow * cos_
+        dz_pi = (F0 * grow * (cos_ / (2 * H) - m * sin_) - a * phi) / (cp * th_bar)
+        return dict(w=w, dzw=W0 * grow * (cos_ / (2 * H) - m * sin_), dxw=dxw,
+                    u=U - (m / k) * w, th_bar=th_bar, pi_bar=1.0 + g / (cp * theta0 * a)
+                    * (np.exp(-a * Z) - 1.0), pi_p=phi / (cp * th_bar), dz_pi_p=dz_pi,
+                    th_p=th_bar / g * (cp * th_bar * dz_pi + U * dxw))
+
+    return zf, zh, x, fields
+
+
+def test_vke_budget_synthetic_gravity_wave():
+    """The VKE terms of compute_budget converge to their exact values at second order.
+
+    VKE equation (dry): d/dt (w, w)/2 = (w, -u.grad w - w dz w - c_p theta dz pi - g)_k, split as
+    advection pi_vke + vfd_vke + j_vke + div_vke = -(w, u.grad w + w dz w)_k,
+    caz = B + P = (g/theta_bar)(w, theta') - c_p theta_bar (w, dz pi'), np_vke = -c_p (w, theta' dz pi').
+    In the test wave B + P = 0 exactly while B and P are large, as in mountain waves, so the
+    error of caz is the discretization error of a near-cancellation. Halving dz and dx must
+    reduce every error by about 4, for native half-level w (staggered) and interpolated w.
+    """
+    from types import SimpleNamespace
+    from budget.budget import compute_budget
+    from budget.constants import cp, g, Rd
+
+    def exact(zf, x, fields):
+        f = fields(zf)
+        pert = lambda q: q - q.mean((1, 2), keepdims=True)
+        mean = lambda q: q.mean((1, 2))
+        w, th_bar = pert(f["w"]), f["th_bar"][:, 0, 0]
+        return dict(adv=-mean(w * pert(f["u"] * f["dxw"] + f["w"] * f["dzw"])),
+                    P=-cp * th_bar * mean(w * pert(f["dz_pi_p"])),
+                    BP=g / th_bar * mean(w * pert(f["th_p"])) - cp * th_bar * mean(w * pert(f["dz_pi_p"])),
+                    N=-cp * mean(w * pert(f["th_p"] * f["dz_pi_p"])))
+
+    def computed(zf, zh, x, fields, staggered):
+        f, fh = fields(zf), fields(zh)
+        da = lambda a: xr.DataArray(a, dims=("z", "y", "x"), coords={"z": zf, "y": x, "x": x})
+        theta, exner = f["th_bar"] + f["th_p"], f["pi_bar"] + f["pi_p"]
+        pres = 1e5 * exner ** (cp / Rd)
+        w_half = xr.DataArray(fh["w"], dims=("z_half", "y", "x"),
+                              coords={"z_half": zh, "y": x, "x": x})
+        ds = xr.Dataset({"u": da(f["u"]), "v": da(np.zeros_like(f["u"])),
+                         "w": _collocated(w_half, zf), "theta": da(theta), "pressure": da(pres),
+                         "density": da(pres / (Rd * theta * exner))})
+        if staggered:
+            ds["w_half"] = w_half
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=x[1] - x[0], dy=x[1] - x[0],
+                                                      cumulative=True, transfer_form="flux",
+                                                      rechunk_spatial=False))
+        with _NoTaper():
+            out = compute_budget(ds, cfg).compute()
+        tot = {k: out[k].isel(wavenumber=0).values for k in
+               ("pi_vke", "vfd_vke", "j_vke", "div_vke", "caz", "np_vke")}
+        return dict(adv=tot["pi_vke"] + tot["vfd_vke"] + tot["j_vke"] + tot["div_vke"],
+                    BP=tot["caz"], N=tot["np_vke"])
+
+    errors = {}
+    for dz, n in ((500.0, 96), (250.0, 192)):
+        zf, zh, x, fields = _vke_wave(dz, n)
+        ex = exact(zf, x, fields)
+        inner = (zf > 54e3) & (zf < 66e3)
+        p_scale = np.abs(ex["P"][inner]).mean()
+        for staggered in (True, False):
+            got = computed(zf, zh, x, fields, staggered)
+            for key in ("adv", "N", "BP"):
+                scale = p_scale if key == "BP" else np.abs(ex[key][inner]).mean()
+                errors[dz, staggered, key] = float(np.abs(got[key] - ex[key])[inner].mean() / scale)
+    for staggered in (True, False):
+        label = "staggered " if staggered else "collocated"
+        coarse = [errors[500.0, staggered, k] for k in ("adv", "N", "BP")]
+        fine = [errors[250.0, staggered, k] for k in ("adv", "N", "BP")]
+        print(f"  {label}: errors at dz = 500 / 250 m (advection, N, B + P relative to |P|): "
+              + ", ".join(f"{c:.4f} / {f:.4f}" for c, f in zip(coarse, fine)))
+        for c, f in zip(coarse, fine):
+            assert c / f > 3.0, (label, c, f)                  # second-order convergence
+            assert f < 0.015, (label, f)
 
 
 def test_staggered_outputs_have_zarr_compatible_chunks():
@@ -867,9 +1582,21 @@ if __name__ == "__main__":
              test_density_weighted_closure_hke_vke_ape, test_pressure_work_closure,
              test_vertical_pressure_buoyancy_closure, test_layer_integral_gives_boundary_flux,
              test_fft_path_matches_exact_lattice_nonperiodic, test_shift_fallback_close_to_exact,
+             test_divergence_correction_matches_increment_form,
+             test_generalized_dell_closes_local_budget,
+             test_generalized_transfer_equals_kernel_weighted_spectral_transfer,
+             test_generalized_transfer_with_w_equals_hke_plus_vke,
+             test_perturbation_frame,
+             test_generalized_transfer_closed_form_triad,
+             test_generalized_transfer_closed_form_boussinesq_wave,
+             test_correction_divergence_source, test_correction_error_paths,
+             test_correction_geographic_grid,
+             test_correction_independent_of_chunking,
+             test_compute_cli_generalized_transfer,
              test_vertical_operators_exact_for_linear_profiles,
              test_staggered_conversions_and_dwdz_more_accurate,
              test_staggered_flux_divergence_telescopes, test_compute_budget_with_half_level_w,
+             test_vke_budget_synthetic_gravity_wave,
              test_staggered_outputs_have_zarr_compatible_chunks,
              test_write_guard_makes_any_chunks_zarr_safe,
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,

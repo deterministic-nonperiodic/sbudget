@@ -372,6 +372,7 @@ def _coord_is_degrees(
 
     return False
 
+
 def _coord_is_meter(c: xr.DataArray) -> bool:
     """Checks if the coordinate units are meter-like."""
     u = _get_units_str(c)

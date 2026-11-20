@@ -11,9 +11,10 @@ from dask.diagnostics import ProgressBar
 from dask.distributed import progress
 
 from .cf_coords import _cf_guess
-from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter
+from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter, get_spatial_dims
 from .cf_coords import convert_units, check_convert_units
 from .memory_manager import CacheManager
+from .numeric_tools import vertical_derivative
 
 _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git',
                  'institution': 'Leibniz Institute for Atmospheric Physics (IAP)',
@@ -46,7 +47,8 @@ def ensure_vertical_consistent(ds: xr.Dataset | xr.DataArray, target_name="z",
                     z_half = convert_units(z_half, "km", "m")
                 w_half = (ds["w"].rename({z_dim: "z_half"})
                           .assign_coords(z_half=("z_half", np.asarray(z_half.values, dtype=float))))
-                print(f"Keeping native half-level w ({z_dim} -> z_half, {w_half.sizes['z_half']} levels)")
+                print(
+                    f"Keeping native half-level w ({z_dim} -> z_half, {w_half.sizes['z_half']} levels)")
                 break
 
     for z_dim in z_candidate:
@@ -236,6 +238,21 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
     ds = ensure_vertical_consistent(ds, target_name='z',
                                     keep_native_w=(mode == "spectral_budget"))
 
+    # Perturbation frame for scale_transfer: remove the level-mean horizontal wind first, so
+    # that ∂z below is the derivative of the perturbation
+    if mode == "scale_transfer" and getattr(cfg.compute, "perturbation", False):
+        y_d, x_d = get_spatial_dims(ds)
+        ds["u"] = ds["u"] - ds["u"].mean((y_d, x_d))
+        ds["v"] = ds["v"] - ds["v"].mean((y_d, x_d))
+
+    # The vertical-advection term of scale_transfer needs ∂z of each velocity component on the
+    # selected levels: differentiate the full column first (the centred operator of the
+    # spectral budget)
+    if mode == "scale_transfer" and getattr(cfg.compute, "vertical_advection", False):
+        for v in ("u", "v", "w"):
+            if v in ds:
+                ds[f"dz{v}"] = vertical_derivative(ds[v], "z")
+
     # select specified vertical levels
     if levels is not None and mode == "scale_transfer":
         ds = ds.sel(z=levels, method='nearest')
@@ -315,7 +332,7 @@ def zarr_safe_chunks(ds: xr.Dataset) -> xr.Dataset:
         print(f"[I/O] Rechunked {len(fixes)} variable(s) to uniform chunks for zarr: "
               f"{', '.join(sorted(fixes))}")
         ds = ds.assign(fixes)
-    for name in ds.data_vars:            # stale encodings would re-impose the old chunks
+    for name in ds.data_vars:  # stale encodings would re-impose the old chunks
         ds[name].encoding.pop("chunks", None)
         ds[name].encoding.pop("preferred_chunks", None)
     return ds
