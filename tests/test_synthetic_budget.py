@@ -190,6 +190,45 @@ def test_conservative_transfers_sum_to_zero_on_periodic_axes():
         assert t_f > 1e-3, f"{name}: flux-form residual unexpectedly small ({t_f:.1e})"
 
 
+def test_periodic_derivative_float32_coordinates():
+    """Model output often stores x and y in single precision: x = -700..700 km every 2.5 km has
+    differences scattering by ~4e-5 of the spacing. The periodic derivative accepts that grid
+    (spacing from the end points, 2500 m to 1e-9), gives the float64-coordinate result, and the
+    conservative transfers still sum to zero; a grid stretched by 0.1% is still rejected."""
+    from budget.numeric_tools import _coordinate_derivative, mark_periodic, uniform_spacing
+    # cell centres offset by 1 cm, rounded to float32 (as written by the model)
+    x32 = (np.linspace(-700e3, 700e3, 561) + 0.01).astype(np.float32)[:-1]
+    assert np.ptp(np.diff(x32.astype(float))) / 2500.0 > 1e-5          # the scatter is real
+    assert abs(uniform_spacing(xr.DataArray(x32, dims="x")) - 2500.0) < 2500.0 * 1e-9
+    x64 = np.linspace(-700e3, 700e3, 561)[:-1] + 0.01
+    values = np.sin(2 * np.pi * 3 * x64 / 1.4e6)                       # the same samples,
+    f = lambda x: xr.DataArray(values, dims="x", coords={"x": x})       # two coordinate labels
+    d32 = _coordinate_derivative(mark_periodic(f(x32).to_dataset(name="a"), ["x"])["a"], "x")
+    d64 = _coordinate_derivative(mark_periodic(f(x64).to_dataset(name="a"), ["x"])["a"], "x")
+    err = float(np.abs(d32.values - d64.values).max() / np.abs(d64.values).max())
+    print(f"  float32 vs float64 coordinates: max relative difference {err:.1e}")
+    assert err < 1e-6
+
+    stretched = 2500.0 * np.cumsum(np.linspace(1.0, 1.001, 560))
+    assert uniform_spacing(xr.DataArray(stretched, dims="x")) is None
+    try:
+        _coordinate_derivative(mark_periodic(f(stretched).to_dataset(name="a"), ["x"])["a"], "x")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a stretched periodic grid was accepted")
+
+    u, v, w, th, dx = _random_3d_fields(seed=7, n=40, w_amp=1.0)
+    as32 = lambda a: a.assign_coords(x=a.x.astype(np.float32) - 7.0e5, y=a.y.astype(np.float32) - 7.0e5)
+    u, v, w, th = _periodic(*(as32(a) for a in (u, v, w, th)))
+    with _Spectral(True, "linear"):
+        cons, flux = _all_transfers(u, v, w, th, True), _all_transfers(u, v, w, th, False)
+    for name in cons:
+        scale = float(np.abs(isotropize(flux[name], dx, dx, cumulative=True)).max())
+        t_c = float(np.abs(_shell_sum(cons[name], dx)).max()) / scale
+        assert t_c < 1e-12, f"{name}: float32 coordinates, sum_k T = {t_c:.1e} max|Pi|"
+
+
 def test_conservative_and_flux_forms_converge():
     """Both forms discretize the same transfer: their difference is second order in dx."""
     diffs = []
@@ -1898,6 +1937,7 @@ if __name__ == "__main__":
              test_write_guard_makes_any_chunks_zarr_safe,
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
              test_cartesian_grid_is_not_global,
+             test_periodic_derivative_float32_coordinates,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,
              test_conservative_and_flux_forms_converge,
              test_periodic_axes_skip_taper_and_linear_detrend,
