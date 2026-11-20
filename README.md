@@ -25,7 +25,7 @@ co-spectrum summed over the wavenumber shell $k$:
 * $T_h(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales); sums to zero over
   $k$ on a periodic domain.
 * $L_h(k)$ — linear **spectral transfer** of HKE due to Coriolis.
-* $`F_{h\uparrow} = -\tfrac12(\mathbf{u}, w\mathbf{u})_k`$, $`F_{A\uparrow}`$ — **vertical flux** of energy
+* $F_{h\uparrow} = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, $F _{A\uparrow}$ — **vertical flux** of energy
   (positive downward, so $\partial_z F > 0$ is a gain).
 * $F_{p\uparrow} = -c_p\bar\theta(w,\pi')_k$ — vertical **pressure** flux.
 * $J_h = F_{h\uparrow}\partial_z\ln\bar\rho$, $J_A = F_{A\uparrow}\partial_z\ln(\bar\rho/\gamma)$,
@@ -76,13 +76,11 @@ choice matters there only for telescoping and closure.
 Every nonlinear transfer sums to zero over wavenumbers on a periodic domain. On the grid this
 holds only if the advection of a quantity $a$ is written in skew-symmetric form,
 
-```math
-\tfrac12\left[(\mathbf{u}\cdot\nabla)a + \nabla\cdot(\mathbf{u}\,a)\right],
-```
+$$\tfrac12\left[(\mathbf{u}\cdot\nabla)a + \nabla\cdot(\mathbf{u}\,a)\right],$$
 
 with a centred difference that wraps around: `transfer_form: conservative` (the default) uses
 this form for the HKE, VKE and APE transfers, and its sum is zero to round-off. The `flux` form,
-$`(\mathbf{u}\cdot\nabla)a + \tfrac12\delta\,a`$, relies on the product rule and leaves a
+$(\mathbf{u}\cdot\nabla)a + \tfrac12\delta\,a$, relies on the product rule and leaves a
 residual of a few per cent of $\max|\Pi|$ for smooth fields (more if there is energy near the
 grid scale); both forms converge to the same transfer.
 
@@ -97,10 +95,8 @@ at $k = 0$), which removes the edge jump of the periodic extension and its leaka
 taper. A taper (`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy
 flux into the window,
 
-```math
-\frac{\langle \mathbf{F}\cdot\nabla W^2\rangle}{\langle W^2\rangle},
-\qquad \mathbf{F} = \tfrac12\,\mathbf{u}\,|\mathbf{u}|^2,
-```
+$$\frac{\langle \mathbf{F}\cdot\nabla W^2\rangle}{\langle W^2\rangle},
+\qquad \mathbf{F} = \tfrac12\,\mathbf{u}\,|\mathbf{u}|^2,$$
 
 which projects onto the largest scales, grows with the mean wind along the tapered axis and can
 exceed the inter-scale transfer itself.
@@ -118,11 +114,9 @@ sbudget compute config.yaml --mode spectral_budget --periodic-axes x     # decla
 On a domain bounded in $y$, the sum over all wavenumbers ($k = 0$ included) is the energy flux
 through the walls,
 
-```math
-\sum_k T(k) = -\frac{1}{L_y}\Big[\big\langle \tfrac12\, v\,|\mathbf{u}|^2 \big\rangle_x\Big]_{y_S}^{y_N},
-```
+$$\sum_k T(k) = -\frac{1}{L_y}\Big[\big\langle \tfrac12\, v\,|\mathbf{u}|^2 \big\rangle_x\Big]_{y_S}^{y_N},$$
 
-and $`\Pi(k_{min})`$ is the part of it that reaches $k > 0$.
+and $\Pi(k_{min})$ is the part of it that reaches $k > 0$.
 
 #### Features
 
@@ -159,12 +153,10 @@ term of $(a_i - b_i)\sum_j (a_j - b_j)^2$ is a product of a field at $\mathbf{x}
 $\mathbf{x}+\mathbf{s}$, so the sum over shifts reduces to correlations
 $(K_i \star F)(\mathbf{x}) = \sum_{\mathbf{s}} K_i(\mathbf{s})F(\mathbf{x}+\mathbf{s})$:
 
-```math
-\mathcal{T}_\ell = \sum_i K_i\star(u_i|\mathbf{u}|^2)
-- 2\sum_j b_j \sum_i K_i\star(u_i u_j) + |\mathbf{b}|^2 \sum_i K_i\star u_i
-- \sum_i b_i\, K_i\star|\mathbf{u}|^2 + 2\sum_{i,j} b_i b_j\, K_i\star u_j
-- |\mathbf{b}|^2 \sum_i b_i \sum_{\mathbf{s}} K_i(\mathbf{s}),
-```
+$$\mathcal{T}_\ell = \sum_i K_i\star(u_i|\mathbf{u}|^2) -
+2\sum_j b_j \sum_i K_i\star(u_i u_j) + |\mathbf{b}|^2 \sum_i K_i\star u_i -
+\sum_i b_i\, K_i\star|\mathbf{u}|^2 + 2\sum_{i,j} b_i b_j\, K_i\star u_j -
+|\mathbf{b}|^2 \sum_i b_i \sum_{\mathbf{s}} K_i(\mathbf{s}),$$
 
 with $i$ over the horizontal and $j$ over all velocity components. Each plane is padded with the
 boundary extension (`reflect`, `wrap`, `symmetric`, `edge`) by the largest shift, so the circular
@@ -186,12 +178,10 @@ $\mathcal{T}_\ell$ assumes non-divergent flow advected horizontally. To compare 
 with the spectral budget in divergent flow with vertical motion (e.g. gravity waves), the
 generalized transfer
 
-```math
-\mathcal{T}^*_\ell = \mathcal{T}_\ell - C_\ell + V_\ell, \qquad
-C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}}
-- \tfrac14\,|\mathbf{u}|^2\,\bar\delta - \tfrac14\,\delta\,\overline{|\mathbf{u}|^2}, \qquad
-V_\ell = \tfrac12\,w\left(\bar{\mathbf{u}}\cdot\partial_z\mathbf{u} - \mathbf{u}\cdot\partial_z\bar{\mathbf{u}}\right)
-```
+$$\mathcal{T}^*_\ell = \mathcal{T}_\ell - C_\ell + V_\ell, \qquad
+C_\ell = \tfrac14\,\delta\,(\mathbf{u}\cdot\bar{\mathbf{u}}) + \tfrac14\,\mathbf{u}\cdot\overline{\delta\mathbf{u}} -
+\tfrac14\,|\mathbf{u}|^2\,\bar\delta - \tfrac14\,\delta\,\overline{|\mathbf{u}|^2}, \qquad
+V_\ell = \tfrac12\,w\left(\bar{\mathbf{u}}\cdot\partial_z\mathbf{u} - \mathbf{u}\cdot\partial_z\bar{\mathbf{u}}\right)$$
 
 ($\delta$ the horizontal divergence, bar the filter of $\mathcal{T}_\ell$) has a domain mean equal
 to the flux-form spectral transfer seen through the same filter, $\sum_k T(k)\,[1-\hat G(k\ell)]$.
@@ -201,7 +191,7 @@ It is written to `energy_transfer_generalized`; `energy_transfer` is unchanged.
 sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection
 ```
 
-The increments contain $u, v$ by default, so $`\mathcal{T}_\ell`$ and $`\mathcal{T}^*_\ell`$ are HKE
+The increments contain $u, v$ by default, so $\mathcal{T} _\ell$ and $\mathcal{T}^{\ast} _\ell$ are HKE
 transfers and $w$ enters only as advecting velocity; `--increment-components u,v,w` adds the
 transfer of vertical kinetic energy (the counterpart of the spectral HKE + VKE transfers).
 
