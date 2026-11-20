@@ -247,6 +247,36 @@ def test_compute_cli_conservative_periodic(tmp_path=None):
         assert err < 1e-3, (k, err)     # float32 storage: theta' ~ 1 K on 250 K
 
 
+def test_spatial_dims_from_units_and_axes():
+    """Horizontal dimensions are found from units and CF axes, not names: model output may
+    label metric x, y "longitude"/"latitude" (Cartesian), degree x, y are geographic, and
+    lat/lon may come in either order."""
+    from budget.cf_coords import get_spatial_dims, is_geographic_grid
+    n = np.arange(4.0)
+
+    def case(dims, attrs, values=(n * 5000.0, n * 5000.0)):
+        coords = {d: (d, v, a) for d, v, a in zip(dims, values, attrs)}
+        coords["height"] = ("height", [1.0, 2.0], {"units": "m", "axis": "Z"})
+        da = xr.DataArray(np.zeros((2, 4, 4)), dims=("height",) + dims, coords=coords)
+        return da, get_spatial_dims(da)
+
+    icon = ({"long_name": "latitude", "units": "m", "axis": "Y"},
+            {"long_name": "longitude", "units": "m", "axis": "X"})
+    da, dims = case(("y", "x"), icon)
+    assert dims == ("y", "x") and not is_geographic_grid(da.x, da.y)
+    da, dims = case(("x", "y"), icon[::-1])                                 # transposed
+    assert dims == ("y", "x")
+    deg = ({"standard_name": "latitude", "units": "degrees_north"},
+           {"standard_name": "longitude", "units": "degrees_east"})
+    da, dims = case(("y", "x"), deg, values=(n * 10.0, n * 30.0))
+    assert dims == ("y", "x") and is_geographic_grid(da.x, da.y)            # was ("y", "y")
+    da, dims = case(("lon", "lat"), deg[::-1], values=(n * 30.0, n * 10.0))
+    assert dims == ("lat", "lon")
+    da, dims = case(("rlat", "rlon"), ({"axis": "Y", "units": "m"}, {"axis": "X", "units": "m"}))
+    assert dims == ("rlat", "rlon")                                          # any names, by axis
+    print("  metric x/y, degree x/y, lat/lon, axis-only: dimensions resolved")
+
+
 def test_cross_spectrum_parseval_with_mean_and_no_detrend():
     """Sum over all modes of the cross spectrum equals the domain mean of the product, with a
     non-zero mean and detrending off (the mean was once restored at k = 0 a second time)."""
@@ -1764,7 +1794,8 @@ if __name__ == "__main__":
              test_periodic_axes_skip_taper_and_linear_detrend,
              test_compute_budget_conservative_periodic_axes,
              test_cross_spectrum_parseval_with_mean_and_no_detrend,
-             test_compute_cli_conservative_periodic]
+             test_compute_cli_conservative_periodic,
+             test_spatial_dims_from_units_and_axes]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")

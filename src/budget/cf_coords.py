@@ -106,104 +106,6 @@ def _cf_guess(ds: xr.Dataset, target: str) -> str | None:
     return None
 
 
-def _find_coordinate(ds: xr.Dataset, name: str,
-                     raise_notfound: bool = True,
-                     check_duplicates: bool = False) -> xr.DataArray | None:
-    """
-    Find a dimension coordinate in a Dataset using CF conventions.
-    
-    Searches for coordinates by:
-    1. Exact name match
-    2. CF convention attributes (standard_name, axis, units)
-    
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Dataset to search
-    name : str
-        Coordinate type to find ('lat', 'lon', 'level')
-    raise_notfound : bool
-        If True, raise ValueError when coordinate not found
-    check_duplicates : bool
-        If True, raise ValueError when multiple candidates found
-        
-    Returns
-    -------
-    xr.DataArray or None
-        The found coordinate, or None if not found and raise_notfound=False
-    """
-    # Try exact name match first
-    coord = ds.coords.get(name)
-    if coord is not None:
-        return coord
-
-    if name not in _CF_COORDS_LOOKUP:
-        raise ValueError(
-            f"Unknown coordinate type: {name}. Must be one of {list(_CF_COORDS_LOOKUP.keys())}")
-
-    criteria = _CF_COORDS_LOOKUP[name]
-
-    # Build predicate function based on available criteria
-    def matches_criteria(c: xr.DataArray) -> bool:
-        # Check name
-        if 'names' in criteria and c.name in criteria['names']:
-            return True
-
-        # Check standard_name attribute
-        if 'standard_name' in criteria:
-            std_name = c.attrs.get('standard_name', '').strip().lower()
-            expected = criteria['standard_name']
-            if isinstance(expected, str):
-                if std_name == expected:
-                    return True
-            elif isinstance(expected, tuple):
-                if std_name in expected:
-                    return True
-
-        # Check axis attribute
-        if 'axis' in criteria:
-            axis = c.attrs.get('axis', '').strip().upper()
-            expected = criteria['axis']
-            if isinstance(expected, str):
-                if axis == expected:
-                    return True
-            elif isinstance(expected, tuple):
-                if axis in expected:
-                    return True
-
-        # Check units hints
-        if 'units_hints' in criteria:
-            units = c.attrs.get('units', '').strip().lower()
-            if any(hint in units for hint in criteria['units_hints']):
-                return True
-
-        # Check units (for level coordinate)
-        if 'units' in criteria:
-            units = c.attrs.get('units', '').strip().lower()
-            expected = criteria['units']
-            if isinstance(expected, tuple):
-                if units in expected:
-                    return True
-
-        return False
-
-    # Search through dimension coordinates
-    candidates = [ds.coords[dim] for dim in ds.dims if matches_criteria(ds.coords[dim])]
-
-    if check_duplicates and len(candidates) > 1:
-        raise ValueError(f"Multiple {name} coordinates found: {[c.name for c in candidates]}")
-
-    if not candidates:
-        if raise_notfound:
-            raise ValueError(
-                f"The coordinate '{name}' is not in the dataset or is "
-                f"inconsistent with CF conventions. Available dims: {list(ds.dims)}"
-            )
-        return None
-
-    return candidates[0]
-
-
 # from Metpy
 # Create a pint UnitRegistry object
 UNITS_REG = pint.UnitRegistry()
@@ -478,6 +380,11 @@ def _is_geographic(coord: xr.DataArray, coord_type: str) -> bool:
     standard_name = str(coord.attrs.get("standard_name", "")).lower()
     axis = str(coord.attrs.get("axis", "")).upper()
 
+    # A coordinate in metres is Cartesian whatever it is called: some model output
+    # labels metric x, y "longitude", "latitude"
+    if _coord_is_meter(coord):
+        return False
+
     # Check axis (most reliable for CF compliance)
     expected_axis = lookup.get("axis")
     if axis and axis == expected_axis:
@@ -604,9 +511,10 @@ def get_spatial_dims(obj: Union[xr.Dataset, xr.DataArray]) -> Tuple[str, str]:
     Robustly determine horizontal dimensions using CF conventions.
 
     Priority:
-    1) CF-compliant lat/lon coordinates as 1-D dimensions
-    2) Projected y/x coordinates with 2-D auxiliary lat/lon
-    3) Plain y/x dimensions
+    1) Geographic lat/lon dimension coordinates (degree units, direction-aware; a coordinate in
+       metres is never geographic, whatever its name or long_name)
+    2) Dimensions with CF axis attributes Y and X
+    3) Plain y/x dimensions (projected grids, with or without 2-D auxiliary lat/lon)
     4) Fallback: last two dimensions if they look spatial
     
     Returns
@@ -616,34 +524,27 @@ def get_spatial_dims(obj: Union[xr.Dataset, xr.DataArray]) -> Tuple[str, str]:
     """
     ds = obj if isinstance(obj, xr.Dataset) else obj.to_dataset(name="_tmp")
     dims = set(ds.dims)
+    # 1-D dimension coordinates, in dimension order
+    dim_coords = [ds[d] for d in ds.dims if d in ds.coords and ds[d].ndim == 1]
 
-    # Case A: Try to find CF-compliant lat/lon as 1-D dimensions
-    try:
-        lat_coord = _find_coordinate(ds, 'lat', raise_notfound=False)
-        lon_coord = _find_coordinate(ds, 'lon', raise_notfound=False)
+    def _pick(candidates, preferred):
+        exact = [c for c in candidates if str(c.name).lower() in preferred]
+        return (exact or candidates)[0].name if candidates else None
 
-        if lat_coord is not None and lon_coord is not None:
-            # Check if they are 1-D dimension coordinates
-            if (lat_coord.name in dims and lon_coord.name in dims and
-                    lat_coord.ndim == 1 and lon_coord.ndim == 1):
-                return str(lat_coord.name), str(lon_coord.name)
-    except ValueError:
-        pass
+    # Case A: geographic lat/lon dimensions (direction-aware: degrees_east is never latitude,
+    # metres never geographic), two distinct dimensions
+    lat = _pick([c for c in dim_coords if _is_geographic(c, "lat")], ("lat", "latitude"))
+    lon = _pick([c for c in dim_coords if _is_geographic(c, "lon")], ("lon", "longitude"))
+    if lat is not None and lon is not None and lat != lon:
+        return str(lat), str(lon)
 
-    # Case B: Check for standard lat/lon names as 1-D dims (fallback)
-    if "lat" in dims and "lon" in dims:
-        if ds["lat"].ndim == 1 and ds["lon"].ndim == 1:
-            # Verify they look geographic
-            if _is_geographic(ds["lat"], "lat") and _is_geographic(ds["lon"], "lon"):
-                return "lat", "lon"
+    # Case B: Cartesian axes declared by the CF axis attribute (any names)
+    axis_of = {str(c.attrs.get("axis", "")).strip().upper(): c.name for c in dim_coords}
+    if "Y" in axis_of and "X" in axis_of and axis_of["Y"] != axis_of["X"]:
+        return str(axis_of["Y"]), str(axis_of["X"])
 
-    # Case C: Projected axes with 2-D auxiliary lat/lon(y,x)
+    # Case C: Projected y/x dimensions (with or without 2-D auxiliary lat/lon(y, x))
     if {"y", "x"} <= dims:
-        # Check if there are 2-D lat/lon coordinates
-        if "lat" in ds.coords and "lon" in ds.coords:
-            if ds["lat"].dims == ("y", "x") and ds["lon"].dims == ("y", "x"):
-                return "y", "x"
-        # Plain y/x without auxiliary coords
         return "y", "x"
 
     # Case D: Fallback - use last two dimensions if they look spatial
