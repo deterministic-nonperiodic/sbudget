@@ -151,8 +151,8 @@ transfer of vertical kinetic energy (the counterpart of the spectral HKE + VKE t
 The same options are `compute:` keys in the YAML (`divergence_correction`, `vertical_advection`,
 `perturbation`, `increment_components`). Unlike $\mathcal{T}_\ell$, the correction (like the
 spectral transfer) depends on the frame: a mean wind adds wave–mean-flow exchange, which
-`--perturbation` removes. Derivation, implementation, tests (including closed-form solutions)
-and validation on simulations: [docs/generalized_transfer.md](docs/generalized_transfer.md).
+`--perturbation` removes. Closed-form and synthetic tests are in
+[tests/test_synthetic_budget.py](tests/test_synthetic_budget.py).
 
 ### References:
 

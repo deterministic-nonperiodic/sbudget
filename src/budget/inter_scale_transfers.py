@@ -1142,9 +1142,8 @@ def transfer_correction(
     uniform background velocity, as T(k) does. With components ("u", "v"), D*_ℓ is the
     counterpart of the HKE transfer Π_h; with ("u", "v", "w"), of the HKE plus VKE transfers
     (the VKE transfer of the spectral budget has the same flux form, with w advected). In D_ℓ
-    the filter and r̂ are horizontal, so w enters through |δu|² only. Derivation, tests and
-    validation:
-    docs/generalized_transfer.md.
+    the filter and r̂ are horizontal, so w enters through |δu|² only. Closed-form tests:
+    tests/test_synthetic_budget.py.
 
     Parameters
     ----------
