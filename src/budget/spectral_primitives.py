@@ -7,7 +7,7 @@ from scipy.signal.windows import dpss as _dpss
 
 from .cf_coords import get_spatial_dims, _coord_is_degrees, _is_geographic
 from .constants import epsilon
-from .numeric_tools import domain_mean
+from .numeric_tools import domain_mean, is_periodic
 
 # -----------------------------
 # Global spectral configuration
@@ -87,7 +87,8 @@ def _make_taper(n: int, kind_or_spec) -> np.ndarray:
 def _taper_2d(field: xr.DataArray) -> tuple[xr.DataArray, float]:
     """Return separable 2-D taper W(lat,lon) and its mean-square for normalization.
 
-    If disabled, returns W=1 and ms=1.
+    If disabled, returns W=1 and ms=1. Along a periodic coordinate (see
+    numeric_tools.mark_periodic) the field needs no taper: W is 1 along it.
     """
     y_dim, x_dim = get_spatial_dims(field)
     ny, nx = field.sizes[y_dim], field.sizes[x_dim]
@@ -99,8 +100,8 @@ def _taper_2d(field: xr.DataArray) -> tuple[xr.DataArray, float]:
     ty_spec = taper_cfg.get("y", "hann")
     tx_spec = taper_cfg.get("x", "hann")
 
-    ty = _make_taper(ny, ty_spec)
-    tx = _make_taper(nx, tx_spec)
+    ty = _make_taper(ny, "none" if is_periodic(field[y_dim]) else ty_spec)
+    tx = _make_taper(nx, "none" if is_periodic(field[x_dim]) else tx_spec)
 
     # <Ty^2>*<Tx^2> (simple, unweighted mean)
     ms = float((ty ** 2).mean() * (tx ** 2).mean())
@@ -139,10 +140,12 @@ def _sqrt_area_weight(field: xr.DataArray) -> xr.DataArray:
 # -----------------------------
 # Utilities (internal)
 # -----------------------------
-def _detrend_2d_wls(arr: np.ndarray, weights: np.ndarray) -> np.ndarray:
+def _detrend_2d_wls(arr: np.ndarray, weights: np.ndarray, fit_y: bool = True,
+                    fit_x: bool = True) -> np.ndarray:
     """
     Core NumPy function for 2D WLS using the square root weight matrix formulation (FAST).
-    Weights are expected to be the area weights (cos(phi)).
+    Weights are expected to be the area weights (cos(phi)). fit_y, fit_x: include the linear
+    trend along y, x (False along a periodic axis, where only the mean is removed).
     """
     assert arr.ndim == 2 and weights.ndim == 2
     ny, nx = arr.shape
@@ -151,7 +154,7 @@ def _detrend_2d_wls(arr: np.ndarray, weights: np.ndarray) -> np.ndarray:
     nan_mask = np.isnan(arr)
     d_obs_flat = arr[~nan_mask]
 
-    if d_obs_flat.size < 3:
+    if d_obs_flat.size < 1 + fit_y + fit_x:
         return np.zeros((ny, nx), dtype=arr.dtype)
 
     # Weights and Sqrt(Weights)
@@ -161,7 +164,8 @@ def _detrend_2d_wls(arr: np.ndarray, weights: np.ndarray) -> np.ndarray:
     # Construct Design Matrix (G)
     idx_y = np.repeat(np.arange(ny), nx)
     idx_x = np.tile(np.arange(nx), ny)
-    G_full = np.stack([np.ones(ny * nx), idx_y, idx_x]).transpose()
+    G_full = np.stack([np.ones(ny * nx)] + ([idx_y] if fit_y else [])
+                      + ([idx_x] if fit_x else [])).transpose()
     G = G_full[~nan_mask.flatten(), :]
 
     # Transform G and d_obs using W^(1/2) (Element-wise multiplication)
@@ -193,7 +197,8 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
     detrend_type : {'constant', 'linear'}
         If ``constant``, a constant offset will be removed from each dim.
         If ``linear``, a linear least-squares fit will be estimated and removed
-        from the data.
+        from the data. Along a periodic coordinate (see numeric_tools.mark_periodic) a linear
+        trend is not part of the field and is not fitted.
 
     Returns
     -------
@@ -238,6 +243,8 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
             da, weights,
             input_core_dims=[dims, dims],
             output_core_dims=[dims],
+            kwargs={"fit_y": not is_periodic(da[dims[0]]),
+                    "fit_x": not is_periodic(da[dims[1]])},
             output_dtypes=[da.dtype],
             vectorize=True,
             dask='parallelized',

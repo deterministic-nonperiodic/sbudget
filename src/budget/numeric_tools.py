@@ -73,6 +73,35 @@ def _check_coordinate_consistency(*arrays: xr.DataArray, dims_to_check: Tuple[st
                     f"Coordinate values for dimension '{dim}' mismatch in input array {i}.")
 
 
+def is_periodic(coord: xr.DataArray) -> bool:
+    """True if the horizontal coordinate is marked periodic (attribute ``periodic``)."""
+    return bool(coord.attrs.get("periodic", False))
+
+
+def mark_periodic(ds, dims):
+    """Mark the horizontal coordinates ``dims`` periodic: derivatives along them wrap around,
+    and spectra are neither tapered nor linearly detrended along them."""
+    for dim in dims:
+        ds[dim].attrs["periodic"] = True
+    return ds
+
+
+def _coordinate_derivative(da: xr.DataArray, dim: str) -> xr.DataArray:
+    """d(da)/d[coord] by centred differences: wrapping around on a periodic coordinate (uniform
+    spacing, the same stencil everywhere), one-sided second order at the ends otherwise.
+
+    The periodic stencil is skew-adjoint, sum_i f_i (D g)_i = -sum_i g_i (D f)_i, which is what
+    makes the skew-symmetric transfers sum exactly to zero over wavenumbers.
+    """
+    coord = da[dim]
+    if not is_periodic(coord):
+        return da.differentiate(dim, edge_order=2)
+    spacing = np.diff(coord.values)
+    if not np.allclose(spacing, spacing[0], rtol=1e-6):
+        raise ValueError(f"periodic derivative along '{dim}' needs uniform spacing")
+    return (da.roll({dim: -1}) - da.roll({dim: 1})) / (2.0 * float(spacing[0]))
+
+
 def first_derivative(da: xr.DataArray, dim: str, delta: float | None = None) -> xr.DataArray:
     """
     Metric-aware first derivative along `dim` in spherical or Cartesian coordinates.
@@ -95,6 +124,8 @@ def first_derivative(da: xr.DataArray, dim: str, delta: float | None = None) -> 
     - Otherwise (Cartesian), we assume the coordinate is metric (meters) and
       return the standard coordinate derivative (already per meter). If this
       is not true in a given dataset, pass an explicit `delta` instead.
+    - Along a coordinate marked periodic (see `mark_periodic`) the centred difference wraps
+      around; otherwise it is one-sided (second order) at the ends.
     """
     if dim not in da.dims:
         raise ValueError(f"first_derivative: dim '{dim}' not in {tuple(da.dims)}")
@@ -113,7 +144,7 @@ def first_derivative(da: xr.DataArray, dim: str, delta: float | None = None) -> 
         return deriv_index / xr.full_like(deriv_index, fill_value=float(delta))
 
     # --- Coordinate-based derivative: start with d/d[coord] ---
-    deriv_coord = da.differentiate(dim, edge_order=2)
+    deriv_coord = _coordinate_derivative(da, dim)
 
     # Geographic longitude/latitude handling
     is_lon = _is_geographic(coord, "lon")
@@ -320,6 +351,19 @@ def horizontal_advection(scalar: xr.DataArray, u: xr.DataArray, v: xr.DataArray,
                          f"_due_to_horizontal_advection"
     })
     return adv
+
+
+def skew_symmetric_advection(scalar: xr.DataArray, u: xr.DataArray,
+                             v: xr.DataArray) -> xr.DataArray:
+    """Skew-symmetric horizontal advection ½[(U·∇)A + ∇·(U A)] of A by U = (u, v).
+
+    Equal to (U·∇)A + ½ (∇·U) A on the continuum, but conservative on the grid: with a
+    skew-adjoint derivative (centred differences on a periodic domain), the domain sum of
+    A times it vanishes for any U, so a transfer built from it sums to zero over wavenumbers
+    without the product rule, which no grid operator satisfies.
+    """
+    return 0.5 * (horizontal_advection(scalar, u, v) + horizontal_divergence(u * scalar,
+                                                                             v * scalar))
 
 
 # --- vector helpers for invariant-form terms ---

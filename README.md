@@ -71,6 +71,31 @@ $C_{A\to h}$ from 39% to 6%; at 8 levels, from 17% to 2–3%. The cubic flux ter
 unresolved harmonics of the product (≈40% at 5 levels for every formulation), so the operator
 choice matters there only for telescoping and closure.
 
+#### Conservative transfers and periodic axes (`--transfer-form conservative`, `--periodic-axes`)
+
+Every nonlinear transfer sums to zero over wavenumbers on a periodic domain. On the grid this
+holds only if the advection is written in skew-symmetric form, $\tfrac12[(\mathbf{u}\cdot\nabla)a
++ \nabla\cdot(\mathbf{u}\,a)]$, with a centred difference that wraps around:
+`transfer_form: conservative` uses this form for the HKE, VKE and APE transfers, and its sum is
+zero to round-off. The default `flux` form, $(\mathbf{u}\cdot\nabla)a + \tfrac12\delta\,a$, relies
+on the product rule and leaves a residual of a few per cent of $\max|\Pi|$ for smooth fields
+(more if there is energy near the grid scale); both forms converge to the same transfer.
+
+`periodic_axes: [x]` (or `[x, y]`) marks the axes on which the data are periodic; a global
+longitude always is. Along them derivatives wrap around, and spectra are neither tapered nor
+linearly detrended: the field needs neither, and both break the conservation. A taper makes
+$\sum_k T = \langle \mathbf{F}\cdot\nabla W^2\rangle / \langle W^2\rangle$ with
+$\mathbf{F} = \mathbf{u}\,|\mathbf{u}|^2/2$, which projects onto the largest scales and grows with
+the mean wind along the tapered axis (the flux-form transfer is not Galilean invariant).
+
+```bash
+sbudget compute config.yaml --mode spectral_budget --transfer-form conservative --periodic-axes x
+```
+
+On a domain bounded in $y$, $\sum_k T$ (k = 0 included) is the energy flux through the walls,
+$-[\langle v\,|\mathbf{u}|^2/2\rangle_x]_{y_S}^{y_N}/L_y$, and $\Pi(k_{min})$ is what of it reaches
+$k > 0$.
+
 #### Features
 
 - FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along

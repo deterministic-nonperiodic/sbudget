@@ -4,10 +4,12 @@ import numpy as np
 import xarray as xr
 
 from .cf_coords import get_spatial_dims, infer_grid_resolution, _is_geographic, _coord_is_degrees
+from .cf_coords import _is_global_longitude
 from .constants import cp, Omega, epsilon, g
 from .memory_manager import ensure_optimal_chunking
 from .numeric_tools import domain_mean, stack_vector, rotate_vector
-from .numeric_tools import horizontal_advection, horizontal_gradient
+from .numeric_tools import horizontal_advection, horizontal_gradient, skew_symmetric_advection
+from .numeric_tools import mark_periodic
 from .numeric_tools import horizontal_divergence, relative_vorticity
 from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize
 from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
@@ -117,6 +119,20 @@ def budget_metadata(func: Callable) -> Callable:
     return wrapper
 
 
+def periodic_dims(ds: xr.Dataset, axes=None) -> list[str]:
+    """Horizontal dimensions on which the data are periodic: those named in ``axes`` ("x"/"y"
+    or the dimension names) plus a global longitude."""
+    y_dim, x_dim = get_spatial_dims(ds)
+    names = {"x": x_dim, "y": y_dim, x_dim: x_dim, y_dim: y_dim}
+    unknown = [a for a in (axes or []) if a not in names]
+    if unknown:
+        raise ValueError(f"periodic_axes {unknown}: expected x, y, {x_dim} or {y_dim}")
+    dims = {names[a] for a in (axes or [])}
+    if _is_global_longitude(ds[x_dim]):
+        dims.add(x_dim)
+    return sorted(dims)
+
+
 # --------------------------------------------------------------------------------------------------
 # Energy budget terms
 # --------------------------------------------------------------------------------------------------
@@ -183,6 +199,7 @@ def nonlinear_hke_transfer_flux(
         v: xr.DataArray,
         w: xr.DataArray,
         divergence: Union[xr.DataArray | None] = None,
+        conservative: bool = False,
         name="pi_nke"
 ) -> xr.DataArray:
     """Nonlinear transfer term for horizontal kinetic energy (HKE), vectorized.
@@ -196,22 +213,29 @@ def nonlinear_hke_transfer_flux(
     The vertical part ½[⟨∂z U, w U⟩ - ⟨U, w ∂z U⟩] is antisymmetric, so T sums to zero over
     wavenumbers on a periodic domain, and T + ∂z F_h + Div_h equals the spectrum of the
     advective tendency -⟨U, (U·∇)U + w ∂z U⟩ exactly (Augier & Lindborg 2013).
+
+    conservative=True uses the skew-symmetric form ½[(U·∇)U + ∇·(U U)] for the horizontal part
+    (no divergence needed): equal on the continuum, but the sum over wavenumbers vanishes on
+    the grid too (periodic axes, see numeric_tools.skew_symmetric_advection). The flux form
+    relies on the product rule and leaves a discretization residual.
     """
     # Horizontal & vertical derivatives
     dzu = u.differentiate("z", edge_order=2)
     dzv = v.differentiate("z", edge_order=2)
-
-    # Divergence (compute if absent)
-    if divergence is None:
-        divergence = horizontal_divergence(u, v)
 
     # Stack vectors
     wind = stack_vector(u, v, name="wind")  # (comp=2, z, y, x, …)
     wind_shear = stack_vector(dzu, dzv, name="shear")
 
     # Advection-like vector A and transport vector wU
-    adv_u = horizontal_advection(u, u, v) + 0.5 * divergence * u
-    adv_v = horizontal_advection(v, u, v) + 0.5 * divergence * v
+    if conservative:
+        adv_u = skew_symmetric_advection(u, u, v)
+        adv_v = skew_symmetric_advection(v, u, v)
+    else:
+        if divergence is None:
+            divergence = horizontal_divergence(u, v)
+        adv_u = horizontal_advection(u, u, v) + 0.5 * divergence * u
+        adv_v = horizontal_advection(v, u, v) + 0.5 * divergence * v
 
     advection = - stack_vector(adv_u, adv_v, name="advection") - 0.5 * w * wind_shear
 
@@ -297,6 +321,7 @@ def nonlinear_vke_transfer(
         v: xr.DataArray,
         w: xr.DataArray,
         divergence: Union[xr.DataArray | None] = None,
+        conservative: bool = False,
         name="pi_vke"
 ) -> xr.DataArray:
     """Nonlinear transfer term for vertical kinetic energy (VKE), vectorized.
@@ -305,18 +330,20 @@ def nonlinear_vke_transfer(
         T = -⟨w, Aw⟩ + ½⟨∂z w, w^2⟩
     where U = (u, v),
           Aw = u ∂x w + v ∂y w + ½ div·w + ½ w ∂z w
-    (antisymmetric vertical part, as in nonlinear_hke_transfer_flux).
+    (antisymmetric vertical part, as in nonlinear_hke_transfer_flux; conservative=True: the
+    skew-symmetric horizontal part ½[U·∇w + ∇·(U w)], as there).
     """
 
     # Horizontal & vertical derivatives
     dzw = w.differentiate("z", edge_order=2)
 
-    # Divergence (compute if absent)
-    if divergence is None:
-        divergence = horizontal_divergence(u, v)
-
     # Advection-like vector A and transport vector wU
-    advection_w = horizontal_advection(w, u, v) + 0.5 * (divergence * w) + 0.5 * (w * dzw)
+    if conservative:
+        advection_w = skew_symmetric_advection(w, u, v) + 0.5 * (w * dzw)
+    else:
+        if divergence is None:
+            divergence = horizontal_divergence(u, v)
+        advection_w = horizontal_advection(w, u, v) + 0.5 * (divergence * w) + 0.5 * (w * dzw)
 
     # Spectral vector inner products (sum over components)
     t_adv = - scalar_cross_spectrum(w, advection_w)  # -⟨w, Aw⟩
@@ -335,6 +362,7 @@ def nonlinear_ape_transfer(
         theta_prime: xr.DataArray,
         gamma: xr.DataArray,
         divergence: Union[xr.DataArray | None] = None,
+        conservative: bool = False,
         name="pi_ape"
 ) -> xr.DataArray:
     """Nonlinear transfer term for available potential energy (APE), vectorized.
@@ -343,19 +371,21 @@ def nonlinear_ape_transfer(
         T = γ (-⟨theta, At⟩ + ½⟨∂z theta, w.theta⟩)
     where U = (u, v),
           At = (u ∂x theta + v ∂y theta + ½ div·theta + ½ w ∂z theta)
-    (antisymmetric vertical part, as in nonlinear_hke_transfer_flux).
+    (antisymmetric vertical part, as in nonlinear_hke_transfer_flux; conservative=True: the
+    skew-symmetric horizontal part ½[U·∇θ + ∇·(U θ)], as there).
     """
 
     # Horizontal & vertical derivatives
     dztheta = theta_prime.differentiate("z", edge_order=2)
 
-    # Divergence (compute if absent)
-    if divergence is None:
-        divergence = horizontal_divergence(u, v)
-
     # Advection-like vector A and transport vector wU
-    advection_theta = horizontal_advection(theta_prime, u, v) + 0.5 * (
-            divergence * theta_prime) + 0.5 * (w * dztheta)
+    if conservative:
+        advection_theta = skew_symmetric_advection(theta_prime, u, v) + 0.5 * (w * dztheta)
+    else:
+        if divergence is None:
+            divergence = horizontal_divergence(u, v)
+        advection_theta = horizontal_advection(theta_prime, u, v) + 0.5 * (
+                divergence * theta_prime) + 0.5 * (w * dztheta)
 
     # Spectral vector inner products (sum over components)
     t_adv = - scalar_cross_spectrum(theta_prime, advection_theta)  # -⟨theta, At⟩
@@ -722,6 +752,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
                                  # Switch for spatial rechunk: small impact on the performance
                                  rechunk_spatial=rechunk_spatial)
 
+    # Periodic horizontal axes: wrap-around derivatives, no taper and no linear detrend there
+    ds = mark_periodic(ds.copy(), periodic_dims(ds, getattr(cfg.compute, "periodic_axes", None)))
+
     # Get wind field, variable names are normalized to logical names.
     u = ds["u"]
     v = ds["v"]
@@ -807,23 +840,31 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     ape_1d = isotropize(ape_2d, dx, dy, cumulative=False)  # non-cumulative APE spectra
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
-    transfer_mode = getattr(cfg.compute, "transfer_form", "flux")  # "invariant" | "flux"
+    # "flux" | "conservative" (skew-symmetric, sums to zero on periodic axes) | "invariant"
+    transfer_mode = getattr(cfg.compute, "transfer_form", None) or "flux"
+    if transfer_mode not in ("flux", "conservative", "invariant"):
+        raise ValueError(f"transfer_form {transfer_mode!r}: expected flux, conservative or "
+                         "invariant")
+    conservative = transfer_mode == "conservative"
 
     # --- NONLINEAR SPECTRAL TRANSFER (pi_nke, pi_vke, pi_ape) ---
     if transfer_mode == "invariant":
         pi_nke_2d = nonlinear_hke_transfer_invariant(u, v, w, divergence, vorticity, name="pi_nke")
     else:
-        pi_nke_2d = nonlinear_hke_transfer_flux(u, v, w, divergence, name="pi_nke")
+        pi_nke_2d = nonlinear_hke_transfer_flux(u, v, w, divergence, conservative=conservative,
+                                                name="pi_nke")
 
     pi_nke = isotropize(pi_nke_2d, dx, dy, cumulative=cumulative)
 
     pi_lke_2d = coriolis_linear_transfer(u, v, name="pi_lke")
     pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
 
-    pi_vke_2d = nonlinear_vke_transfer(u, v, w, divergence, name="pi_vke")
+    pi_vke_2d = nonlinear_vke_transfer(u, v, w, divergence, conservative=conservative,
+                                       name="pi_vke")
     pi_vke = isotropize(pi_vke_2d, dx, dy, cumulative=cumulative)
 
-    pi_ape_2d = nonlinear_ape_transfer(u, v, w, theta_prime, gamma, divergence, name="pi_ape")
+    pi_ape_2d = nonlinear_ape_transfer(u, v, w, theta_prime, gamma, divergence,
+                                       conservative=conservative, name="pi_ape")
     pi_ape = isotropize(pi_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE PERTURBATION (Exner deviation from the hydrostatic reference) ---
