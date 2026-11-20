@@ -544,6 +544,28 @@ def test_interior_transfer_sums_to_zero_on_bounded_axes():
             assert s_tot > 1e-3, (conservative, name, s_tot)
 
 
+def test_default_detrend_keeps_the_split_exact():
+    """With the default spectral settings (mean removed and restored, no trend, no taper) the
+    interior HKE transfer sums to zero and the lateral flux to its physical-space domain mean on
+    a non-periodic domain. Errico detrending removes a different ramp from each field of a
+    co-spectrum, so Parseval, and with it the conservation of the interior transfer, fails."""
+    from budget.budget import lateral_hke_flux
+    u, v, w, th, exner, dx = _lateral_case(periodic=False)
+    ramp = xr.DataArray(np.linspace(0.0, 1.0, u.sizes["x"]), dims="x", coords={"x": u.x})
+    u = u + 8.0 * ramp                                                  # not periodic in x
+    assert sp.SPECTRAL_CFG["detrend"]["type"] == "constant"
+    assert not sp.SPECTRAL_CFG["taper"]["enabled"]
+    res = {}
+    for detrend in ("constant", "errico"):
+        with _Spectral(False, detrend):
+            total = nonlinear_hke_transfer_flux(u, v, w, conservative=True)
+            lf = lateral_hke_flux(u, v)
+            scale = float(np.abs(isotropize(total - lf, dx, dx, cumulative=True)).max())
+            res[detrend] = float(np.abs(_shell_sum(total - lf, dx)).max()) / scale
+        print(f"  detrend {detrend:8s}: max_z |sum_k interior| / max|Pi_int| = {res[detrend]:.1e}")
+    assert res["constant"] < 1e-12 and res["errico"] > 1e-3, res
+
+
 def _nonperiodic_2d(n, L=500e3):
     """Analytic, non-periodic fields on [0, L]^2 (both end points on the grid), one level."""
     x = np.linspace(0.0, L, n)
@@ -2168,6 +2190,7 @@ if __name__ == "__main__":
              test_lateral_fluxes_converge_to_boundary_fluxes,
              test_pressure_work_closes_on_bounded_axes,
              test_compute_budget_lateral_split,
+             test_default_detrend_keeps_the_split_exact,
              test_isotropize_conserves_variance_on_any_grid,
              test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,

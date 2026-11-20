@@ -102,11 +102,16 @@ and well above 2 on a bounded axis. `periodic_axes: [x]`, `[x, y]` or `none` ove
 a global longitude is always periodic. Along periodic axes derivatives wrap around, and spectra
 are neither tapered nor detrended. The scale-transfer mode uses the same test: periodic axes are
 padded by wrapping and other axes by reflection (explicit `x_coord_boundary`/`y_coord_boundary`
-keywords take precedence). Along bounded axes the default is Errico (1985) end-point
-detrending (the mean and the linear trend joining the two edges are removed, the mean restored
-at $k = 0$), which removes the edge jump of the periodic extension and its leakage tail, and no
-taper. A taper (`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy
-flux into the window,
+keywords take precedence). Spectra remove the domain mean and restore it at $k = 0$
+(`SPECTRAL_CFG["detrend"]["type"] = "constant"`), with no trend and no taper, so that every
+co-spectrum sums to the domain mean of the product (Parseval), on which the conservation of the
+transfers and the closure of the budget rest. Errico (1985) end-point detrending (`"errico"`:
+along bounded axes, the linear trend joining the two edges is also removed) suppresses the edge
+jump of the periodic extension and its leakage tail in the energy spectra, but removes a
+different ramp from each field of a co-spectrum: the transfers then no longer sum to zero (by up
+to ~40% of $\max|\Pi|$ on bounded model domains, while the shape of $\Pi(k)$ changes by about
+5%). Use it for energy spectra, not for budgets. A taper (`SPECTRAL_CFG["taper"]`) weights the
+domain: its transfers include the energy flux into the window,
 
 $$\frac{\langle \mathbf{F}\cdot\nabla W^2\rangle}{\langle W^2\rangle},
 \qquad \mathbf{F} = \tfrac12\,\mathbf{u}\,|\mathbf{u}|^2,$$
@@ -114,10 +119,10 @@ $$\frac{\langle \mathbf{F}\cdot\nabla W^2\rangle}{\langle W^2\rangle},
 which projects onto the largest scales, grows with the mean wind along the tapered axis and can
 exceed the inter-scale transfer itself.
 
-Defaults: `transfer_form: conservative`, `periodic_axes: auto`, Errico detrending along bounded
-axes, no taper. They give exact conservation on periodic axes and leakage-free spectra on
-bounded ones without any setting; on undeclared periodic data the transfers equal those with the
-axes declared (`tests/test_synthetic_budget.py`).
+Defaults: `transfer_form: conservative`, `periodic_axes: auto`, mean removal only, no taper.
+The interior transfers then sum to zero to round-off on any domain and the lateral fluxes to the
+flux through the side boundaries (see below); on undeclared periodic data the transfers equal
+those with the axes declared (`tests/test_synthetic_budget.py`).
 
 ```bash
 sbudget compute config.yaml --mode spectral_budget                       # defaults
