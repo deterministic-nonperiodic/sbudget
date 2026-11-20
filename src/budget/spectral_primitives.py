@@ -12,9 +12,13 @@ from .numeric_tools import domain_mean, is_periodic
 # -----------------------------
 # Global spectral configuration
 # -----------------------------
+# Defaults: no taper and Errico end-point
+# detrending along non-periodic axes. A taper weights the domain, so the transfers it gives
+# include the energy flux into the window, <F . grad W^2>/<W^2>;
+# Errico detrending removes the edge jump (the leakage tail of the spectra) without it.
 SPECTRAL_CFG = {
     "taper": {
-        "enabled": True,
+        "enabled": False,
         # Per-axis taper specification; accepts string or dict.
         # String options: {"hann","hanning","hamming","cosine","none","dpss"}
         # Dict form for DPSS (recommended for FFTs):
@@ -30,7 +34,7 @@ SPECTRAL_CFG = {
         "normalize_row_mean": True  # divide by <cos(phi)> so mean-squared window is consistent
     },
     "detrend": {
-        "type": "linear",  # one of {"constant","linear","none"}
+        "type": "errico",  # one of {"errico", "linear", "constant", None}
     },
 }
 
@@ -199,10 +203,10 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
         If ``linear``, a linear least-squares fit will be estimated and removed
         from the data. Along a periodic coordinate (see numeric_tools.mark_periodic) a linear
         trend is not part of the field and is not fitted.
-        If ``errico``, along each non-periodic axis the linear trend joining the two end values
-        is removed (Errico 1985, MWR 113, 1554-1562): the field then matches across the
-        boundary of the periodic extension, without a jump, and the trend is centred so the
-        domain mean is unchanged.
+        If ``errico``, the domain mean and, along each non-periodic axis, the linear trend
+        joining the two end values are removed (Errico 1985, MWR 113, 1554-1562): the field then
+        matches across the boundary of the periodic extension, without a jump. The mean is
+        restored at k = 0, as for the other types.
 
     Returns
     -------
@@ -233,7 +237,8 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
                                coords={dim: da.coords[dim] for dim in dims})
 
     if detrend_type == "errico":
-        return _errico_detrend(da, dims)
+        trendless = _errico_detrend(da, dims)
+        return trendless - domain_mean(trendless * weights) / domain_mean(weights)
 
     # Calculate the fit (constant or plane)
     fit_to_remove = 0
@@ -297,7 +302,7 @@ def _apply_weighting(field: xr.DataArray) -> tuple[xr.DataArray, float, xr.DataA
     # -- Mean to restore at DC: only what the detrending removed (without detrending the mean is
     # still in the field, and restoring it would count the k = 0 product twice) --
     mu_restore = domain_mean(field)
-    if detrend_type not in ("constant", "linear"):          # None, errico: mean left in place
+    if detrend_type is None:                                 # mean left in place
         mu_restore = xr.zeros_like(mu_restore)
 
     # -- Apply the final total window (f_w = f' * W_total) --

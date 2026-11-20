@@ -83,10 +83,13 @@ fields (more if there is energy near the grid scale); both forms converge to the
 
 `periodic_axes: [x]` (or `[x, y]`) marks the axes on which the data are periodic; a global
 longitude always is. Along them derivatives wrap around, and spectra are neither tapered nor
-linearly detrended: the field needs neither, and both break the conservation. A taper makes
-$\sum_k T = \langle \mathbf{F}\cdot\nabla W^2\rangle / \langle W^2\rangle$ with
+detrended. Along non-periodic axes the default is Errico (1985) end-point detrending (the mean
+and the linear trend joining the two edges are removed, the mean restored at $k = 0$), which
+removes the edge jump of the periodic extension and its leakage tail, and no taper. A taper
+(`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy flux into the
+window, $\langle \mathbf{F}\cdot\nabla W^2\rangle / \langle W^2\rangle$ with
 $\mathbf{F} = \mathbf{u}\,|\mathbf{u}|^2/2$, which projects onto the largest scales and grows with
-the mean wind along the tapered axis (the flux-form transfer is not Galilean invariant).
+the mean wind along the tapered axis.
 
 ```bash
 sbudget compute config.yaml --mode spectral_budget --transfer-form conservative --periodic-axes x

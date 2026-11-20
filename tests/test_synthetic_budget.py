@@ -47,6 +47,22 @@ class _NoTaper:
         sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = self.saved
 
 
+class _Spectral:
+    """Context manager: explicit taper on/off and detrend type (restored on exit)."""
+
+    def __init__(self, taper, detrend):
+        self.taper, self.detrend = taper, detrend
+
+    def __enter__(self):
+        self.saved = (sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
+        sp.SPECTRAL_CFG["taper"]["enabled"] = self.taper
+        sp.SPECTRAL_CFG["detrend"]["type"] = self.detrend
+        return self
+
+    def __exit__(self, *exc):
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = self.saved
+
+
 def _random_3d_fields(seed=3, n=40, nz=33, L=400e3, H=40e3, w_amp=0.05, m_max=4.0):
     """Smooth periodic (in x, y) fields with vertical structure; w deliberately not small."""
     rng = np.random.default_rng(seed)
@@ -159,12 +175,12 @@ def _all_transfers(u, v, w, th, conservative):
 
 def test_conservative_transfers_sum_to_zero_on_periodic_axes():
     """The skew-symmetric transfers sum to zero over wavenumbers to round-off on a periodic
-    domain, with the default taper and linear detrend left on (skipped along periodic axes); the
+    domain, with a DPSS taper and linear detrend switched on (skipped along periodic axes); the
     flux form leaves the discretization residual of the product rule (here > 1e-3)."""
     u, v, w, th, dx = _random_3d_fields(seed=7, n=40, w_amp=1.0)
     u, v, w, th = _periodic(u, v, w, th)
-    assert sp.SPECTRAL_CFG["taper"]["enabled"] and sp.SPECTRAL_CFG["detrend"]["type"] == "linear"
-    cons, flux = _all_transfers(u, v, w, th, True), _all_transfers(u, v, w, th, False)
+    with _Spectral(True, "linear"):
+        cons, flux = _all_transfers(u, v, w, th, True), _all_transfers(u, v, w, th, False)
     for name in cons:
         scale = float(np.abs(isotropize(flux[name], dx, dx, cumulative=True)).max())
         t_c = float(np.abs(_shell_sum(cons[name], dx)).max()) / scale
@@ -199,7 +215,8 @@ def test_periodic_axes_skip_taper_and_linear_detrend():
     X = np.broadcast_to(x, (n, n))
     da = xr.DataArray(np.sin(2 * np.pi * X / L), dims=("y", "x"), coords={"y": x, "x": x})
     (per_x,) = _periodic(da, dims=("x",))
-    w, _ = sp._taper_2d(per_x)
+    with _Spectral(True, "linear"):
+        w, _ = sp._taper_2d(per_x)
     assert np.allclose(w.isel(y=n // 2), w.isel(y=n // 2, x=0))           # flat along x
     assert not np.allclose(w.isel(x=0), w.isel(x=0, y=n // 2))             # tapered along y
     exact = 2 * np.pi / L * np.cos(2 * np.pi * X / L) * np.sin(np.pi / n * 2) / (2 * np.pi / n)
@@ -278,8 +295,9 @@ def test_spatial_dims_from_units_and_axes():
 
 
 def test_errico_detrend():
-    """Errico detrending removes the end-to-end jump along non-periodic axes only, keeps the mean,
-    leaves periodic content alone, and the cross spectrum still sums to <a' b'> + 0."""
+    """Errico detrending removes the end-to-end jump along non-periodic axes only and the mean
+    (restored at k = 0), leaves periodic content alone, and the cross spectrum sums to
+    <a' b'> + mean(a) mean(b)."""
     n, L = 32, 320e3
     x = np.arange(n) * L / n
     Y, X = np.meshgrid(x, x, indexing="ij")
@@ -290,18 +308,18 @@ def test_errico_detrend():
     out = sp.detrend(da, detrend_type="errico")
     assert np.allclose(out.isel(y=0), out.isel(y=-1))                     # no jump in y
     assert not np.allclose(out.isel(x=0), out.isel(x=-1))                 # x left alone
-    assert np.isclose(float(out.mean()), float(da.mean()))                # mean kept
+    assert abs(float(out.mean())) < 1e-12                                  # mean removed
     # a purely periodic field in y (sampled without the end point) keeps a small jump term only
-    resid = out - (periodic + 1e-5 * X + 7.0)
+    resid = out - (periodic + 1e-5 * X + 7.0 - float(da.mean()))
     assert float(np.abs(resid - resid.mean("y")).max()) < 0.2
     saved = (sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
     try:
         sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = False, "errico"
         got = float(sp.scalar_cross_spectrum(da, 2 * da).sum(("ky", "kx")))
-        assert np.isclose(got, float((out * 2 * out).mean()), rtol=1e-12)
+        assert np.isclose(got, float((out * 2 * out).mean() + 2 * da.mean() ** 2), rtol=1e-12)
     finally:
         sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = saved
-    print("  jump in y removed, x and the mean unchanged, Parseval holds")
+    print("  jump in y and mean removed, x unchanged, Parseval with the mean restored")
 
 
 def test_cross_spectrum_parseval_with_mean_and_no_detrend():
@@ -324,7 +342,8 @@ def test_cross_spectrum_parseval_with_mean_and_no_detrend():
 def test_compute_budget_conservative_periodic_axes():
     """End to end: with transfer_form conservative and periodic_axes [x, y], the cumulative
     transfers of compute_budget vanish at the smallest wavenumber (no DC, no corner modes) to
-    the energy beyond the Nyquist circle; the flux form with the default taper does not."""
+    the energy beyond the Nyquist circle; the flux form with the previous default spectral
+    settings (DPSS taper, linear detrend, no periodic axes) does not."""
     from types import SimpleNamespace
     from budget.budget import compute_budget, periodic_dims
     u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
@@ -338,7 +357,8 @@ def test_compute_budget_conservative_periodic_axes():
         cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
                                                       transfer_form=form, periodic_axes=axes,
                                                       rechunk_spatial=False))
-        out = compute_budget(ds, cfg).compute()
+        with _Spectral(True, "linear"):
+            out = compute_budget(ds, cfg).compute()
         k_min[form] = {k: float(np.abs(_interior(out[k].isel(wavenumber=0)) /
                                        np.abs(_interior(out[k])).max()).max())
                        for k in ("pi_nke", "pi_vke", "pi_ape")}
