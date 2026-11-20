@@ -85,6 +85,15 @@ _BUDGET_META = {
 }
 
 
+def _set_budget_metadata(da: xr.DataArray, name: str) -> xr.DataArray:
+    """Replace inherited attributes (temperature, winds etc.) by the entry of _BUDGET_META."""
+    da.attrs.clear()
+    if name in _BUDGET_META:
+        std_name, long_name, units = _BUDGET_META[name]
+        da.attrs.update({"standard_name": std_name, "long_name": long_name, "units": units})
+    return da
+
+
 def budget_metadata(func: Callable) -> Callable:
     """
     Decorator that applies standard_name, long_name, and units attributes
@@ -95,22 +104,10 @@ def budget_metadata(func: Callable) -> Callable:
         # Execute the wrapped function to get the result DataArray
         result_da: xr.DataArray = func(*args, **kwargs)
 
-        # Clear unwanted inherited attributes (temperature, winds etc.)
-        result_da.attrs.clear()
-
         # Determine the name provided to the function (default is 'name')
         name = kwargs.get('name') or result_da.name
 
-        if name in _BUDGET_META:
-            std_name, long_name, units = _BUDGET_META[name]
-            result_da.attrs.update(
-                {
-                    "standard_name": std_name,
-                    "long_name": long_name,
-                    "units": units
-                }
-            )
-        return result_da
+        return _set_budget_metadata(result_da, name)
 
     # Preserve original function metadata for documentation tools
     wrapper.__name__ = func.__name__
@@ -923,8 +920,11 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
               vf_pres, vfd_pres, j_pres, div_pres, np_hke, np_vke,
               div_hke, div_vke, div_ape]
 
-    # Filter out None and assemble into Dataset
-    fluxes = xr.Dataset({da.name: da for da in fluxes if da is not None})
+    # Filter out None and assemble into Dataset. Metadata by output name: terms built outside the
+    # decorated functions (staggered vertical terms, flux divergences) would otherwise keep the
+    # attributes of their inputs.
+    fluxes = xr.Dataset({da.name: _set_budget_metadata(da, da.name)
+                         for da in fluxes if da is not None})
 
     # wavenumber coord attrs (unchanged, but placed after assembly)
     fluxes.wavenumber.attrs.update({'standard_name': 'wavenumber',

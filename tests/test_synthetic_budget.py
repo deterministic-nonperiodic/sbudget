@@ -1318,9 +1318,10 @@ def test_staggered_flux_divergence_telescopes():
 
 
 def test_compute_budget_with_half_level_w():
-    """compute_budget detects a Lorenz-staggered w_half and returns finite terms."""
+    """compute_budget detects a Lorenz-staggered w_half and returns finite terms; every output
+    carries its own metadata (staggered and collocated), not the attributes of its inputs."""
     from types import SimpleNamespace
-    from budget.budget import compute_budget
+    from budget.budget import compute_budget, _BUDGET_META
     n = 16
     f, full, half, zf, zh, dx = _lorenz_case(levels_per_lambda=8, n=n, depth=12000.0)
     theta = full(250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + f("t", zf))
@@ -1332,10 +1333,19 @@ def test_compute_budget_with_half_level_w():
     ds["w"] = _collocated(ds["w_half"], zf)
     cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
                                                   transfer_form="flux", rechunk_spatial=False))
+    ds["theta"].attrs.update(standard_name="air_potential_temperature", units="K")
+    ds["w_half"].attrs.update(standard_name="upward_air_velocity", units="m s-1")
+    ds["w"].attrs.update(standard_name="upward_air_velocity", units="m s-1")
     out = compute_budget(ds, cfg).compute()
     assert all(bool(np.isfinite(out[k]).all()) for k in out.data_vars)
     for k in ("vf_hke", "vfd_dke", "vf_pres", "vfd_pres", "cad", "caz", "np_vke", "div_hke"):
         assert k in out
+    collocated = compute_budget(ds.drop_vars("w_half"), cfg)
+    for label, budget in (("staggered", out), ("collocated", collocated)):
+        for k, da in budget.data_vars.items():
+            want = dict(zip(("standard_name", "long_name", "units"), _BUDGET_META[k]))
+            assert da.attrs == want, (label, k, da.attrs)
+    print(f"  metadata of all {len(out.data_vars)} outputs from the table (staggered, collocated)")
 
 
 def test_staggered_outputs_have_zarr_compatible_chunks():
