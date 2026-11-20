@@ -27,8 +27,10 @@ class ComputeConfig:
     dy: float | None = None
     # "conservative" (skew-symmetric: sums to zero over wavenumbers), "flux" or "invariant"
     transfer_form: str | None = "conservative"
-    # horizontal axes on which the data are periodic ("x", "y"); a global longitude always is
-    periodic_axes: list[str] | None = None
+    # horizontal axes on which the data are periodic: None/"auto" = detected from the data (seam
+    # test, see budget.resolve_periodic_axes), or a list ("x", "y"; [] = none); a global
+    # longitude always is
+    periodic_axes: list[str] | str | None = None
     shape_parameter: float = 1.0  # Shape parameter p for the mollifier filter
     # scale_transfer: generalized transfer D*_ell = D_ell - C_ell + V_ell, the counterpart of the
     # flux-form spectral transfer (see inter_scale_transfers.transfer_correction)

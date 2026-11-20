@@ -386,9 +386,11 @@ def main(argv: list[str] | None = None) -> None:
                                 "'conservative' (default; skew-symmetric: sums to zero over "
                                 "wavenumbers on periodic axes), 'flux' or 'invariant'.")
     p_compute.add_argument("--periodic-axes", type=_csv_or_list,
-                           help="Horizontal axes on which the data are periodic, e.g. 'x' or "
-                                "'x,y': wrap-around derivatives, no taper and no linear detrend "
-                                "along them (a global longitude always is).")
+                           help="Horizontal axes on which the data are periodic: 'auto' "
+                                "(default; detected from the jump between the last and first "
+                                "points), 'x', 'x,y' or 'none'. Along them derivatives wrap "
+                                "around and spectra are not detrended; repeated end points are "
+                                "dropped (a global longitude always is periodic).")
 
     p_compute.add_argument("--shape-parameter", type=float,
                            help="Shape parameter p for the mollifier filter. Default is 1.")

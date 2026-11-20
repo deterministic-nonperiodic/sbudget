@@ -322,6 +322,40 @@ def test_errico_detrend():
     print("  jump in y and mean removed, x unchanged, Parseval with the mean restored")
 
 
+def test_periodicity_detected_from_the_seam():
+    """periodic_axes auto: periodic axes (seam ~ neighbour difference) are found, a repeated end
+    point is dropped, a cut axis is bounded; explicit lists and 'none' override; and with the
+    defaults the transfers of undeclared periodic data equal those of declared ones."""
+    from types import SimpleNamespace
+    from budget.budget import resolve_periodic_axes, compute_budget
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    ds = xr.Dataset({"u": 10 * u, "v": 10 * v})
+    _, per, rep = resolve_periodic_axes(ds)
+    assert per == ["x", "y"], rep
+    dup = xr.concat([ds, ds.isel(x=[0]).assign_coords(x=[float(ds.x[-1]) + dx])], "x")
+    out, per, rep = resolve_periodic_axes(dup)
+    assert per == ["x", "y"] and out.sizes["x"] == 40 and "dropped" in rep["x"][1], rep
+    cut, per, rep = resolve_periodic_axes(ds.isel(y=slice(5, 30)))
+    assert per == ["x"] and rep["y"][1] == "bounded", rep
+    assert resolve_periodic_axes(ds, ["y"])[1] == ["y"]
+    assert resolve_periodic_axes(ds, "none")[1] == [] and resolve_periodic_axes(ds, [])[1] == []
+
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = xr.ones_like(u) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    full = xr.Dataset({"u": 10 * u + 40.0, "v": 10 * v, "w": w, "theta": theta,
+                       "pressure": pres, "density": pres / (287.0 * 240.0)})
+    pis = {}
+    for axes in (None, ["x", "y"]):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      periodic_axes=axes, rechunk_spatial=False))
+        pis[str(axes)] = compute_budget(full, cfg)["pi_nke"].compute()
+    a, b = pis["None"], pis["['x', 'y']"]
+    err = float(np.abs(a - b).max() / np.abs(b).max())
+    print(f"  seam ratios {rep}; defaults, undeclared vs declared periodic: {err:.1e}")
+    assert err < 1e-12
+
+
 def test_cross_spectrum_parseval_with_mean_and_no_detrend():
     """Sum over all modes of the cross spectrum equals the domain mean of the product, with a
     non-zero mean and detrending off (the mean was once restored at k = 0 a second time)."""
@@ -353,7 +387,7 @@ def test_compute_budget_conservative_periodic_axes():
     ds = xr.Dataset({"u": 10 * u, "v": 10 * v, "w": w, "theta": theta, "pressure": pres,
                      "density": pres / (287.0 * 240.0)})
     k_min = {}
-    for form, axes in (("conservative", ["x", "y"]), ("flux", None)):
+    for form, axes in (("conservative", ["x", "y"]), ("flux", [])):
         cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
                                                       transfer_form=form, periodic_axes=axes,
                                                       rechunk_spatial=False))
@@ -1843,7 +1877,8 @@ if __name__ == "__main__":
              test_cross_spectrum_parseval_with_mean_and_no_detrend,
              test_compute_cli_conservative_periodic,
              test_spatial_dims_from_units_and_axes,
-             test_errico_detrend]
+             test_errico_detrend,
+             test_periodicity_detected_from_the_seam]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")

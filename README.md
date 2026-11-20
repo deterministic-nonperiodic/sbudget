@@ -81,9 +81,11 @@ its sum is zero to round-off. The `flux` form, $(\mathbf{u}\cdot\nabla)a + \tfra
 relies on the product rule and leaves a residual of a few per cent of $\max|\Pi|$ for smooth
 fields (more if there is energy near the grid scale); both forms converge to the same transfer.
 
-`periodic_axes: [x]` (or `[x, y]`) marks the axes on which the data are periodic; a global
-longitude always is. Along them derivatives wrap around, and spectra are neither tapered nor
-detrended. Along non-periodic axes the default is Errico (1985) end-point detrending (the mean
+Periodic axes are detected from the data by default (`periodic_axes: auto`): the RMS jump
+between the last and first points is compared with the RMS neighbour difference, about 1 on a
+periodic axis, about 0 when the last point repeats the first (it is then dropped), and well above 2 on a bounded axis. `periodic_axes:
+[x]`, `[x, y]` or `none` override the test; a global longitude is always periodic. Along periodic
+axes derivatives wrap around, and spectra are neither tapered nor detrended. Along non-periodic axes the default is Errico (1985) end-point detrending (the mean
 and the linear trend joining the two edges are removed, the mean restored at $k = 0$), which
 removes the edge jump of the periodic extension and its leakage tail, and no taper. A taper
 (`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy flux into the
@@ -91,8 +93,14 @@ window, $\langle \mathbf{F}\cdot\nabla W^2\rangle / \langle W^2\rangle$ with
 $\mathbf{F} = \mathbf{u}\,|\mathbf{u}|^2/2$, which projects onto the largest scales and grows with
 the mean wind along the tapered axis.
 
+Defaults: `transfer_form: conservative`, `periodic_axes: auto`, Errico detrending along bounded
+axes, no taper. They give exact conservation on periodic axes and leakage-free spectra on
+bounded ones without any setting; on undeclared periodic data the transfers equal those with the
+axes declared (`tests/test_synthetic_budget.py`).
+
 ```bash
-sbudget compute config.yaml --mode spectral_budget --transfer-form conservative --periodic-axes x
+sbudget compute config.yaml --mode spectral_budget                       # defaults
+sbudget compute config.yaml --mode spectral_budget --periodic-axes x     # declare x periodic
 ```
 
 On a domain bounded in $y$, $\sum_k T$ (k = 0 included) is the energy flux through the walls,
