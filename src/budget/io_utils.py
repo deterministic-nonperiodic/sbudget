@@ -14,6 +14,7 @@ from .cf_coords import _cf_guess
 from .cf_coords import _is_z, is_geographic_grid, _coord_is_meter, get_spatial_dims
 from .cf_coords import convert_units, check_convert_units
 from .memory_manager import CacheManager
+from .numeric_tools import vertical_derivative
 
 _global_attrs = {'source': 'git@github.com:deterministic-nonperiodic/sbudget.git',
                  'institution': 'Leibniz Institute for Atmospheric Physics (IAP)',
@@ -246,8 +247,8 @@ def open_dataset(cfg, verbose=False) -> xr.Dataset:
     # The vertical-advection term of scale_transfer needs ∂z u, ∂z v on the selected levels:
     # differentiate the full column first (same centred operator as the spectral budget)
     if mode == "scale_transfer" and getattr(cfg.compute, "vertical_advection", False):
-        ds["dzu"] = ds["u"].differentiate("z", edge_order=2)
-        ds["dzv"] = ds["v"].differentiate("z", edge_order=2)
+        ds["dzu"] = vertical_derivative(ds["u"], "z")
+        ds["dzv"] = vertical_derivative(ds["v"], "z")
 
     # select specified vertical levels
     if levels is not None and mode == "scale_transfer":

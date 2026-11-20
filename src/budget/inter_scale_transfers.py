@@ -11,6 +11,7 @@ from .cf_coords import get_spatial_dims
 from .constants import earth_radius, epsilon
 from .grid_utils import scale_increments
 from .memory_manager import CacheManager, ensure_optimal_chunking, get_current_worker_count
+from .numeric_tools import horizontal_divergence, vertical_derivative
 
 
 # --------------------------------------------------------------------------------------------------
@@ -484,6 +485,18 @@ def _resolve_increments_data(increments_ds: xr.Dataset | Future) -> Dict[
     return increments_data
 
 
+def _block_increments(increments: Dict | Future) -> Dict:
+    """
+    Resolved geometry for one block: increments is the precomputed dictionary, a Future
+    pointing to it, or a recipe rebuilt once per worker process (_geometry_spec).
+    """
+    if isinstance(increments, Future):
+        return increments.result()
+    if isinstance(increments, dict) and "geometry_spec" in increments:
+        return _increments_from_spec(increments["geometry_spec"])
+    return increments
+
+
 def _block_space_scale_integral(
         field_chunk: xr.Dataset,
         increments: Dict | Future,
@@ -526,13 +539,7 @@ def _block_space_scale_integral(
     """
 
     # Run the indexing loop ONLY once per block to get the dictionary.
-    # increments is now either the precomputed dictionary or a Future pointing to it.
-    if isinstance(increments, Future):
-        increments_data = increments.result()
-    elif isinstance(increments, dict) and "geometry_spec" in increments:
-        increments_data = _increments_from_spec(increments["geometry_spec"])
-    else:
-        increments_data = increments
+    increments_data = _block_increments(increments)
 
     radial_distance = increments_data["r"]  # Access without modifying the shared dict
 
@@ -598,9 +605,18 @@ _FFT_PAD_MODES = {"wrap", "reflect", "symmetric", "edge"}
 
 # Per-process cache of kernel spectra, shared by the threads of a worker. Keyed by the padded
 # plane shape, the lattice and the scale; bounded so it never dominates worker memory.
-_KERNEL_CACHE: Dict[tuple, tuple] = {}
+_KERNEL_CACHE: Dict[tuple, Any] = {}
+_KERNEL_CACHE_BYTES: Dict[tuple, int] = {}
 _KERNEL_CACHE_LOCK = threading.Lock()
 _KERNEL_CACHE_MAX_BYTES = 2 * 1024 ** 3
+
+
+def _cache_kernel(key: tuple, entry: Any, nbytes: int) -> None:
+    """Keep a kernel spectrum in _KERNEL_CACHE unless that exceeds _KERNEL_CACHE_MAX_BYTES."""
+    with _KERNEL_CACHE_LOCK:
+        if sum(_KERNEL_CACHE_BYTES.values()) + nbytes <= _KERNEL_CACHE_MAX_BYTES:
+            _KERNEL_CACHE[key] = entry
+            _KERNEL_CACHE_BYTES[key] = nbytes
 
 
 def _kernel_spectra(lattice: Dict, shape: tuple, ell: float, p: float) -> tuple:
@@ -633,13 +649,7 @@ def _kernel_spectra(lattice: Dict, shape: tuple, ell: float, p: float) -> tuple:
         spectra.append(np.conj(sfft.rfft2(kernel, workers=1)))
         sums.append(float((coeff * trig).sum()))
     entry = (spectra[0], spectra[1], sums[0], sums[1])
-
-    nbytes = spectra[0].nbytes * 2
-    with _KERNEL_CACHE_LOCK:
-        used = sum((v[0].nbytes * 2 if isinstance(v, tuple) else v.nbytes)
-                   for v in _KERNEL_CACHE.values())
-        if used + nbytes <= _KERNEL_CACHE_MAX_BYTES:
-            _KERNEL_CACHE[key] = entry
+    _cache_kernel(key, entry, spectra[0].nbytes * 2)
     return entry
 
 
@@ -748,53 +758,71 @@ def _filter_spectrum(lattice: Dict, shape: tuple, ell: float, p: float) -> np.nd
     np.add.at(kernel, (sy[~zero] % my, sx[~zero] % mx), g * cell / norm)
     kernel[0, 0] += g0 * cell / norm
     spectrum = np.conj(sfft.rfft2(kernel, workers=1))
-
-    with _KERNEL_CACHE_LOCK:
-        used = sum((v[0].nbytes * 2 if isinstance(v, tuple) else v.nbytes)
-                   for v in _KERNEL_CACHE.values())
-        if used + spectrum.nbytes <= _KERNEL_CACHE_MAX_BYTES:
-            _KERNEL_CACHE[key] = spectrum
+    _cache_kernel(key, spectrum, spectrum.nbytes)
     return spectrum
 
 
-def _block_transfer_correction(field_chunk: xr.Dataset, increments: Dict | Future,
-                               x_dim: str, y_dim: str, scales: np.ndarray, components: list,
-                               divergence: bool, vertical: bool,
-                               kernel_params: Dict | None = None) -> xr.DataArray:
+def _correction_pad_modes(x_boundary: str, y_boundary: str) -> tuple:
     """
-    Correction X_ℓ = V_ℓ - C_ℓ per block, so that D_ℓ + X_ℓ is the physical-space counterpart of
-    the flux-form spectral transfer (see inter_scale_kinetic_energy_transfer):
-
-        C_ℓ = ¼ δ (u·ū) + ¼ u·(δu)‾ - ¼ |u|² δ̄ - ¼ δ (|u|²)‾      (if divergence)
-        V_ℓ = ½ w (Ū·∂z U - U·∂z Ū)                               (if vertical)
-
-    u runs over `components` (the components of the increments in D_ℓ); δ = field_chunk["div"];
-    U = (u, v) with ∂z U = field_chunk["dzu"], ["dzv"], and w = field_chunk["w_adv"]. The bar is
-    the lattice filter of D_ℓ (same normalization and boundary extension). Unlike D_ℓ, both terms
-    use the full fields (mean included). Cost per plane and scale: up to 2 n + 4 inverse FFTs of
-    the padded plane (n = number of components).
+    numpy.pad modes (x, y) of the transfer correction for the given boundary types. The
+    correction is evaluated by FFT only, so it needs a fixed boundary extension.
     """
-    if isinstance(increments, Future):
-        increments_data = increments.result()
-    elif isinstance(increments, dict) and "geometry_spec" in increments:
-        increments_data = _increments_from_spec(increments["geometry_spec"])
-    else:
-        increments_data = increments
-
-    x_mode = _NP_PAD_MODES.get(increments_data.get("x_boundary_type", "periodic"))
-    y_mode = _NP_PAD_MODES.get(increments_data.get("y_boundary_type", "reflect"))
-    if "lattice" not in increments_data or x_mode not in _FFT_PAD_MODES \
-            or y_mode not in _FFT_PAD_MODES:
+    x_mode, y_mode = _NP_PAD_MODES.get(x_boundary), _NP_PAD_MODES.get(y_boundary)
+    if x_mode not in _FFT_PAD_MODES or y_mode not in _FFT_PAD_MODES:
         raise NotImplementedError(
-            "The transfer corrections need the FFT path (boundary types wrap, periodic, "
-            f"reflect, symmetric or edge); got x={x_mode}, y={y_mode}.")
-    lattice = increments_data["lattice"]
-    p = float((kernel_params or {}).get("p", 1.0))
+            "The transfer correction needs boundary types with a fixed extension (periodic, "
+            f"wrap, reflect, symmetric or edge); got x={x_boundary}, y={y_boundary}.")
+    return x_mode, y_mode
 
+
+def _dilatational_exchange(b: Dict[str, np.ndarray], bar: Dict[str, np.ndarray],
+                           names: list) -> np.ndarray:
+    """
+    Dilatational exchange on one plane, with u over the components `names`:
+
+        C_ℓ = ¼ δ (u·ū) + ¼ u·(δu)‾ - ¼ |u|² δ̄ - ¼ δ (|u|²)‾
+
+    b holds the unfiltered fields (components and "div"), bar the filtered ones under the keys
+    of _correction_fft_block (components, "div*<component>", "div", "|u|^2").
+    """
+    delta = b["div"]
+    c = delta * sum(b[v] * bar[v] for v in names)
+    c += sum(b[v] * bar[f"div*{v}"] for v in names)
+    c -= sum(b[v] ** 2 for v in names) * bar["div"]
+    c -= delta * bar["|u|^2"]
+    return 0.25 * c
+
+
+def _vertical_exchange(b: Dict[str, np.ndarray], bar: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    Vertical exchange on one plane, with U = (u, v):
+
+        V_ℓ = ½ w (Ū·∂z U - U·∂z Ū)
+
+    b holds the unfiltered fields ("u", "v", "w_adv", "dzu", "dzv"), bar the filtered ones.
+    """
+    return 0.5 * b["w_adv"] * (bar["u"] * b["dzu"] + bar["v"] * b["dzv"]
+                               - b["u"] * bar["dzu"] - b["v"] * bar["dzv"])
+
+
+def _correction_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, p: float,
+                          components: list, divergence: bool, vertical: bool,
+                          x_dim: str, y_dim: str, x_mode: str, y_mode: str):
+    """
+    Lattice evaluation of the transfer correction X_ℓ = V_ℓ - C_ℓ by FFT filtering.
+
+    Both terms are products of unfiltered fields with filtered ones, Ā = Σ_s G(s) A(x + s), where
+    G is the lattice filter of D_ℓ (_filter_spectrum: same shifts and normalization). Each plane is
+    padded by the largest shift with the boundary extension of D_ℓ and transformed once; every
+    scale then needs one stacked inverse FFT. Unlike in _dell_fft_block the plane mean is kept:
+    C_ℓ and V_ℓ depend on it. Cost per plane and scale: up to 2 n + 4 inverse FFTs of the padded
+    plane (n = number of components).
+
+    Returns (accumulator (scale, ..., y, x) float64, work dims).
+    """
     names = list(components)
     extra = (["div"] if divergence else []) + (["w_adv", "dzu", "dzv"] if vertical else [])
-    template = field_chunk["u"]
-    lead = [d for d in template.dims if d not in (y_dim, x_dim)]
+    lead = [d for d in field_chunk["u"].dims if d not in (y_dim, x_dim)]
     work_dims = tuple(lead) + (y_dim, x_dim)
     data = {v: field_chunk[v].transpose(*work_dims).values for v in names + extra}
 
@@ -803,49 +831,90 @@ def _block_transfer_correction(field_chunk: xr.Dataset, increments: Dict | Futur
     py, px = int(np.abs(lattice["sy"]).max()), int(np.abs(lattice["sx"]).max())
     my, mx = ny + 2 * py, nx + 2 * px
     inner = (slice(py, py + ny), slice(px, px + nx))
-    rfft = lambda a: sfft.rfft2(a, workers=1)
 
     accumulator = np.zeros((len(scales),) + shape, dtype=np.float64)
+    rfft = lambda a: sfft.rfft2(a, workers=1)
+
     for idx in np.ndindex(*shape[:-2]):
         b = {v: data[v][idx].astype(np.float64) for v in names + extra}
-        a = {v: _pad_plane(b[v], py, px, y_mode, x_mode) for v in names + extra}
+        a = {v: _pad_plane(b[v], py, px, y_mode, x_mode) for v in b}
 
-        # spectra of the fields to be filtered; ū for u, v is shared by both terms
-        spec = {f"bar_{v}": rfft(a[v]) for v in names}
+        # Fields to be filtered (ū is shared by both terms; names always include u and v)
+        filtered = {v: a[v] for v in names}
         if divergence:
-            spec.update({f"bar_d{v}": rfft(a["div"] * a[v]) for v in names})
-            spec["bar_div"] = rfft(a["div"])
-            spec["bar_k"] = rfft(sum(a[v] ** 2 for v in names))
+            filtered.update({f"div*{v}": a["div"] * a[v] for v in names})
+            filtered["div"] = a["div"]
+            filtered["|u|^2"] = sum(a[v] ** 2 for v in names)
         if vertical:
-            for v in ("u", "v"):
-                spec.setdefault(f"bar_{v}", rfft(a[v]))
-            spec["bar_dzu"] = rfft(a["dzu"])
-            spec["bar_dzv"] = rfft(a["dzv"])
-        keys = list(spec)
-        stacked = np.stack([spec[k] for k in keys])
-        del spec, a
+            filtered.update(dzu=a["dzu"], dzv=a["dzv"])
+        keys = list(filtered)
+        spectra = np.stack([rfft(filtered[k]) for k in keys])
+        del a, filtered
 
-        for m, ell in enumerate(scales):
-            gh = _filter_spectrum(lattice, (my, mx), ell, p)
-            bars = sfft.irfft2(stacked * gh, s=(my, mx), axes=(-2, -1),
-                               workers=1)[(slice(None),) + inner]
-            bar = dict(zip(keys, bars))
-            x_corr = np.zeros(shape[-2:])
+        for n, ell in enumerate(scales):
+            g_hat = _filter_spectrum(lattice, (my, mx), ell, p)
+            fields = sfft.irfft2(spectra * g_hat, s=(my, mx), axes=(-2, -1),
+                                 workers=1)[(slice(None),) + inner]
+            bar = dict(zip(keys, fields))
+
             if divergence:
-                d = b["div"]
-                k = sum(b[v] ** 2 for v in names)
-                c = 0.25 * d * sum(b[v] * bar[f"bar_{v}"] for v in names)
-                c += 0.25 * sum(b[v] * bar[f"bar_d{v}"] for v in names)
-                c -= 0.25 * k * bar["bar_div"] + 0.25 * d * bar["bar_k"]
-                x_corr -= c
+                accumulator[(n,) + idx] -= _dilatational_exchange(b, bar, names)
             if vertical:
-                x_corr += 0.5 * b["w_adv"] * (bar["bar_u"] * b["dzu"] + bar["bar_v"] * b["dzv"]
-                                              - b["u"] * bar["bar_dzu"] - b["v"] * bar["bar_dzv"])
-            accumulator[(m,) + idx] = x_corr
+                accumulator[(n,) + idx] += _vertical_exchange(b, bar)
 
+    return accumulator, work_dims
+
+
+def _block_transfer_correction(
+        field_chunk: xr.Dataset,
+        increments: Dict | Future,
+        x_dim: str,
+        y_dim: str,
+        scales: np.ndarray,
+        components: list,
+        divergence: bool,
+        vertical: bool,
+        kernel_params: Dict | None = None
+) -> xr.DataArray:
+    """
+    Transfer correction X_ℓ = V_ℓ - C_ℓ per Dask block (see transfer_correction).
+
+    Parameters
+    ----------
+    field_chunk : xr.Dataset
+        A block of whole horizontal planes with the velocity components and the fields of the
+        requested terms ("div"; "w_adv", "dzu", "dzv").
+    increments : Dict | Future
+        Grid information containing precomputed scale increments and angle grids.
+    x_dim, y_dim : str
+        Names of spatial dimensions.
+    scales : np.ndarray
+        Filter length scales ℓ.
+    components : list
+        Velocity components of the increments in D_ℓ.
+    divergence, vertical : bool
+        Include the dilatational exchange C_ℓ and the vertical exchange V_ℓ.
+    Returns
+    -------
+    xr.DataArray
+        Correction with dimension 'scale' and same spatial dims as the block (float32).
+    """
+    increments_data = _block_increments(increments)
+    if "lattice" not in increments_data:
+        raise NotImplementedError("The transfer correction needs the shift lattice.")
+    x_mode, y_mode = _correction_pad_modes(increments_data.get("x_boundary_type", "periodic"),
+                                           increments_data.get("y_boundary_type", "reflect"))
+    p = float((kernel_params or {}).get("p", 1.0))
+
+    accumulator, work_dims = _correction_fft_block(field_chunk, increments_data["lattice"],
+                                                   scales, p, components, divergence, vertical,
+                                                   x_dim, y_dim, x_mode, y_mode)
+
+    template = field_chunk["u"]
     coords = {"scale": scales}
-    coords.update({str(dd): template.coords[dd] for dd in template.dims if dd in template.coords})
-    out = xr.DataArray(accumulator.astype(np.float32), dims=("scale",) + work_dims,
+    coords.update({str(d): template.coords[d] for d in template.dims if d in template.coords})
+
+    out = xr.DataArray(accumulator.astype(np.float32), dims=("scale",) + tuple(work_dims),
                        coords=coords)
     return out.transpose("scale", *template.dims)
 
@@ -1013,6 +1082,142 @@ def scale_transfer(
     return transfer.rename(name)
 
 
+def transfer_correction(
+        field: xr.Dataset,
+        increments: Dict | Future,
+        length_scale: xr.DataArray,
+        x_dim: str,
+        y_dim: str,
+        components: list,
+        divergence: bool = True,
+        vertical: bool = False,
+        name: str = "transfer_correction",
+        p: float = 1,
+        verbose: bool = False
+) -> xr.DataArray:
+    """
+    Compute the correction X_ℓ = V_ℓ - C_ℓ that makes
+
+        D*_ℓ = D_ℓ - C_ℓ + V_ℓ
+
+    the physical-space counterpart of the flux-form spectral transfer T(k).
+
+    D_ℓ (Duchon & Robert 2000) closes the local budget of the mixed energy ½ u·ū only for
+    non-divergent u advected horizontally. T(k) is the spectrum of the skew-symmetric advection
+
+        N = (U·∇)u + ½ δ u + ½ [w ∂z u + ∂z (w u)],    δ = ∂x u + ∂y v,  U = (u, v),
+
+    and the domain mean of D*_ℓ equals Σ_k T(k) [1 - Ĝ(kℓ)], Ĝ the transfer function of the
+    filter of D_ℓ, with
+
+        C_ℓ = ¼ δ (u·ū) + ¼ u·(δu)‾ - ¼ |u|² δ̄ - ¼ δ (|u|²)‾     (dilatational exchange)
+        V_ℓ = ½ w (Ū·∂z U - U·∂z Ū)                             (vertical exchange)
+
+    C_ℓ follows from the exact local identity -½ [ū·N_h + u·N̄_h] = -∇·J_ℓ - (D_ℓ - C_ℓ), J_ℓ the
+    Duchon-Robert spatial flux; V_ℓ is the part of ū·N_v that is not a vertical flux divergence.
+    C_ℓ vanishes for δ = 0 and V_ℓ for w = 0; both vanish as ℓ → 0. Unlike D_ℓ, they depend on a
+    uniform background velocity, as T(k) does. With components ("u", "v"), D*_ℓ is the
+    counterpart of the HKE transfer Π_h. Derivation and tests: README ('Counterpart of the
+    spectral transfer') and tests/test_synthetic_budget.py.
+
+    Parameters
+    ----------
+    field : xr.Dataset
+        Velocity components `components`, the horizontal divergence "div" (if divergence) and
+        the vertical velocity "w_adv" with the shear "dzu", "dzv" (if vertical).
+    increments: dict, Dask Future
+        Grid information containing precomputed scale increments and angle grids.
+    length_scale : xr.DataArray
+        1D array of filter length scales ℓ.
+    x_dim, y_dim : str
+        Names of the spatial dimensions.
+    components : list
+        Velocity components of the increments in D_ℓ (u and v, optionally w).
+    divergence : bool
+        Include the dilatational exchange -C_ℓ.
+    vertical : bool
+        Include the vertical exchange V_ℓ.
+    name : str
+        Name for the resulting variable.
+    p : float
+        Shape parameter of the mollifier (as for D_ℓ).
+    verbose : bool, optional
+        If True, print progress and summary info.
+
+    Returns
+    -------
+    xr.DataArray
+        Correction with dimension 'scale' and the dims of field["u"].
+    """
+    if not (divergence or vertical):
+        raise ValueError("transfer_correction: request at least one of divergence, vertical.")
+
+    if verbose:
+        print(f"[scale-integral] Building parallel graph for '{name}' ...")
+
+    correction = xr.map_blocks(
+        _block_transfer_correction,
+        field,
+        kwargs=dict(
+            increments=increments,
+            x_dim=x_dim, y_dim=y_dim,
+            scales=length_scale.values,
+            components=list(components),
+            divergence=divergence, vertical=vertical,
+            kernel_params={"p": p},
+        ),
+        # Build template: final output is (scale, ...)
+        template=field["u"].expand_dims(scale=length_scale).rename(name),
+    )
+
+    # Recover scale attributes
+    correction['scale'].attrs.update(length_scale.attrs)
+
+    return correction.rename(name)
+
+
+def _correction_inputs(wind: xr.Dataset, divergence: bool, vertical: bool,
+                       kwargs: Dict) -> Dict[str, xr.DataArray]:
+    """
+    Fields of the transfer correction besides the velocity components:
+
+        "div"                   δ, if divergence: kwargs["divergence"]; else the dataset's
+                                divergence if it also holds the vorticity (the rule of the
+                                spectral budget, so that both diagnostics use the same δ);
+                                else centred differences (horizontal_divergence).
+        "w_adv", "dzu", "dzv"   w and ∂z u, ∂z v, if vertical: the shear from kwargs or the
+                                dataset (the reader differentiates the full column before
+                                selecting levels), else centred differences along z
+                                (vertical_derivative).
+    """
+    fields = {}
+    if divergence:
+        delta = kwargs.get("divergence", None)
+        if delta is None and "divergence" in wind and "vorticity" in wind:
+            delta = wind["divergence"]
+        if delta is None:
+            delta = horizontal_divergence(wind["u"], wind["v"])
+        fields["div"] = delta
+
+    if vertical:
+        if "w" not in wind:
+            raise ValueError("vertical_advection needs the vertical velocity w.")
+        fields["w_adv"] = wind["w"]
+        for v in ("u", "v"):
+            key = f"dz{v}"
+            if kwargs.get(key) is not None:
+                fields[key] = kwargs[key]
+            elif key in wind:
+                fields[key] = wind[key]
+            elif wind.sizes.get("z", 0) < 3:
+                raise ValueError(f"vertical_advection: provide {key} (∂z {v}) or at least "
+                                 "3 levels to differentiate.")
+            else:
+                fields[key] = vertical_derivative(wind[v], "z")
+
+    return fields
+
+
 def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Dataset:
     """ Computes the inter-scale kinetic energy transfer rate using third-order structure functions.
     Parameters
@@ -1021,13 +1226,17 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         Dataset containing 3D velocity components (u, v, w).
     **kwargs
         Additional keyword arguments passed to scale_increments and scale_transfer functions.
+        For the corrected transfer D*_ℓ (see transfer_correction): divergence_correction,
+        vertical_advection, perturbation (bool), increment_components (default: all present),
+        and optionally the fields divergence, dzu, dzv.
     Returns
     -------
     xr.Dataset
-        Dataset containing the specific kinetic energy transfer rate across scales.
+        Dataset containing the specific kinetic energy transfer rate across scales, and
+        energy_transfer_corrected if a correction is requested.
     """
 
-    # Components entering the increments of D_ℓ (default: all velocity components present).
+    # Validate input dataset: components entering the increments of D_ℓ (default: all present).
     # increment_components=("u", "v") gives the counterpart of the HKE transfer Π_h.
     present = [v for v in ["u", "v", "w"] if v in wind]
     velocity_vars = list(kwargs.get("increment_components") or present)
@@ -1035,9 +1244,10 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         raise ValueError(f"increment_components {velocity_vars} must contain u, v and be a "
                          f"subset of the velocity components present {present}.")
 
-    # Corrections making D_ℓ the counterpart of the flux-form spectral transfer (see below)
+    # Optional correction D*_ℓ = D_ℓ - C_ℓ + V_ℓ (see transfer_correction)
     divergence_correction = bool(kwargs.get("divergence_correction", False))
     vertical_advection = bool(kwargs.get("vertical_advection", False))
+    corrected = divergence_correction or vertical_advection
 
     # Perturbation frame: remove the level-mean horizontal wind (D_ℓ is unchanged; C_ℓ, V_ℓ and
     # the flux-form spectral transfer are not Galilean invariant). Given dzu, dzv must then be
@@ -1046,35 +1256,14 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         y_d, x_d = get_spatial_dims(wind)
         wind = wind.assign(u=wind["u"] - wind["u"].mean((y_d, x_d)),
                            v=wind["v"] - wind["v"].mean((y_d, x_d)))
-    extra = {}
-    if divergence_correction:
-        divergence = kwargs.get("divergence", None)
-        if divergence is None:
-            from .numeric_tools import horizontal_divergence
-            divergence = horizontal_divergence(wind["u"], wind["v"])
-        extra["div"] = divergence
-    if vertical_advection:
-        if "w" not in wind:
-            raise ValueError("vertical_advection needs the vertical velocity w.")
-        dz = {}
-        for v in ("u", "v"):
-            name = f"dz{v}"
-            if kwargs.get(name) is not None:
-                dz[name] = kwargs[name]
-            elif name in wind:
-                dz[name] = wind[name]
-            else:
-                if wind.sizes.get("z", 0) < 3:
-                    raise ValueError(f"vertical_advection: provide {name} (∂z{v}) or at least "
-                                     "3 levels to differentiate.")
-                dz[name] = wind[v].differentiate("z", edge_order=2)
-        extra.update(w_adv=wind["w"], **dz)
+
+    correction_fields = _correction_inputs(wind, divergence_correction, vertical_advection,
+                                           kwargs) if corrected else {}
 
     # Ensure velocity components are float32 for memory efficiency
     wind = wind[velocity_vars].astype({v: "float32" for v in velocity_vars})
-    if extra:
-        wind = wind.assign({k: da.transpose(*wind["u"].dims).astype("float32")
-                            for k, da in extra.items()})
+    wind = wind.assign({k: da.transpose(*wind["u"].dims).astype("float32")
+                        for k, da in correction_fields.items()})
 
     # Check if the dataset has the required variables
     verbose = kwargs.get("verbose", False)
@@ -1098,6 +1287,11 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     # Extract the coordinates metadata to be passed synchronously.
     radial_distance = increments['r']
     length_scale = increments['scale']
+
+    # The correction is evaluated by FFT only: fail before building the graph
+    if corrected:
+        _correction_pad_modes(increments.attrs.get("x_boundary_type", "periodic"),
+                              increments.attrs.get("y_boundary_type", "reflect"))
 
     # ----------------------------------------------------------------------------
     # Scatter the large geometry payload if a client is present
@@ -1218,52 +1412,40 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
         "description": "Equivalent spectral wavelength calculated as 2*pi / equivalent_wavenumber."
     })
 
+    # Promote to dataset
+    energy_transfer_rate = energy_transfer_rate.to_dataset()
+
     # ----------------------------------------------------------------------------
     # Physical-space counterpart of the flux-form spectral transfer (optional):
-    #     D_ℓ* = D_ℓ - C_ℓ + V_ℓ
-    #
-    # D_ℓ (Duchon & Robert 2000) closes the local budget of the mixed energy ½ u·ū only for
-    # non-divergent u advected horizontally. For the flux-form (skew-symmetric) advection whose
-    # spectrum is the spectral transfer T(k),
-    #     N = (U·∇)u + ½ δ u + ½ [w ∂z u + ∂z (w u)],   δ = ∂x u + ∂y v,
-    # the domain mean of D_ℓ* equals Σ_k T(k) [1 - Ĝ(kℓ)] (Ĝ: transfer function of the filter):
-    #   C_ℓ = ¼ δ (u·ū) + ¼ u·(δu)‾ - ¼ |u|² δ̄ - ¼ δ (|u|²)‾      (dilatational exchange; exact
-    #         local identity -½[ū·N_h + u·N̄_h] = -∇·J_ℓ - (D_ℓ - C_ℓ), J_ℓ the DR flux)
-    #   V_ℓ = ½ w (Ū·∂z U - U·∂z Ū)                              (vertical exchange, U = (u, v))
-    # C_ℓ vanishes for δ = 0 and V_ℓ for w = 0; both vanish as ℓ → 0. Unlike D_ℓ, C_ℓ depends on a
-    # uniform background velocity when δ ≠ 0, as the flux-form spectral transfer does. With
-    # increment_components=("u", "v"), D_ℓ* is the counterpart of Π_h (HKE). Derivation and
-    # tests: README ('Counterpart of the spectral transfer') and tests/test_synthetic_budget.py.
+    #     D*_ℓ = D_ℓ - C_ℓ + V_ℓ    (see transfer_correction)
     # ----------------------------------------------------------------------------
-    corrected = None
-    if divergence_correction or vertical_advection:
-        field_c = wind.fillna(0.0)
-        correction = xr.map_blocks(
-            _block_transfer_correction,
-            field_c,
-            kwargs=dict(increments=increments_data, x_dim=x_name, y_dim=y_name,
-                        scales=length_scale.values, components=velocity_vars,
-                        divergence=divergence_correction, vertical=vertical_advection,
-                        kernel_params={"p": kwargs.get("p", 1)}),
-            template=field_c["u"].expand_dims(scale=length_scale).rename("correction"),
+    if corrected:
+        correction = transfer_correction(
+            field=wind.fillna(0.0),
+            increments=increments_data,
+            length_scale=length_scale,
+            x_dim=x_name, y_dim=y_name,
+            components=velocity_vars,
+            divergence=divergence_correction,
+            vertical=vertical_advection,
+            p=kwargs.get("p", 1),
+            verbose=verbose
         ).assign_coords(**coord_dict)
-        corrected = (energy_transfer_rate + correction).rename("energy_transfer_corrected")
-        terms = ["D_ell"] + (["- C_ell (dilatational exchange)"] if divergence_correction
-                             else []) + (["+ V_ell (vertical exchange)"] if vertical_advection
-                                         else [])
-        corrected.attrs.update({
+
+        terms = (["- C_ell (dilatational exchange)"] if divergence_correction else []) \
+            + (["+ V_ell (vertical exchange)"] if vertical_advection else [])
+        corrected_rate = energy_transfer_rate["energy_transfer"] + correction
+        corrected_rate.attrs.update({
             'units': "W / kg",
             'long_name': "Corrected transfer rate of kinetic energy across scales",
-            'description': " ".join(terms) + f", increments of {', '.join(velocity_vars)}: "
+            'description': f"D_ell {' '.join(terms)}, increments of {', '.join(velocity_vars)}: "
                            "counterpart of the flux-form spectral transfer (its domain mean is "
                            "the kernel-weighted spectral transfer). Positive means forward "
-                           "energy transfer towards smaller scales",
+                           "energy transfer towards smaller scales"
         })
+        energy_transfer_rate["energy_transfer_corrected"] = corrected_rate
 
-    # Promote to dataset and transpose to have 'scale' as the last dimension
-    energy_transfer_rate = energy_transfer_rate.to_dataset()
-    if corrected is not None:
-        energy_transfer_rate["energy_transfer_corrected"] = corrected
+    # Transpose to have 'scale' as the last dimension
     energy_transfer_rate = energy_transfer_rate.transpose(..., "scale")
 
     return energy_transfer_rate

@@ -149,8 +149,19 @@ vertical advection after the vertical flux $\tfrac12 w\,\mathbf{U}\cdot\bar{\mat
 domain the domain mean of $\mathcal{T}^*_\ell$ equals the kernel-weighted spectral transfer
 $\sum_k T(k)\,[1-\hat G(k\ell)]$. Use `--increment-components u,v` for the counterpart of the HKE
 transfer $\Pi_h$. The output gains `energy_transfer_corrected`; `energy_transfer` is unchanged.
-$\delta$ and $\partial_z\mathbf{u}$ use the finite differences of the spectral budget ($\partial_z$
-on the full column, before `--levels` is applied).
+The same options exist as `compute:` keys in the YAML (`divergence_correction`,
+`vertical_advection`, `perturbation`, `increment_components`); from Python, the correction alone
+is `inter_scale_transfers.transfer_correction`. $\delta$ is chosen as in the spectral budget: the
+dataset's `divergence` when it also provides `vorticity`, otherwise centred differences.
+$\partial_z\mathbf{u}$ uses the budget's centred differences on the full column, before
+`--levels` is applied.
+
+The increment form of $C_\ell$ is, for unit density and without pressure, the $G_\ell$-weighted
+average of the divergence terms in the point-split kinetic-energy identity of Galtier and Banerjee
+(2011), as written by Eyink and Drivas (2018, their Eq. 131). Eyink and Drivas show that such
+terms are not regularized as $\ell\to 0$ at infinite Reynolds number, so $\mathcal{T}^*_\ell$ is a
+diagnostic of the resolved transfer at a given $\ell$ (for comparison with the spectral budget),
+not a measure of anomalous dissipation.
 
 `--perturbation` removes the level-mean horizontal wind first. $\mathcal{T}_\ell$ does not change,
 but $C_\ell$, $V_\ell$ and the flux-form spectral transfer are not Galilean invariant: a mean wind
@@ -178,7 +189,16 @@ $4\times10^{-4}$ of $\max|\mathcal{T}_\ell|$; with divergent flow, vertical adve
 background wind, the domain mean of $\mathcal{T}^*_\ell$ equals an independent Fourier-space
 computation of the kernel-weighted transfer to $2\times10^{-4}$ ($\ell = 5\,\Delta x$),
 $10^{-5}$ ($8\,\Delta x$) and $2\times10^{-6}$ ($12\,\Delta x$), where $\mathcal{T}_\ell$ alone
-gives 0–12% of it. Cost: up to $2n+4$ extra inverse FFTs per plane and scale.
+gives 0–12% of it. Two closed forms: a divergent triad $u = c + A\cos kx + B\cos(2kx+\beta)$, for
+which $\langle\mathcal{T}_\ell - C_\ell\rangle = \tfrac38 kA^2B\sin\beta\,[\hat G(2k)-\hat G(k)]$
+(reproduced to $8\times10^{-4}$ at $8\,\Delta x$ and $1.4\times10^{-6}$ at $16\,\Delta x$, the
+error being the quadrature of $\nabla G$), and a single plane wave in a uniform wind $\mathbf{c}$, for which
+$\langle\mathcal{T}_\ell\rangle = \langle C_\ell\rangle = 0$ but
+$\langle\mathcal{T}^*_\ell\rangle = \tfrac14 m a_w\sin\phi\,(\mathbf{a}\cdot\mathbf{c})[1-\hat G(k)]$,
+zero in the perturbation frame (reproduced to $10^{-5}$). The command-line run (YAML and flags,
+stretched vertical grid, level selection, perturbation frame) equals the direct computation on the
+full column exactly; results do not depend on the dask chunking; invalid requests fail before
+any computation. Cost: up to $2n+4$ extra inverse FFTs per plane and scale.
 
 ### References:
 
@@ -192,6 +212,11 @@ gives 0–12% of it. Cost: up to $2n+4$ extra inverse FFTs per plane and scale.
 - J. Duchon, and R. Robert (2000). Inertial energy dissipation for weak solutions of
   incompressible Euler and Navier-Stokes equations. Nonlinearity, 13(1), 249.
   https://doi.org/10.1088/0951-7715/13/1/312
+- S. Galtier, and S. Banerjee (2011). Exact relation for correlation functions in compressible
+  isothermal turbulence. Phys. Rev. Lett., 107, 134501.
+  https://doi.org/10.1103/PhysRevLett.107.134501
+- G. L. Eyink, and T. D. Drivas (2018). Cascades and dissipative anomalies in compressible fluid
+  turbulence. Phys. Rev. X, 8, 011022. https://doi.org/10.1103/PhysRevX.8.011022
 
 ### Install
 

@@ -144,6 +144,21 @@ def first_derivative(da: xr.DataArray, dim: str, delta: float | None = None) -> 
     return deriv_coord
 
 
+def vertical_derivative(da: xr.DataArray, dim: str = "z") -> xr.DataArray:
+    """
+    Centred derivative d(da)/dz along `dim` (one-sided second order at the ends), the operator of
+    the spectral budget. Dask chunks along `dim` smaller than the 3-point stencil are merged for
+    the derivative (xarray cannot differentiate across them) and restored afterwards, so neither
+    the values nor the chunk layout depend on the chunking.
+    """
+    if dim not in da.dims:
+        raise ValueError(f"vertical_derivative: dim '{dim}' not in {tuple(da.dims)}")
+    if da.chunks is None or min(da.chunksizes[dim]) >= 3:
+        return da.differentiate(dim, edge_order=2)
+    chunks = da.chunksizes
+    return da.chunk({dim: -1}).differentiate(dim, edge_order=2).chunk(chunks)
+
+
 def horizontal_divergence(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """
     Horizontal divergence of vector field (u, v), returned in s^-1.
