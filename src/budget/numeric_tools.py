@@ -82,7 +82,7 @@ def mark_periodic(ds, dims):
     """Mark the horizontal coordinates ``dims`` periodic: derivatives along them wrap around,
     and spectra are neither tapered nor linearly detrended along them."""
     for dim in dims:
-        ds[dim].attrs["periodic"] = True
+        ds[dim].attrs["periodic"] = 1          # integer: netCDF attributes cannot be boolean
     return ds
 
 

@@ -327,7 +327,8 @@ def test_periodicity_detected_from_the_seam():
     point is dropped, a cut axis is bounded; explicit lists and 'none' override; and with the
     defaults the transfers of undeclared periodic data equal those of declared ones."""
     from types import SimpleNamespace
-    from budget.budget import resolve_periodic_axes, compute_budget
+    from budget.budget import compute_budget
+    from budget.grid_utils import resolve_periodic_axes
     u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
     ds = xr.Dataset({"u": 10 * u, "v": 10 * v})
     _, per, rep = resolve_periodic_axes(ds)
@@ -356,6 +357,31 @@ def test_periodicity_detected_from_the_seam():
     assert err < 1e-12
 
 
+def test_scale_transfer_detects_periodic_axes():
+    """scale_transfer resolves periodic axes as the spectral budget does: a repeated end column
+    is dropped and x wraps (equal to the trimmed data declared periodic), a cut y axis is padded
+    by reflection, and explicit boundary keywords take precedence."""
+    u, v, w, _, dx = _random_3d_fields(seed=13, n=32, nz=5)
+    ds = xr.Dataset({"u": 10 * u, "v": 10 * v, "w": w})
+    kw = dict(scales=np.array([4 * dx]), allow_rechunk=False, divergence_correction=True)
+    run = lambda data, **extra: inter_scale_kinetic_energy_transfer(data, **kw, **extra)
+
+    dup = xr.concat([ds, ds.isel(x=[0]).assign_coords(x=[float(ds.x[-1]) + dx])], "x")
+    auto = run(dup)
+    declared = run(ds, x_coord_boundary="periodic", y_coord_boundary="periodic")
+    assert auto.sizes["x"] == 32
+    for k in ("energy_transfer", "energy_transfer_generalized"):
+        assert np.allclose(auto[k].values, declared[k].values, rtol=0, atol=1e-12), k
+
+    cut = ds.isel(y=slice(4, 28))
+    auto = run(cut)
+    explicit = run(cut, x_coord_boundary="periodic", y_coord_boundary="reflect")
+    assert np.array_equal(auto["energy_transfer"].values, explicit["energy_transfer"].values)
+    forced = run(cut, x_coord_boundary="reflect", y_coord_boundary="reflect")
+    assert not np.allclose(forced["energy_transfer"].values, auto["energy_transfer"].values)
+    print("  repeated end column dropped and x wrapped; cut y reflected; explicit keywords win")
+
+
 def test_cross_spectrum_parseval_with_mean_and_no_detrend():
     """Sum over all modes of the cross spectrum equals the domain mean of the product, with a
     non-zero mean and detrending off (the mean was once restored at k = 0 a second time)."""
@@ -379,7 +405,8 @@ def test_compute_budget_conservative_periodic_axes():
     the energy beyond the Nyquist circle; the flux form with the previous default spectral
     settings (DPSS taper, linear detrend, no periodic axes) does not."""
     from types import SimpleNamespace
-    from budget.budget import compute_budget, periodic_dims
+    from budget.budget import compute_budget
+    from budget.grid_utils import periodic_dims
     u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
     zf = u.z.values
     theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
@@ -1298,7 +1325,8 @@ def test_correction_divergence_source():
     rng = np.random.default_rng(41)
     given = xr.DataArray(rng.normal(size=fields["u"].shape).astype(np.float32),
                          dims=("z", "y", "x"), coords=ds["u"].coords)
-    kw = dict(scales=scales[:1], allow_rechunk=False, divergence_correction=True)
+    kw = dict(scales=scales[:1], allow_rechunk=False, divergence_correction=True,
+              periodic_axes="none")
     generalized = lambda data, **extra: inter_scale_kinetic_energy_transfer(
         data, **kw, **extra)["energy_transfer_generalized"].values
 
@@ -1878,7 +1906,8 @@ if __name__ == "__main__":
              test_compute_cli_conservative_periodic,
              test_spatial_dims_from_units_and_axes,
              test_errico_detrend,
-             test_periodicity_detected_from_the_seam]
+             test_periodicity_detected_from_the_seam,
+             test_scale_transfer_detects_periodic_axes]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")

@@ -282,6 +282,7 @@ def _cmd_compute(args) -> None:
                                                       False)),
                 "vertical_advection": bool(getattr(cfg.compute, "vertical_advection", False)),
                 "increment_components": getattr(cfg.compute, "increment_components", None),
+                "periodic_axes": getattr(cfg.compute, "periodic_axes", None),
                 # the reader has already removed the level mean (see io_utils.open_dataset)
                 "perturbation": False,
             }

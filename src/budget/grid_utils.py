@@ -16,7 +16,7 @@ import xarray as xr
 from pint import Quantity
 from pyproj import Geod
 
-from .cf_coords import is_geographic_grid, _is_global_longitude
+from .cf_coords import is_geographic_grid, _is_global_longitude, get_spatial_dims
 from .constants import epsilon
 
 _GEODE = Geod(ellps="WGS84")
@@ -54,6 +54,82 @@ def _get_spacing(
         _, _, dist = _GEODE.inv(center, coord[0].item(), center, coord[1].item())
 
     return float(dist)
+
+
+def periodic_dims(ds: xr.Dataset, axes=None) -> list[str]:
+    """Horizontal dimensions on which the data are periodic: those named in ``axes`` ("x"/"y"
+    or the dimension names) plus a global longitude."""
+    y_dim, x_dim = get_spatial_dims(ds)
+    names = {"x": x_dim, "y": y_dim, x_dim: x_dim, y_dim: y_dim}
+    unknown = [a for a in (axes or []) if a not in names]
+    if unknown:
+        raise ValueError(f"periodic_axes {unknown}: expected x, y, {x_dim} or {y_dim}")
+    dims = {names[a] for a in (axes or [])}
+    if _is_global_longitude(ds[x_dim]):
+        dims.add(x_dim)
+    return sorted(dims)
+
+
+# Seam test: RMS jump between the last and first points over the RMS neighbour difference.
+# A periodic axis sampled without its end point gives ~1 (the seam is one more neighbour pair),
+# one that repeats its first point at the end gives ~0, a bounded (cut) axis gives >> 1 (smooth
+# synthetic fields: 0.97-1.13 periodic, 2.6-3.7 cut; fields with small-scale structure give
+# larger values when cut). An axis misread as periodic has a seam jump of at most two
+# neighbour differences, which the wrap-around derivative tolerates.
+SEAM_DUPLICATE_MAX = 0.25
+SEAM_PERIODIC_MAX = 2.0
+
+
+def seam_ratio(ds: xr.Dataset, dim: str, variables=("u", "v"), max_levels: int = 5) -> float:
+    """RMS of f[-1] - f[0] over the RMS of f[i+1] - f[i] along ``dim``, for the horizontal wind,
+    on at most ``max_levels`` levels and the first and last times (cheap on large inputs)."""
+    fields = [ds[v] for v in variables if v in ds]
+    if not fields:
+        raise ValueError(f"seam_ratio: none of {variables} in the dataset")
+    sub = {}
+    for d in fields[0].dims:
+        if d == "time" and ds.sizes[d] > 2:
+            sub[d] = [0, ds.sizes[d] - 1]
+        elif d == "z" and ds.sizes[d] > max_levels:
+            sub[d] = np.linspace(0, ds.sizes[d] - 1, max_levels).round().astype(int).tolist()
+    seam = neighbour = 0.0
+    for f in fields:
+        f = f.isel(sub).astype("float64")
+        seam += float(((f.isel({dim: -1}) - f.isel({dim: 0})) ** 2).mean())
+        neighbour += float((f.diff(dim) ** 2).mean())
+    return float(np.sqrt(seam / neighbour)) if neighbour > 0 else 0.0
+
+
+def resolve_periodic_axes(ds: xr.Dataset, axes=None):
+    """Periodic horizontal dimensions, and the dataset without repeated end points.
+
+    axes None or "auto" (default): an axis is periodic if its seam ratio (see seam_ratio) is at
+    most SEAM_PERIODIC_MAX, or it is a global longitude; a list names them explicitly ([] or
+    "none": none but a global longitude). On a periodic axis whose seam ratio is below
+    SEAM_DUPLICATE_MAX the last point repeats the first and is dropped, so the FFT and the
+    wrap-around derivative see one period.
+
+    Returns (dataset, periodic dims, {dim: (seam ratio, status)}).
+    """
+    y_dim, x_dim = get_spatial_dims(ds)
+    if isinstance(axes, str):
+        axes = None if axes.lower() == "auto" else [] if axes.lower() == "none" else [axes]
+    if axes is not None and [str(a).lower() for a in axes] in (["auto"], ["none"]):
+        axes = None if str(axes[0]).lower() == "auto" else []
+    ratios = {d: seam_ratio(ds, d) for d in (y_dim, x_dim)}
+    if axes is None:
+        periodic = {d for d, r in ratios.items() if r <= SEAM_PERIODIC_MAX}
+        periodic |= set(periodic_dims(ds, []))
+    else:
+        periodic = set(periodic_dims(ds, axes))
+    report = {}
+    for d in (y_dim, x_dim):
+        if d in periodic and ratios[d] < SEAM_DUPLICATE_MAX:
+            ds = ds.isel({d: slice(0, -1)})
+            report[d] = (ratios[d], "periodic, repeated end point dropped")
+        else:
+            report[d] = (ratios[d], "periodic" if d in periodic else "bounded")
+    return ds, sorted(periodic), report
 
 
 def infer_boundary_conditions(x_coord: xr.DataArray, **kwargs) -> tuple[str, str]:

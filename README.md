@@ -90,7 +90,9 @@ between the last and first points is compared with the RMS neighbour difference.
 on a periodic axis, about 0 when the last point repeats the first (that point is then dropped),
 and well above 2 on a bounded axis. `periodic_axes: [x]`, `[x, y]` or `none` override the test;
 a global longitude is always periodic. Along periodic axes derivatives wrap around, and spectra
-are neither tapered nor detrended. Along bounded axes the default is Errico (1985) end-point
+are neither tapered nor detrended. The scale-transfer mode uses the same test: periodic axes are
+padded by wrapping and other axes by reflection (explicit `x_coord_boundary`/`y_coord_boundary`
+keywords take precedence). Along bounded axes the default is Errico (1985) end-point
 detrending (the mean and the linear trend joining the two edges are removed, the mean restored
 at $k = 0$), which removes the edge jump of the periodic extension and its leakage tail, and no
 taper. A taper (`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy

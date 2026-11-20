@@ -9,9 +9,9 @@ from dask.distributed import get_client
 
 from .cf_coords import get_spatial_dims
 from .constants import earth_radius, epsilon
-from .grid_utils import scale_increments
+from .grid_utils import resolve_periodic_axes, scale_increments
 from .memory_manager import CacheManager, ensure_optimal_chunking, get_current_worker_count
-from .numeric_tools import horizontal_divergence, vertical_derivative
+from .numeric_tools import horizontal_divergence, mark_periodic, vertical_derivative
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1270,6 +1270,27 @@ def inter_scale_kinetic_energy_transfer(wind: xr.Dataset, **kwargs) -> xr.Datase
     if not {"u", "v"} <= set(velocity_vars) or not set(velocity_vars) <= set(present):
         raise ValueError(f"increment_components {velocity_vars} must contain u, v and be a "
                          f"subset of the velocity components present {present}.")
+
+    # Periodic axes (detected from the data unless given, as in the spectral budget): wrapped
+    # increments and derivatives there, repeated end points dropped; explicit x_coord_boundary /
+    # y_coord_boundary keywords take precedence
+    y_d, x_d = get_spatial_dims(wind)
+    kwargs = dict(kwargs)
+    if not {"x_coord_boundary", "y_coord_boundary"} & set(kwargs):
+        wind, periodic, report = resolve_periodic_axes(wind, kwargs.get("periodic_axes"))
+        kwargs["x_coord_boundary"] = "periodic" if x_d in periodic else "reflect"
+        kwargs["y_coord_boundary"] = "periodic" if y_d in periodic else "reflect"
+        if kwargs.get("verbose", False):
+            for d, (ratio, status) in report.items():
+                print(f"[transfer] {d}: {status} (seam/neighbour difference {ratio:.2f})")
+    else:                                   # explicit: periodic boundaries wrap derivatives too
+        periodic = [d for d, key in ((y_d, "y_coord_boundary"), (x_d, "x_coord_boundary"))
+                    if kwargs.get(key, "reflect") in ("periodic", "wrap")]
+    wind = mark_periodic(wind.copy(), periodic)
+    for name in ("divergence", "dzu", "dzv", "dzw"):
+        if isinstance(kwargs.get(name), xr.DataArray):
+            kwargs[name] = mark_periodic(kwargs[name].sel({y_d: wind[y_d], x_d: wind[x_d]}),
+                                         periodic)
 
     # Optional correction D*_ℓ = D_ℓ - C_ℓ + V_ℓ (see transfer_correction)
     divergence_correction = bool(kwargs.get("divergence_correction", False))
