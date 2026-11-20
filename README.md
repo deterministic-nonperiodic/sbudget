@@ -74,7 +74,8 @@ choice matters there only for telescoping and closure.
 #### Conservative transfers and periodic axes (`--transfer-form conservative`, `--periodic-axes`)
 
 Every nonlinear transfer sums to zero over wavenumbers on a periodic domain. On the grid this
-holds only if the advection of a quantity $a$ is written in skew-symmetric form,
+holds only if the advection of a quantity $a$ is written in skew-symmetric form (e.g. Morinishi
+et al. 1998),
 
 $$\tfrac12\left[(\mathbf{u}\cdot\nabla)a + \nabla\cdot(\mathbf{u}\,a)\right],$$
 
@@ -185,7 +186,10 @@ V_\ell = \tfrac12\,w\left(\bar{\mathbf{u}}\cdot\partial_z\mathbf{u} - \mathbf{u}
 
 ($\delta$ the horizontal divergence, bar the filter of $\mathcal{T}_\ell$) has a domain mean equal
 to the flux-form spectral transfer seen through the same filter, $\sum_k T(k)\,[1-\hat G(k\ell)]$.
-It is written to `energy_transfer_generalized`; `energy_transfer` is unchanged.
+It is written to `energy_transfer_generalized`; `energy_transfer` is unchanged. $C _\ell$ is the
+divergence part of the point-split energy balance of compressible turbulence (Galtier & Banerjee
+2011; Banerjee & Galtier 2014; Eyink & Drivas 2018, Eq. 131), taken at unit density and without
+the pressure terms.
 
 ```bash
 sbudget compute config.yaml --mode scale_transfer --divergence-correction --vertical-advection
@@ -196,9 +200,9 @@ transfers and $w$ enters only as advecting velocity; `--increment-components u,v
 transfer of vertical kinetic energy (the counterpart of the spectral HKE + VKE transfers).
 
 The same options are `compute:` keys in the YAML (`divergence_correction`, `vertical_advection`,
-`perturbation`, `increment_components`). Unlike $\mathcal{T}_\ell$, the correction (like the
-spectral transfer) depends on the frame: a mean wind adds wave–mean-flow exchange, which
-`--perturbation` removes. Closed-form and synthetic tests are in
+`perturbation`, `increment_components`). Unlike $\mathcal{T}_\ell$, which is Galilean invariant
+(Aluie et al. 2018), the correction (like the spectral transfer) depends on the frame: a mean
+wind adds wave–mean-flow exchange, which `--perturbation` removes. Closed-form and synthetic tests are in
 [tests/test_synthetic_budget.py](tests/test_synthetic_budget.py).
 
 ### References:
@@ -213,6 +217,21 @@ spectral transfer) depends on the frame: a mean wind adds wave–mean-flow excha
 - J. Duchon, and R. Robert (2000). Inertial energy dissipation for weak solutions of
   incompressible Euler and Navier-Stokes equations. Nonlinearity, 13(1), 249.
   https://doi.org/10.1088/0951-7715/13/1/312
+- S. Galtier, and S. Banerjee (2011). Exact relation for correlation functions in compressible
+  isothermal turbulence. Phys. Rev. Lett., 107, 134501.
+  https://doi.org/10.1103/PhysRevLett.107.134501
+- S. Banerjee, and S. Galtier (2014). A Kolmogorov-like exact relation for compressible
+  polytropic turbulence. J. Fluid Mech., 742, 230-242. https://doi.org/10.1017/jfm.2013.657
+- G. L. Eyink, and T. D. Drivas (2018). Cascades and dissipative anomalies in compressible fluid
+  turbulence. Phys. Rev. X, 8, 011022. https://doi.org/10.1103/PhysRevX.8.011022
+- H. Aluie, M. Hecht, and G. K. Vallis (2018). Mapping the energy cascade in the North Atlantic
+  Ocean: The coarse-graining approach. J. Phys. Oceanogr., 48(2), 225-244.
+  https://doi.org/10.1175/JPO-D-17-0100.1
+- R. M. Errico (1985). Spectra computed from a limited area grid. Mon. Wea. Rev., 113, 1554-1562.
+  https://doi.org/10.1175/1520-0493(1985)113%3C1554:SCFALA%3E2.0.CO;2
+- Y. Morinishi, T. S. Lund, O. V. Vasilyev, and P. Moin (1998). Fully conservative higher order
+  finite difference schemes for incompressible flow. J. Comput. Phys., 143, 90-124.
+  https://doi.org/10.1006/jcph.1998.5962
 
 ### Install
 
