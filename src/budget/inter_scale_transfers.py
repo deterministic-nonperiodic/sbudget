@@ -729,10 +729,10 @@ def _dell_fft_block(field_chunk: xr.Dataset, lattice: Dict, scales: np.ndarray, 
         # Spectra of the products F, keyed by the horizontal component i that K_i acts on
         a = {v: padding.pad(b[v]) for v in names}
         a2 = sum(a[v] ** 2 for v in names)
-        f_u_a2 = {i: _rfft2(a[i] * a2) for i in horizontal}                       # u_i |u|²
-        f_uu = {j: {i: _rfft2(a[i] * a[j]) for i in horizontal} for j in names}   # u_i u_j
-        f_a2 = _rfft2(a2)                                                         # |u|²
-        f_u = {j: _rfft2(a[j]) for j in names}                                    # u_j
+        f_u_a2 = {i: _rfft2(a[i] * a2) for i in horizontal}  # u_i |u|²
+        f_uu = {j: {i: _rfft2(a[i] * a[j]) for i in horizontal} for j in names}  # u_i u_j
+        f_a2 = _rfft2(a2)  # |u|²
+        f_u = {j: _rfft2(a[j]) for j in names}  # u_j
         del a, a2
 
         for n, ell in enumerate(scales):
