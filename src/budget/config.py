@@ -25,7 +25,12 @@ class ComputeConfig:
     norm: str | None = None  # None or "ortho"
     dx: float | None = None
     dy: float | None = None
-    transfer_form: str | None = "flux"  # one of ["invariant", "flux"]
+    # "conservative" (skew-symmetric: sums to zero over wavenumbers), "flux" or "invariant"
+    transfer_form: str | None = "conservative"
+    # horizontal axes on which the data are periodic: None/"auto" = detected from the data (seam
+    # test, see budget.resolve_periodic_axes), or a list ("x", "y"; [] = none); a global
+    # longitude always is
+    periodic_axes: list[str] | str | None = None
     shape_parameter: float = 1.0  # Shape parameter p for the mollifier filter
     # scale_transfer: generalized transfer D*_ell = D_ell - C_ell + V_ell, the counterpart of the
     # flux-form spectral transfer (see inter_scale_transfers.transfer_correction)
@@ -144,6 +149,10 @@ def apply_overrides(cfg, args):
         _set_nested(cfg, ["compute", "cumulative"], bool(cum))
 
     _set_nested(cfg, ["compute", "transfer_form"], _get(args, "transfer_form"))
+
+    pa = _get(args, "periodic_axes")
+    if pa:
+        _set_nested(cfg, ["compute", "periodic_axes"], [str(a) for a in pa])
 
     sp = _get(args, "shape_parameter")
     if sp is not None:

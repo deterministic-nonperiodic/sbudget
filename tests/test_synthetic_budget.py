@@ -47,6 +47,22 @@ class _NoTaper:
         sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = self.saved
 
 
+class _Spectral:
+    """Context manager: explicit taper on/off and detrend type (restored on exit)."""
+
+    def __init__(self, taper, detrend):
+        self.taper, self.detrend = taper, detrend
+
+    def __enter__(self):
+        self.saved = (sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
+        sp.SPECTRAL_CFG["taper"]["enabled"] = self.taper
+        sp.SPECTRAL_CFG["detrend"]["type"] = self.detrend
+        return self
+
+    def __exit__(self, *exc):
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = self.saved
+
+
 def _random_3d_fields(seed=3, n=40, nz=33, L=400e3, H=40e3, w_amp=0.05, m_max=4.0):
     """Smooth periodic (in x, y) fields with vertical structure; w deliberately not small."""
     rng = np.random.default_rng(seed)
@@ -138,6 +154,259 @@ def test_vke_and_ape_transfers_conserve():
             conservation = _rel(t, scale)
             print(f"  t_{name}: sum_k t = {conservation:.3f} (relative to |<X w dX/dz>|)")
             assert conservation < 0.1, f"{name} transfer does not conserve ({conservation:.3f})"
+
+
+# ------------------------------------------------------------------------------------------------
+# Conservative (skew-symmetric) transfers and periodic axes
+# ------------------------------------------------------------------------------------------------
+def _periodic(*arrays, dims=("y", "x")):
+    """Copies of the arrays with the horizontal coordinates marked periodic."""
+    from budget.numeric_tools import mark_periodic
+    return [mark_periodic(a.copy(), dims) for a in arrays]
+
+
+def _all_transfers(u, v, w, th, conservative):
+    gamma = xr.ones_like(th.z, dtype=float)
+    div = None if conservative else horizontal_divergence(u, v)
+    return {"HKE": nonlinear_hke_transfer_flux(u, v, w, div, conservative=conservative),
+            "VKE": nonlinear_vke_transfer(u, v, w, div, conservative=conservative),
+            "APE": nonlinear_ape_transfer(u, v, w, th, gamma, div, conservative=conservative)}
+
+
+def test_conservative_transfers_sum_to_zero_on_periodic_axes():
+    """The skew-symmetric transfers sum to zero over wavenumbers to round-off on a periodic
+    domain, with a DPSS taper and linear detrend switched on (skipped along periodic axes); the
+    flux form leaves the discretization residual of the product rule (here > 1e-3)."""
+    u, v, w, th, dx = _random_3d_fields(seed=7, n=40, w_amp=1.0)
+    u, v, w, th = _periodic(u, v, w, th)
+    with _Spectral(True, "linear"):
+        cons, flux = _all_transfers(u, v, w, th, True), _all_transfers(u, v, w, th, False)
+    for name in cons:
+        scale = float(np.abs(isotropize(flux[name], dx, dx, cumulative=True)).max())
+        t_c = float(np.abs(_shell_sum(cons[name], dx)).max()) / scale
+        t_f = float(np.abs(_shell_sum(flux[name], dx)).max()) / scale
+        print(f"  {name}: max_z |sum_k T| / max|Pi|: conservative {t_c:.1e}, flux {t_f:.1e}")
+        assert t_c < 1e-12, f"{name} conservative form does not sum to zero ({t_c:.1e})"
+        assert t_f > 1e-3, f"{name}: flux-form residual unexpectedly small ({t_f:.1e})"
+
+
+def test_conservative_and_flux_forms_converge():
+    """Both forms discretize the same transfer: their difference is second order in dx."""
+    diffs = []
+    for n in (40, 80):
+        u, v, w, th, dx = _random_3d_fields(seed=5, n=n, w_amp=1.0)
+        u, v, w, th = _periodic(u, v, w, th)
+        with _NoTaper():
+            a = _interior(isotropize(nonlinear_hke_transfer_flux(u, v, w, conservative=True),
+                                     dx, dx))
+            b = _interior(isotropize(nonlinear_hke_transfer_flux(u, v, w), dx, dx))
+        diffs.append(float(np.abs(a - b).max() / np.abs(b).max()))
+    print(f"  max |conservative - flux| / max |flux|: {diffs[0]:.1e} (n = 40), "
+          f"{diffs[1]:.1e} (n = 80), ratio {diffs[0] / diffs[1]:.1f}")
+    assert diffs[1] < 0.02 and diffs[0] / diffs[1] > 3.0
+
+
+def test_periodic_axes_skip_taper_and_linear_detrend():
+    """Along a periodic axis the taper is 1, the derivative wraps around (exact for a resolved
+    sine) and a linear trend is not removed; along the other axis both still apply."""
+    from budget.numeric_tools import first_derivative
+    n, L = 32, 320e3
+    x = np.arange(n) * L / n
+    X = np.broadcast_to(x, (n, n))
+    da = xr.DataArray(np.sin(2 * np.pi * X / L), dims=("y", "x"), coords={"y": x, "x": x})
+    (per_x,) = _periodic(da, dims=("x",))
+    with _Spectral(True, "linear"):
+        w, _ = sp._taper_2d(per_x)
+    assert np.allclose(w.isel(y=n // 2), w.isel(y=n // 2, x=0))           # flat along x
+    assert not np.allclose(w.isel(x=0), w.isel(x=0, y=n // 2))             # tapered along y
+    exact = 2 * np.pi / L * np.cos(2 * np.pi * X / L) * np.sin(np.pi / n * 2) / (2 * np.pi / n)
+    assert np.allclose(first_derivative(per_x, "x"), exact, atol=1e-12)    # centred, wrapped
+    assert not np.allclose(first_derivative(da, "x"), exact, atol=1e-8)    # one-sided at ends
+    ramp = da.copy(data=np.add.outer(np.arange(n) * 1.0, np.arange(n) * 2.0))
+    (ramp_x,) = _periodic(ramp, dims=("x",))
+    left = sp.detrend(ramp_x, detrend_type="linear")
+    assert np.allclose(left.isel(y=0) - left.isel(y=0).mean(), ramp.isel(y=0) - ramp.isel(y=0).mean())
+    assert np.allclose(left.isel(x=0).diff("y"), 0.0, atol=1e-9)           # y trend removed
+
+
+def test_compute_cli_conservative_periodic(tmp_path=None):
+    """budget compute --transfer-form conservative --periodic-axes x,y end to end (YAML + flags,
+    netCDF in and out): the cumulative transfers vanish at the smallest wavenumber."""
+    import tempfile
+    from pathlib import Path
+    import yaml
+    from budget.client import main
+    tmp = Path(tmp_path or tempfile.mkdtemp())
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=32, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = xr.ones_like(u) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u, "v": 10 * v, "w": w, "theta": theta, "pres": pres})
+    ds = ds.expand_dims(time=[0.0]).rename(z="height").astype("float64")
+    ds["height"].attrs["units"] = "m"
+    for k, units in (("u", "m s-1"), ("v", "m s-1"), ("w", "m s-1"), ("theta", "K"),
+                     ("pres", "Pa")):
+        ds[k].attrs["units"] = units
+    ds.to_netcdf(tmp / "periodic.nc")
+    config = {"input": {"path": str(tmp / "periodic.nc"), "dims": ["height", "y", "x"]},
+              "output": {"path": str(tmp / "out.nc"), "store": "netcdf"},
+              "compute": {"mode": "spectral_budget", "client": False, "dx": dx, "dy": dx},
+              "variables": {"u": "u", "v": "v", "w": "w", "theta": "theta", "pressure": "pres"}}
+    with open(tmp / "config.yaml", "w") as fh:
+        yaml.safe_dump(config, fh)
+    main(["compute", str(tmp / "config.yaml"), "--no-client", "--transfer-form", "conservative",
+          "--periodic-axes", "x,y"])
+    out = xr.open_dataset(tmp / "out.nc")
+    for k in ("pi_nke", "pi_vke", "pi_ape"):
+        pi = _interior(out[k].sortby("z"))
+        err = float(np.abs(pi.isel(wavenumber=0)).max() / np.abs(pi).max())
+        print(f"  CLI {k}: max_z |Pi(k_min)| / max|Pi| = {err:.1e}")
+        assert err < 1e-3, (k, err)     # float32 storage: theta' ~ 1 K on 250 K
+
+
+def test_spatial_dims_from_units_and_axes():
+    """Horizontal dimensions are found from units and CF axes, not names: metric x, y with
+    long_name "longitude"/"latitude" are Cartesian, degree x, y are geographic, and lat/lon may
+    come in either order."""
+    from budget.cf_coords import get_spatial_dims, is_geographic_grid
+    n = np.arange(4.0)
+
+    def case(dims, attrs, values=(n * 5000.0, n * 5000.0)):
+        coords = {d: (d, v, a) for d, v, a in zip(dims, values, attrs)}
+        coords["height"] = ("height", [1.0, 2.0], {"units": "m", "axis": "Z"})
+        da = xr.DataArray(np.zeros((2, 4, 4)), dims=("height",) + dims, coords=coords)
+        return da, get_spatial_dims(da)
+
+    metric = ({"long_name": "latitude", "units": "m", "axis": "Y"},
+              {"long_name": "longitude", "units": "m", "axis": "X"})
+    da, dims = case(("y", "x"), metric)
+    assert dims == ("y", "x") and not is_geographic_grid(da.x, da.y)
+    da, dims = case(("x", "y"), metric[::-1])                                 # transposed
+    assert dims == ("y", "x")
+    deg = ({"standard_name": "latitude", "units": "degrees_north"},
+           {"standard_name": "longitude", "units": "degrees_east"})
+    da, dims = case(("y", "x"), deg, values=(n * 10.0, n * 30.0))
+    assert dims == ("y", "x") and is_geographic_grid(da.x, da.y)            # was ("y", "y")
+    da, dims = case(("lon", "lat"), deg[::-1], values=(n * 30.0, n * 10.0))
+    assert dims == ("lat", "lon")
+    da, dims = case(("rlat", "rlon"), ({"axis": "Y", "units": "m"}, {"axis": "X", "units": "m"}))
+    assert dims == ("rlat", "rlon")                                          # any names, by axis
+    print("  metric x/y named lon/lat, degree x/y, lat/lon, axis-only: dimensions resolved")
+
+
+def test_errico_detrend():
+    """Errico detrending removes the end-to-end jump along non-periodic axes only and the mean
+    (restored at k = 0), leaves periodic content alone, and the cross spectrum sums to
+    <a' b'> + mean(a) mean(b)."""
+    n, L = 32, 320e3
+    x = np.arange(n) * L / n
+    Y, X = np.meshgrid(x, x, indexing="ij")
+    periodic = np.cos(2 * np.pi * X / L) * np.sin(4 * np.pi * Y / L)
+    da = xr.DataArray(periodic + 3e-5 * Y + 1e-5 * X + 7.0, dims=("y", "x"),
+                      coords={"y": x, "x": x})
+    (da,) = _periodic(da, dims=("x",))                       # x periodic: only y is detrended
+    out = sp.detrend(da, detrend_type="errico")
+    assert np.allclose(out.isel(y=0), out.isel(y=-1))                     # no jump in y
+    assert not np.allclose(out.isel(x=0), out.isel(x=-1))                 # x left alone
+    assert abs(float(out.mean())) < 1e-12                                  # mean removed
+    # a purely periodic field in y (sampled without the end point) keeps a small jump term only
+    resid = out - (periodic + 1e-5 * X + 7.0 - float(da.mean()))
+    assert float(np.abs(resid - resid.mean("y")).max()) < 0.2
+    saved = (sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
+    try:
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = False, "errico"
+        got = float(sp.scalar_cross_spectrum(da, 2 * da).sum(("ky", "kx")))
+        assert np.isclose(got, float((out * 2 * out).mean() + 2 * da.mean() ** 2), rtol=1e-12)
+    finally:
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = saved
+    print("  jump in y and mean removed, x unchanged, Parseval with the mean restored")
+
+
+def test_periodicity_detected_from_the_seam():
+    """periodic_axes auto: periodic axes (seam ~ neighbour difference) are found, a repeated end
+    point is dropped, a cut axis is bounded; explicit lists and 'none' override; and with the
+    defaults the transfers of undeclared periodic data equal those of declared ones."""
+    from types import SimpleNamespace
+    from budget.budget import resolve_periodic_axes, compute_budget
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    ds = xr.Dataset({"u": 10 * u, "v": 10 * v})
+    _, per, rep = resolve_periodic_axes(ds)
+    assert per == ["x", "y"], rep
+    dup = xr.concat([ds, ds.isel(x=[0]).assign_coords(x=[float(ds.x[-1]) + dx])], "x")
+    out, per, rep = resolve_periodic_axes(dup)
+    assert per == ["x", "y"] and out.sizes["x"] == 40 and "dropped" in rep["x"][1], rep
+    cut, per, rep = resolve_periodic_axes(ds.isel(y=slice(5, 30)))
+    assert per == ["x"] and rep["y"][1] == "bounded", rep
+    assert resolve_periodic_axes(ds, ["y"])[1] == ["y"]
+    assert resolve_periodic_axes(ds, "none")[1] == [] and resolve_periodic_axes(ds, [])[1] == []
+
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = xr.ones_like(u) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    full = xr.Dataset({"u": 10 * u + 40.0, "v": 10 * v, "w": w, "theta": theta,
+                       "pressure": pres, "density": pres / (287.0 * 240.0)})
+    pis = {}
+    for axes in (None, ["x", "y"]):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      periodic_axes=axes, rechunk_spatial=False))
+        pis[str(axes)] = compute_budget(full, cfg)["pi_nke"].compute()
+    a, b = pis["None"], pis["['x', 'y']"]
+    err = float(np.abs(a - b).max() / np.abs(b).max())
+    print(f"  seam ratios {rep}; defaults, undeclared vs declared periodic: {err:.1e}")
+    assert err < 1e-12
+
+
+def test_cross_spectrum_parseval_with_mean_and_no_detrend():
+    """Sum over all modes of the cross spectrum equals the domain mean of the product, with a
+    non-zero mean and detrending off (the mean was once restored at k = 0 a second time)."""
+    u, v, _, _, dx = _random_3d_fields(seed=2, n=24, nz=3)
+    a, b = u + 40.0, v * u + 3.0
+    saved = (sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
+    try:
+        for detrend in (None, "constant", "linear"):
+            sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = False, detrend
+            got = sp.scalar_cross_spectrum(a, b).sum(("ky", "kx"))
+            err = float(np.abs(got - (a * b).mean(("y", "x"))).max() / np.abs(a * b).mean())
+            print(f"  detrend {str(detrend):8s}: |sum_k - <a b>| / <|a b|> = {err:.1e}")
+            assert err < 1e-12 or detrend == "linear"
+    finally:
+        sp.SPECTRAL_CFG["taper"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = saved
+
+
+def test_compute_budget_conservative_periodic_axes():
+    """End to end: with transfer_form conservative and periodic_axes [x, y], the cumulative
+    transfers of compute_budget vanish at the smallest wavenumber (no DC, no corner modes) to
+    the energy beyond the Nyquist circle; the flux form with the previous default spectral
+    settings (DPSS taper, linear detrend, no periodic axes) does not."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget, periodic_dims
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = xr.ones_like(u) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u, "v": 10 * v, "w": w, "theta": theta, "pressure": pres,
+                     "density": pres / (287.0 * 240.0)})
+    k_min = {}
+    for form, axes in (("conservative", ["x", "y"]), ("flux", [])):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      transfer_form=form, periodic_axes=axes,
+                                                      rechunk_spatial=False))
+        with _Spectral(True, "linear"):
+            out = compute_budget(ds, cfg).compute()
+        k_min[form] = {k: float(np.abs(_interior(out[k].isel(wavenumber=0)) /
+                                       np.abs(_interior(out[k])).max()).max())
+                       for k in ("pi_nke", "pi_vke", "pi_ape")}
+        print(f"  {form:12s}: max_z |Pi(k_min)| / max|Pi| " +
+              ", ".join(f"{k} {e:.1e}" for k, e in k_min[form].items()))
+    assert all(e < 1e-6 for e in k_min["conservative"].values())
+    assert all(e > 1e-2 for e in k_min["flux"].values())
+    assert "periodic" not in ds.x.attrs                                     # input untouched
+    assert periodic_dims(ds, ["y"]) == ["y"]
+    glob = ds.rename(x="lon", y="lat").assign_coords(lon=np.linspace(0, 351, 40),
+                                                      lat=np.linspace(-60, 60, 40))
+    glob.lon.attrs.update(units="degrees_east", standard_name="longitude")
+    glob.lat.attrs.update(units="degrees_north", standard_name="latitude")
+    assert periodic_dims(glob) == ["lon"]                                   # global longitude
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1456,8 +1725,8 @@ def test_vke_budget_synthetic_gravity_wave():
 
 def test_staggered_outputs_have_zarr_compatible_chunks():
     """Shifted half-level slices must not leave irregular dask chunks along the vertical.
-    On Levante, 501 half levels chunked (251, 250) gave vf_vke chunks (250, 1, 249) on the 500
-    full levels, which zarr refuses."""
+    501 half levels chunked (251, 250) gave vf_vke chunks (250, 1, 249) on the 500 full levels,
+    which zarr refuses."""
     import tempfile
     from budget.vertical import (half_to_full_mean, diff_half_to_full, interp_full_to_half,
                                  diff_full_to_half)
@@ -1481,7 +1750,7 @@ def test_staggered_outputs_have_zarr_compatible_chunks():
 
 
 def test_write_guard_makes_any_chunks_zarr_safe():
-    """The Levante div_hke pattern (z chunks 11, ..., 9, 2, 11, ..., 5) is rechunked before the
+    """An irregular div_hke pattern (z chunks 11, ..., 9, 2, 11, ..., 5) is rechunked before the
     zarr write; values are unchanged and uniform variables are left alone."""
     import tempfile
     from budget.io_utils import zarr_safe_chunks
@@ -1600,7 +1869,16 @@ if __name__ == "__main__":
              test_staggered_outputs_have_zarr_compatible_chunks,
              test_write_guard_makes_any_chunks_zarr_safe,
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
-             test_cartesian_grid_is_not_global]
+             test_cartesian_grid_is_not_global,
+             test_conservative_transfers_sum_to_zero_on_periodic_axes,
+             test_conservative_and_flux_forms_converge,
+             test_periodic_axes_skip_taper_and_linear_detrend,
+             test_compute_budget_conservative_periodic_axes,
+             test_cross_spectrum_parseval_with_mean_and_no_detrend,
+             test_compute_cli_conservative_periodic,
+             test_spatial_dims_from_units_and_axes,
+             test_errico_detrend,
+             test_periodicity_detected_from_the_seam]
     failed = 0
     for t in tests:
         print(f"{t.__name__}")
