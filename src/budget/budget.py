@@ -69,7 +69,9 @@ _BUDGET_META = {
     "lf0_ape": ("lateral_ape_flux_divergence_at_k0",
                 "Lateral APE flux divergence at k = 0 (see lf0_hke)", _BUDGET_UNITS),
     "lf0_pres": ("lateral_pressure_flux_divergence_at_k0",
-                 "Lateral pressure flux divergence at k = 0 (see lf0_hke)", _BUDGET_UNITS),
+                 "Lateral pressure flux divergence at k = 0 (see lf0_hke). Unlike lf_pres at "
+                 "k > 0, it depends on the reference of the Exner perturbation where the domain "
+                 "has a net horizontal divergence", _BUDGET_UNITS),
     "lf_hke": ("lateral_hke_flux_divergence",
                "Lateral (horizontal) flux divergence of horizontal kinetic energy: transport "
                "through the side boundaries, zero on periodic axes", _BUDGET_UNITS),
@@ -466,7 +468,9 @@ def lateral_ape_flux(u: xr.DataArray, v: xr.DataArray, theta_prime: xr.DataArray
 def lateral_pressure_flux(u: xr.DataArray, v: xr.DataArray, theta_mean: xr.DataArray,
                           exner: xr.DataArray, name="lf_pres") -> xr.DataArray:
     """Lateral divergence of pressure work: -c_p θ̄ [(U, ∇π')_k + (∇·U, π')_k], with ∇·U the
-    finite-difference divergence (so that it vanishes at every k on periodic axes)."""
+    finite-difference divergence (so that it vanishes at every k on periodic axes). A constant C
+    added to π' changes only the k = 0 value, by -c_p θ̄ C ⟨∇·U⟩ (the pressure work through the
+    boundaries of a domain with net horizontal divergence depends on the reference pressure)."""
     wind = stack_vector(u, v, name="wind")
     grad = stack_vector(*horizontal_gradient(exner), name="grad")
     lf = -cp * theta_mean * (vector_cross_spectrum(wind, grad)

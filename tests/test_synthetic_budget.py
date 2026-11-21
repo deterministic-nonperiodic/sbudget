@@ -706,6 +706,27 @@ def test_lateral_fluxes_converge_to_boundary_fluxes():
         assert e[2] < 0.05, e
 
 
+def test_lateral_pressure_flux_reference():
+    """A constant C added to pi' leaves L_p unchanged at every k > 0 and changes its k = 0 value
+    (lf0_pres) by -c_p theta C <div U>, where <div U> is the domain mean of the
+    finite-difference divergence (non-zero on a bounded domain)."""
+    from budget.budget import lateral_pressure_flux
+    from budget.constants import cp
+    q, _, dx = _nonperiodic_2d(81)
+    C = 0.01
+    with _Spectral(False, None):
+        a = lateral_pressure_flux(q["u"], q["v"], 1.0 / cp, q["p"])
+        b = lateral_pressure_flux(q["u"], q["v"], 1.0 / cp, q["p"] + C)
+        mean_div = float(horizontal_divergence(q["u"], q["v"]).mean())
+    ia, ib = isotropize(a, dx, dx), isotropize(b, dx, dx)
+    change = float(np.abs(ia - ib).max()) / float(np.abs(ia).max())
+    d0 = float((dc_component(b) - dc_component(a)).squeeze())
+    print(f"  k > 0: max |change| / max |L_p| = {change:.1e}; k = 0 change {d0:.4e}, "
+          f"-C <div U> = {-C * mean_div:.4e}")
+    assert change < 1e-12, change
+    assert abs(d0 + C * mean_div) < 1e-10 * abs(C * mean_div) and abs(mean_div) > 0
+
+
 def test_pressure_work_closes_on_bounded_axes():
     """On a non-periodic domain the vertical-flux decomposition of the horizontal pressure work
     misses the lateral pressure flux; with L_p (lf_pres) it closes at every wavenumber."""
@@ -2283,6 +2304,7 @@ if __name__ == "__main__":
              test_default_detrend_keeps_the_split_exact,
              test_compute_budget_mean_flow_exchange,
              test_compute_budget_lateral_flux_at_k0,
+             test_lateral_pressure_flux_reference,
              test_isotropize_conserves_variance_on_any_grid,
              test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,

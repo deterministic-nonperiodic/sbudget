@@ -178,6 +178,10 @@ divided by the area (again up to the modes beyond the Nyquist circle), and `lf0_
 periodic axes. At $k = 0$ a co-spectrum is the product of the domain means, so for a field
 with a large-scale gradient across the domain and a mean wind most of the boundary flux sits in
 this one mode: without it, the lateral spectra alone can miss most of the boundary flux.
+`lf0_pres` depends on the reference of the Exner perturbation $\pi'$: a constant $C$ added to
+$\pi'$ changes it by $-c_p\bar\theta\, C\,\langle\nabla\cdot\mathbf{u}\rangle$, which the
+$k = 0$ parts of the other pressure terms (not written) compensate. `lf_pres` at $k > 0$ does not
+depend on it.
 
 #### Features
 
