@@ -566,6 +566,39 @@ def test_default_detrend_keeps_the_split_exact():
     assert res["constant"] < 1e-12 and res["errico"] > 1e-3, res
 
 
+def test_compute_budget_mean_flow_exchange():
+    """mf_hke, mf_vke, mf_ape are the interior transfers at k = 0, which the isotropic spectra
+    leave out: with them the interior transfers close, pi_*(k_min) + mf_* = 0 to round-off, on
+    periodic and on bounded axes, with the default spectral settings (the fields have no energy
+    beyond the Nyquist circle). A mean wind makes the HKE exchange with the mean flow non-zero;
+    the VKE and APE terms vanish here because w and theta' have zero domain mean (on a lon-lat
+    grid the k = 0 mode of the area-weighted fields need not)."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget, _BUDGET_META
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = xr.ones_like(u) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u + 20.0 + 0.1 * u.z / 1e3, "v": 10 * v, "w": w, "theta": theta,
+                     "pressure": pres, "density": pres / (287.0 * 240.0)})
+    for axes in (["x", "y"], []):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      transfer_form="conservative",
+                                                      periodic_axes=axes, rechunk_spatial=False))
+        out = compute_budget(ds, cfg).compute()
+        for pi, mf in (("pi_nke", "mf_hke"), ("pi_vke", "mf_vke"), ("pi_ape", "mf_ape")):
+            assert "wavenumber" not in out[mf].dims and out[mf].attrs["standard_name"] == \
+                _BUDGET_META[mf][0]
+            scale = float(np.abs(out[pi]).max())
+            closure = float(np.abs(out[pi].isel(wavenumber=0) + out[mf]).max()) / scale
+            size = float(np.abs(out[mf]).max()) / scale
+            print(f"  axes {str(axes):10s} {pi}: max_z |Pi(k_min) + {mf}| = {closure:.1e}, "
+                  f"max |{mf}| = {size:.2f} (of max|Pi|)")
+            assert closure < 1e-12, (axes, pi, closure)
+            if mf == "mf_hke":
+                assert size > 1e-2, (axes, mf, size)
+
+
 def _nonperiodic_2d(n, L=500e3):
     """Analytic, non-periodic fields on [0, L]^2 (both end points on the grid), one level."""
     x = np.linspace(0.0, L, n)
@@ -2191,6 +2224,7 @@ if __name__ == "__main__":
              test_pressure_work_closes_on_bounded_axes,
              test_compute_budget_lateral_split,
              test_default_detrend_keeps_the_split_exact,
+             test_compute_budget_mean_flow_exchange,
              test_isotropize_conserves_variance_on_any_grid,
              test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,

@@ -542,6 +542,15 @@ def vector_cross_spectrum(vec1: xr.DataArray, vec2: xr.DataArray) -> xr.DataArra
     return u_term + v_term
 
 
+def dc_component(spectrum: xr.DataArray) -> xr.DataArray:
+    """The k = 0 (domain-mean) value of a 2-D spectrum from scalar_spectrum,
+    scalar_cross_spectrum or vector_cross_spectrum (ky shifted: k = 0 at ky index ny // 2, kx
+    index 0). isotropize leaves it out unless include_dc."""
+    ny = int(spectrum.sizes["ky"])
+    dc = spectrum.isel(ky=ny // 2, kx=0)
+    return dc.drop_vars([c for c in ("ky", "kx", "nx_grid") if c in dc.coords])
+
+
 def _prep_bins(nx_fft: int, ny: int, dx: float, dy: float, nyquist=True, include_dc=False,
                nx: int | None = None):
     """

@@ -11,7 +11,7 @@ from .numeric_tools import horizontal_advection, horizontal_gradient, skew_symme
 from .numeric_tools import mark_periodic
 from .grid_utils import resolve_periodic_axes
 from .numeric_tools import horizontal_divergence, relative_vorticity
-from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize
+from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize, dc_component
 from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
 from .thermodynamics import hydrostatic_exner_function
 from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
@@ -51,6 +51,14 @@ _BUDGET_META = {
     "pi_ape": ("nonlinear_ape_transfer",
                "Nonlinear spectral transfer of available potential energy (interior part)",
                _BUDGET_UNITS),
+    "mf_hke": ("hke_transfer_to_domain_mean_flow",
+               "Interior HKE transfer at k = 0: energy gained by the domain-mean flow from the "
+               "fluctuations; the cumulative pi_nke at the lowest wavenumber is minus this",
+               _BUDGET_UNITS),
+    "mf_vke": ("vke_transfer_to_domain_mean_flow",
+               "Interior VKE transfer at k = 0 (see mf_hke)", _BUDGET_UNITS),
+    "mf_ape": ("ape_transfer_to_domain_mean_flow",
+               "Interior APE transfer at k = 0 (see mf_hke)", _BUDGET_UNITS),
     "lf_hke": ("lateral_hke_flux_divergence",
                "Lateral (horizontal) flux divergence of horizontal kinetic energy: transport "
                "through the side boundaries, zero on periodic axes", _BUDGET_UNITS),
@@ -923,6 +931,9 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     pi_nke_2d = (pi_nke_2d - lf_hke_2d).rename("pi_nke")
     pi_nke = isotropize(pi_nke_2d, dx, dy, cumulative=cumulative)
     lf_hke = isotropize(lf_hke_2d, dx, dy, cumulative=cumulative)
+    # k = 0: the isotropic spectra exclude the domain-mean mode, so the interior transfer summed
+    # over the output wavenumbers is minus its value there (exchange with the domain-mean flow)
+    mf_hke = dc_component(pi_nke_2d).rename("mf_hke")
 
     pi_lke_2d = coriolis_linear_transfer(u, v, name="pi_lke")
     pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
@@ -933,6 +944,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     pi_vke_2d = (pi_vke_2d - lf_vke_2d).rename("pi_vke")
     pi_vke = isotropize(pi_vke_2d, dx, dy, cumulative=cumulative)
     lf_vke = isotropize(lf_vke_2d, dx, dy, cumulative=cumulative)
+    mf_vke = dc_component(pi_vke_2d).rename("mf_vke")
 
     pi_ape_2d = nonlinear_ape_transfer(u, v, w, theta_prime, gamma, divergence,
                                        conservative=conservative, name="pi_ape")
@@ -940,6 +952,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     pi_ape_2d = (pi_ape_2d - lf_ape_2d).rename("pi_ape")
     pi_ape = isotropize(pi_ape_2d, dx, dy, cumulative=cumulative)
     lf_ape = isotropize(lf_ape_2d, dx, dy, cumulative=cumulative)
+    mf_ape = dc_component(pi_ape_2d).rename("mf_ape")
 
     # --- PRESSURE PERTURBATION (Exner deviation from the hydrostatic reference) ---
     exner_surface = domain_mean(exner.sel(z=exner.z.min()))
@@ -1038,7 +1051,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
               pi_nke, pi_lke, pi_vke, pi_ape, vfd_dke, vfd_vke, vfd_ape,
               j_hke, j_vke, j_ape, vf_hke, vf_vke, vf_ape, cad, caz,
               vf_pres, vfd_pres, j_pres, div_pres, np_hke, np_vke,
-              div_hke, div_vke, div_ape, lf_hke, lf_vke, lf_ape, lf_pres]
+              div_hke, div_vke, div_ape, lf_hke, lf_vke, lf_ape, lf_pres,
+              mf_hke, mf_vke, mf_ape]
 
     # Filter out None and assemble into Dataset. Metadata by output name: terms built outside the
     # decorated functions (staggered vertical terms, flux divergences) would otherwise keep the

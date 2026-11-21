@@ -161,9 +161,16 @@ Outputs: `pi_nke`, `pi_vke`, `pi_ape` are the interior transfers; `lf_hke`, `lf_
 `lf_pres` the lateral flux divergences (cumulative, like the other terms). The full transfer of
 the chosen form is their sum, e.g. `pi_nke + lf_hke`; on periodic axes `lf_*` is zero and
 `pi_*` is the full transfer. How the boundary flux spreads over $k$ depends on the Fourier basis
-of the bounded domain, as does every spectrum there; their sum over $k$ is the boundary flux. The cumulative
-outputs exclude the domain-mean mode $k = 0$, so $\Pi(k_{min}) = -T(0)$: the exchange between
-the fluctuations and the domain-mean flow, not zero even on a periodic domain.
+of the bounded domain, as does every spectrum there; their sum over $k$ is the boundary flux.
+
+The isotropic spectra exclude the domain-mean mode $k = 0$, and the interior transfer at $k = 0$
+is the exchange between the fluctuations and the domain-mean flow, which is not zero even on a
+periodic domain (e.g. wave drag on a mean wind). It is written as `mf_hke`, `mf_vke`, `mf_ape`
+(per time and level, no wavenumber dimension; positive when the mean flow gains energy), so
+that `pi_*` at the lowest wavenumber plus `mf_*` is zero, up to the transfer in the modes beyond
+the Nyquist circle, which the isotropic spectra also leave out (small unless the grid is very
+anisotropic). On lon–lat grids the spectra are those of the area-weighted fields, and $k = 0$ is
+the mean of the weighted field.
 
 #### Features
 
