@@ -28,7 +28,7 @@ from budget.budget import (nonlinear_hke_transfer_flux, nonlinear_hke_transfer_i
 from budget.inter_scale_transfers import inter_scale_kinetic_energy_transfer  # noqa: E402
 from budget.numeric_tools import (horizontal_divergence, relative_vorticity,  # noqa: E402
                                   horizontal_advection, stack_vector)
-from budget.spectral_primitives import isotropize, vector_cross_spectrum  # noqa: E402
+from budget.spectral_primitives import isotropize, vector_cross_spectrum, dc_component  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------------
@@ -599,6 +599,52 @@ def test_compute_budget_mean_flow_exchange():
                 assert size > 1e-2, (axes, mf, size)
 
 
+def test_compute_budget_lateral_flux_at_k0():
+    """lf0_hke, lf0_vke, lf0_ape, lf0_pres are the lateral flux divergences at k = 0, which the
+    isotropic spectra leave out. They vanish on periodic axes (skew-adjointness holds at k = 0 as
+    at every k); on bounded axes lf0_hke is the k = 0 value of L_h computed directly, and
+    lf_hke(k_min) + lf0_hke is the sum of L_h over all wavenumbers inside the Nyquist circle. At
+    k = 0 a co-spectrum is the product of the domain means: lf0_hke is non-zero here (mean wind),
+    lf0_vke and lf0_ape vanish because w and theta' have zero mean, and lf0_pres is small because
+    these fields are periodic in the data, so the domain-mean pressure gradient nearly vanishes
+    (test_lateral_fluxes_converge_to_boundary_fluxes covers a field that is not)."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget, _BUDGET_META, lateral_hke_flux
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = (1.0 + 1e-3 * v) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]   # horizontal pi'
+    ds = xr.Dataset({"u": 10 * u + 20.0 + 0.1 * u.z / 1e3, "v": 10 * v, "w": w, "theta": theta,
+                     "pressure": pres, "density": pres / (287.0 * 240.0)})
+    names = (("lf_hke", "lf0_hke"), ("lf_vke", "lf0_vke"), ("lf_ape", "lf0_ape"),
+             ("lf_pres", "lf0_pres"))
+    out = {}
+    for axes in (["x", "y"], []):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      transfer_form="conservative",
+                                                      periodic_axes=axes, rechunk_spatial=False))
+        out[str(axes)] = compute_budget(ds, cfg).compute()
+    per, bnd = out["['x', 'y']"], out["[]"]
+    for lf, lf0 in names:
+        assert "wavenumber" not in bnd[lf0].dims
+        assert bnd[lf0].attrs["standard_name"] == _BUDGET_META[lf0][0]
+        scale = max(float(np.abs(bnd[lf]).max()), float(np.abs(bnd[lf0]).max()))
+        r_per = float(np.abs(per[lf0]).max()) / scale
+        size = float(np.abs(bnd[lf0]).max()) / scale
+        print(f"  {lf0}: max |periodic| = {r_per:.1e}, max |bounded| = {size:.2f} (of max|{lf}|, |{lf0}|)")
+        assert r_per < 1e-10, (lf0, r_per)
+        if lf0 == "lf0_hke":
+            assert size > 1e-2, (lf0, size)
+    direct = lateral_hke_flux(ds.u, ds.v)                   # bounded: coordinates not marked
+    scale = float(np.abs(bnd.lf_hke).max())
+    err0 = float(np.abs(bnd.lf0_hke - dc_component(direct)).max()) / scale
+    err_sum = float(np.abs(bnd.lf_hke.isel(wavenumber=0) + bnd.lf0_hke
+                           - _shell_sum(direct, dx)).max()) / scale
+    print(f"  bounded: |lf0_hke - L_h(0)| = {err0:.1e}, "
+          f"|lf_hke(k_min) + lf0_hke - sum_k L_h| = {err_sum:.1e} (of max|lf_hke|)")
+    assert err0 < 1e-12 and err_sum < 1e-12, (err0, err_sum)
+
+
 def _nonperiodic_2d(n, L=500e3):
     """Analytic, non-periodic fields on [0, L]^2 (both end points on the grid), one level."""
     x = np.linspace(0.0, L, n)
@@ -624,7 +670,9 @@ def test_lateral_fluxes_converge_to_boundary_fluxes():
     """Summed over wavenumbers, L_h and L_p equal minus the advective HKE flux U |U|^2/2 and the
     pressure flux pi' U through the edges of a non-periodic domain, divided by the area: the
     grid sum is a domain mean of a discrete divergence, so it converges at first order (end-point
-    weights) to the boundary integral."""
+    weights) to the boundary integral. The sum is taken as compute_budget writes it, the
+    cumulative lf_* at the lowest wavenumber plus lf0_* (k = 0); it equals the shell sum
+    including k = 0 to round-off."""
     from budget.budget import lateral_hke_flux, lateral_pressure_flux
     from budget.constants import cp
     _, f, _ = _nonperiodic_2d(3)
@@ -637,12 +685,21 @@ def test_lateral_fluxes_converge_to_boundary_fluxes():
     for n in (41, 81, 161):
         q, _, dx = _nonperiodic_2d(n)
         with _Spectral(False, None):
-            lh = float(_shell_sum(lateral_hke_flux(q["u"], q["v"]), dx).squeeze())
-            lp = float(_shell_sum(lateral_pressure_flux(q["u"], q["v"], 1.0 / cp, q["p"]),
-                                  dx).squeeze())
+            sums, without_k0 = [], []
+            for spec in (lateral_hke_flux(q["u"], q["v"]),
+                         lateral_pressure_flux(q["u"], q["v"], 1.0 / cp, q["p"])):
+                # as compute_budget writes them: lf_* (cumulative) at k_min and lf0_* (k = 0)
+                k_min = float(isotropize(spec, dx, dx, cumulative=True).isel(wavenumber=0)
+                              .squeeze())
+                sums.append(k_min + float(dc_component(spec).squeeze()))
+                without_k0.append(k_min)
+                assert abs(sums[-1] - float(_shell_sum(spec, dx).squeeze())) < \
+                    1e-12 * abs(sums[-1])
+        lh, lp = sums
         errors.append((abs(lh / exact_h - 1), abs(lp / exact_p - 1)))
-        print(f"  n = {n:3d}: sum_k L_h / boundary flux - 1 = {lh / exact_h - 1:+.4f}, "
-              f"L_p: {lp / exact_p - 1:+.4f}")
+        print(f"  n = {n:3d}: (L_h(k_min) + L_h(0)) / boundary flux - 1 = {lh / exact_h - 1:+.4f}"
+              f" (without k = 0: {without_k0[0] / exact_h - 1:+.4f}), L_p: {lp / exact_p - 1:+.4f}"
+              f" ({without_k0[1] / exact_p - 1:+.4f})")
     for i in range(2):
         e = [err[i] for err in errors]
         assert e[0] / e[1] > 1.7 and e[1] / e[2] > 1.7, e         # first-order convergence
@@ -2225,6 +2282,7 @@ if __name__ == "__main__":
              test_compute_budget_lateral_split,
              test_default_detrend_keeps_the_split_exact,
              test_compute_budget_mean_flow_exchange,
+             test_compute_budget_lateral_flux_at_k0,
              test_isotropize_conserves_variance_on_any_grid,
              test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,

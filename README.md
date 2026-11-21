@@ -172,6 +172,13 @@ the Nyquist circle, which the isotropic spectra also leave out (small unless the
 anisotropic). On lon–lat grids the spectra are those of the area-weighted fields, and $k = 0$ is
 the mean of the weighted field.
 
+The lateral terms are written at $k = 0$ in the same way, as `lf0_hke`, `lf0_vke`, `lf0_ape`,
+`lf0_pres`: `lf_*` at the lowest wavenumber plus `lf0_*` is the flux through the side boundaries
+divided by the area (again up to the modes beyond the Nyquist circle), and `lf0_*` is zero on
+periodic axes. At $k = 0$ a co-spectrum is the product of the domain means, so for a field
+with a large-scale gradient across the domain and a mean wind most of the boundary flux sits in
+this one mode: without it, the lateral spectra alone can miss most of the boundary flux.
+
 #### Features
 
 - FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along

@@ -59,6 +59,17 @@ _BUDGET_META = {
                "Interior VKE transfer at k = 0 (see mf_hke)", _BUDGET_UNITS),
     "mf_ape": ("ape_transfer_to_domain_mean_flow",
                "Interior APE transfer at k = 0 (see mf_hke)", _BUDGET_UNITS),
+    "lf0_hke": ("lateral_hke_flux_divergence_at_k0",
+                "Lateral HKE flux divergence at k = 0 (domain-mean mode), which the isotropic "
+                "spectra leave out: lf_hke at the lowest wavenumber plus this is the HKE flux "
+                "through the side boundaries divided by the area; zero on periodic axes",
+                _BUDGET_UNITS),
+    "lf0_vke": ("lateral_vke_flux_divergence_at_k0",
+                "Lateral VKE flux divergence at k = 0 (see lf0_hke)", _BUDGET_UNITS),
+    "lf0_ape": ("lateral_ape_flux_divergence_at_k0",
+                "Lateral APE flux divergence at k = 0 (see lf0_hke)", _BUDGET_UNITS),
+    "lf0_pres": ("lateral_pressure_flux_divergence_at_k0",
+                 "Lateral pressure flux divergence at k = 0 (see lf0_hke)", _BUDGET_UNITS),
     "lf_hke": ("lateral_hke_flux_divergence",
                "Lateral (horizontal) flux divergence of horizontal kinetic energy: transport "
                "through the side boundaries, zero on periodic axes", _BUDGET_UNITS),
@@ -934,6 +945,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # k = 0: the isotropic spectra exclude the domain-mean mode, so the interior transfer summed
     # over the output wavenumbers is minus its value there (exchange with the domain-mean flow)
     mf_hke = dc_component(pi_nke_2d).rename("mf_hke")
+    # likewise the lateral term: lf_*(k_min) + lf0_* is the flux through the side boundaries
+    lf0_hke = dc_component(lf_hke_2d).rename("lf0_hke")
 
     pi_lke_2d = coriolis_linear_transfer(u, v, name="pi_lke")
     pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
@@ -945,6 +958,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     pi_vke = isotropize(pi_vke_2d, dx, dy, cumulative=cumulative)
     lf_vke = isotropize(lf_vke_2d, dx, dy, cumulative=cumulative)
     mf_vke = dc_component(pi_vke_2d).rename("mf_vke")
+    lf0_vke = dc_component(lf_vke_2d).rename("lf0_vke")
 
     pi_ape_2d = nonlinear_ape_transfer(u, v, w, theta_prime, gamma, divergence,
                                        conservative=conservative, name="pi_ape")
@@ -953,6 +967,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     pi_ape = isotropize(pi_ape_2d, dx, dy, cumulative=cumulative)
     lf_ape = isotropize(lf_ape_2d, dx, dy, cumulative=cumulative)
     mf_ape = dc_component(pi_ape_2d).rename("mf_ape")
+    lf0_ape = dc_component(lf_ape_2d).rename("lf0_ape")
 
     # --- PRESSURE PERTURBATION (Exner deviation from the hydrostatic reference) ---
     exner_surface = domain_mean(exner.sel(z=exner.z.min()))
@@ -1025,6 +1040,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # Lateral pressure flux: with it, the horizontal pressure work closes on bounded axes too
     lf_pres_2d = lateral_pressure_flux(u, v, theta_mean, exner_prime, name="lf_pres")
     lf_pres = isotropize(lf_pres_2d, dx, dy, cumulative=cumulative)
+    lf0_pres = dc_component(lf_pres_2d).rename("lf0_pres")
 
     np_hke_2d = nonlinear_pressure_work_hke(u, v, theta_prime, exner_prime, name="np_hke")
     np_hke = isotropize(np_hke_2d, dx, dy, cumulative=cumulative)
@@ -1052,7 +1068,7 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
               j_hke, j_vke, j_ape, vf_hke, vf_vke, vf_ape, cad, caz,
               vf_pres, vfd_pres, j_pres, div_pres, np_hke, np_vke,
               div_hke, div_vke, div_ape, lf_hke, lf_vke, lf_ape, lf_pres,
-              mf_hke, mf_vke, mf_ape]
+              mf_hke, mf_vke, mf_ape, lf0_hke, lf0_vke, lf0_ape, lf0_pres]
 
     # Filter out None and assemble into Dataset. Metadata by output name: terms built outside the
     # decorated functions (staggered vertical terms, flux divergences) would otherwise keep the
