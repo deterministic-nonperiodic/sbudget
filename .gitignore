@@ -31,9 +31,8 @@ logs/
 dev/
 docs/
 
-# Config files with local paths
-origin_config.yaml
-vortex_config.yaml
+# Config files with local paths (the examples/ configs are generic and tracked)
+/*_config.yaml
 
 # Misc
 *.DS_Store

@@ -1,0 +1,34 @@
+# Example configuration for a Cartesian (x, y in metres) limited-area model output.
+# Every path is a placeholder: copy this file and edit it, or override on the command line
+# (--input-path, --output-path). See examples/config.yaml for a lon-lat grid.
+input:
+  path: ./model_output.nc   # input file (netCDF or Zarr)
+  dims: [ z, y, x ]         # names of the vertical and horizontal dimensions
+  engine: h5netcdf          # optional: h5netcdf | netcdf4 | scipy
+
+output:
+  path: ./budget.nc         # output file path
+  store: netcdf             # netcdf | zarr
+  overwrite: true
+
+compute:
+  mode: spectral_budget     # spectral_budget | scale_transfer
+  dx: null                  # grid spacing (m); null: inferred from the coordinates
+  dy: null
+  cumulative: true          # cumulative sums from the smallest scale (default)
+  transfer_form: conservative  # conservative (skew-symmetric) | flux | invariant
+  periodic_axes: auto       # auto (seam test) | [x] | [x, y] | none
+  nyquist_cutoff: true      # false: isotropic bins extend to the grid corner
+  include_k0: false         # true: first bin at wavenumber 0 (domain totals)
+  rechunk_spatial: false
+  chunk_size: 512           # largest chunk size (MB) for a horizontal plane
+  scheduler: null           # null = auto (threads locally, distributed under SLURM)
+
+variables:                  # logical name: variable name in the input file
+  u: u
+  v: v
+  w: w
+  theta: theta              # preferred; if missing, derived from pressure and temperature
+  pressure: pres
+  temperature: temp
+  density: rho              # optional: derived from pressure and temperature
