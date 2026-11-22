@@ -1,6 +1,6 @@
 input:
   path: ./model_output.nc
-  dims: [ z_mc,  lat, lon ] # [y, x] Names of the horizontal spatial dimensions
+  dims: [ height, lat, lon ] # [z, y, x]: names of the vertical and horizontal dimensions
   engine: netcdf4           # optional: h5netcdf | netcdf4 | scipy
 
 output:
@@ -15,6 +15,9 @@ compute:
   dx: null                  # only for Cartesian grids; lon/lat inferred
   dy: null
   cumulative: true          # default; set false for raw (non-accumulated) spectra
+  nyquist_cutoff: true      # isotropic bins stop at the Nyquist wavenumber of the coarser axis;
+                            # false: bins extend to the grid corner (sums include every mode)
+  include_k0: false         # true: first bin at wavenumber 0 (domain-mean mode, domain totals)
   transfer_form: conservative  # conservative (skew-symmetric), flux or invariant spectral transfers
   periodic_axes: auto       # auto (seam test), [x], [x, y] or none: wrapping derivatives, no detrend
   # FFT stability & memory control

@@ -169,8 +169,9 @@ periodic domain (e.g. wave drag on a mean wind). It is written as `mf_hke`, `mf_
 (per time and level, no wavenumber dimension; positive when the mean flow gains energy), so
 that `pi_*` at the lowest wavenumber plus `mf_*` is zero, up to the transfer in the modes beyond
 the Nyquist circle, which the isotropic spectra also leave out (small unless the grid is very
-anisotropic). On lon–lat grids the spectra are those of the area-weighted fields, and $k = 0$ is
-the mean of the weighted field.
+anisotropic; `nyquist_cutoff: false` extends the bins to the grid corner and includes them). On
+lon–lat grids the spectra are those of the area-weighted fields, and $k = 0$ is the area-weighted
+mean.
 
 The lateral terms are written at $k = 0$ in the same way, as `lf0_hke`, `lf0_vke`, `lf0_ape`,
 `lf0_pres`: `lf_*` at the lowest wavenumber plus `lf0_*` is the flux through the side boundaries
@@ -180,8 +181,8 @@ with a large-scale gradient across the domain and a mean wind most of the bounda
 this one mode: without it, the lateral spectra alone can miss most of the boundary flux.
 `lf0_pres` depends on the reference of the Exner perturbation $\pi'$: a constant $C$ added to
 $\pi'$ changes it by $-c_p\bar\theta\, C\,\langle\nabla\cdot\mathbf{u}\rangle$, which the
-$k = 0$ parts of the other pressure terms (not written) compensate. `lf_pres` at $k > 0$ does not
-depend on it.
+$k = 0$ parts of the other pressure terms compensate (written with `include_k0: true`, which
+adds a $k = 0$ bin to every term). `lf_pres` at $k > 0$ does not depend on it.
 
 #### Reading the output
 
@@ -190,7 +191,10 @@ Every term is written per unit mass (W kg⁻¹), with dimensions (`time`, `z`, `
 each transfer, flux and conversion term $X$ is accumulated from the smallest resolved scale,
 $X(k) = \sum_{k' \ge k} X(k')$: the net effect of all scales smaller than $2\pi/k$. The energy
 spectra (`hke`, `rke`, `dke`, `vke`, `ape`) are not accumulated, and the $k = 0$ terms (`mf_*`,
-`lf0_*`) have no `wavenumber` dimension.
+`lf0_*`) have no `wavenumber` dimension. With `include_k0: true` the first bin is $k = 0$ and its
+cumulative value is the domain total of each term. The settings that change how the output is
+read (`cumulative`, `nyquist_cutoff`, `include_k0`, `transfer_form`, `periodic_axes`, detrending
+and taper) are stored as global attributes.
 
 How to read a cumulative curve:
 
@@ -242,9 +246,9 @@ What the terms do:
 Checks to run on your own output:
 
 1. `pi_*` at the lowest wavenumber plus `mf_*` is close to zero. The remainder is the modes
-   beyond the Nyquist circle, a few percent at most on strongly anisotropic grids. A larger
-   remainder means the spectra do not satisfy Parseval's theorem (end-point detrending or a
-   taper).
+   beyond the Nyquist circle, a few percent at most on strongly anisotropic grids, and zero with
+   `nyquist_cutoff: false`. A larger remainder means the spectra do not satisfy Parseval's
+   theorem (end-point detrending or a taper).
 2. On periodic axes, `lf_*` and `lf0_*` are zero.
 3. `pi_* + lf_*` is the transfer before the split, as in a code without lateral fluxes.
 4. `lf_*` at the lowest wavenumber plus `lf0_*` is the flux through the side boundaries, except
@@ -260,7 +264,7 @@ python examples/plot_budget.py budget.nc --layers 20e3,50e3 50e3,80e3 -o budget.
 # density-weighted layers (W m-2): any file with the density; averaged over all dims except z
 python examples/plot_budget.py budget.nc --layers 20e3,50e3 \
     --density model_output.nc --density-var rho --density-zdim height
-# output written with cumulative: false
+# outputs older than the global attributes, written with cumulative: false
 python examples/plot_budget.py budget.nc --not-cumulative --layers 20e3,50e3
 ```
 
@@ -414,7 +418,8 @@ Quick help
   sbudget compute --help
 ```
 
-Compute budget based on configuration file
+Compute budget based on configuration file (`examples/config.yaml` for a lon–lat grid,
+`examples/config_cartesian.yaml` for a Cartesian one; the paths in both are placeholders)
 
 ```bash  
   sbudget compute examples/config.yaml

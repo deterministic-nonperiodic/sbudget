@@ -301,6 +301,30 @@ def test_compute_cli_conservative_periodic(tmp_path=None):
         err = float(np.abs(pi.isel(wavenumber=0)).max() / np.abs(pi).max())
         print(f"  CLI {k}: max_z |Pi(k_min)| / max|Pi| = {err:.1e}")
         assert err < 1e-3, (k, err)     # float32 storage: theta' ~ 1 K on 250 K
+    expected = {"cumulative": 1, "nyquist_cutoff": 1, "include_k0": 0,
+                "transfer_form": "conservative", "periodic_axes": "x,y"}
+    assert all(out.attrs.get(k) == v for k, v in expected.items()), out.attrs
+    # the binning flags reach the computation
+    main(["compute", str(tmp / "config.yaml"), "--no-client", "--periodic-axes", "x,y",
+          "--no-nyquist-cutoff", "--include-k0", "--output-path", str(tmp / "out_k0.nc"),
+          "--overwrite"])
+    out_k0 = xr.open_dataset(tmp / "out_k0.nc")
+    assert out_k0.attrs["nyquist_cutoff"] == 0 and out_k0.attrs["include_k0"] == 1
+    assert float(out_k0.wavenumber[0]) == 0.0
+    assert out_k0.sizes["wavenumber"] > out.sizes["wavenumber"] + 1
+    print(f"  CLI attributes {expected}; --no-nyquist-cutoff --include-k0: "
+          f"{out_k0.sizes['wavenumber']} bins from k = 0 (default {out.sizes['wavenumber']})")
+
+
+def test_example_configs_load():
+    """The configurations shipped in examples/ load, and their paths are placeholders."""
+    from budget.config import load_config
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("config.yaml", "config_cartesian.yaml"):
+        cfg = load_config(os.path.join(here, "..", "examples", name))
+        assert cfg.input.path.startswith("./") and cfg.output.path.startswith("./"), name
+        assert cfg.compute.nyquist_cutoff is True and cfg.compute.include_k0 is False, name
+        print(f"  examples/{name}: dims {cfg.input.dims}, mode {cfg.compute.mode}")
 
 
 def test_spatial_dims_from_units_and_axes():
@@ -647,8 +671,9 @@ def test_compute_budget_lateral_flux_at_k0():
 
 def test_example_plot_budget():
     """examples/plot_budget.py runs on compute_budget outputs (periodic and bounded, with and
-    without a density profile), and its accumulation of an output written with cumulative: false
-    reproduces the cumulative output."""
+    without a density profile, with the k = 0 bin and every mode), and its accumulation of an
+    output written with cumulative: false (read from the output's attribute) reproduces the
+    cumulative output."""
     import importlib.util
     import tempfile
     from types import SimpleNamespace
@@ -693,6 +718,169 @@ def test_example_plot_budget():
             pb.main([os.path.join(tmp, "budget_False.nc"), "--not-cumulative", "--layers",
                      "5e3,20e3", "--density", rho_path, "--density-zdim", "height", "-o", fig])
             assert os.path.getsize(fig) > 0
+            # outputs with the k = 0 bin and every mode
+            cfg = SimpleNamespace(compute=SimpleNamespace(
+                dx=dx, dy=dx, cumulative=False, transfer_form="conservative",
+                periodic_axes=axes, rechunk_spatial=False, nyquist_cutoff=False, include_k0=True))
+            compute_budget(ds, cfg).compute().to_netcdf(os.path.join(tmp, "budget_k0.nc"))
+            pb.main([os.path.join(tmp, "budget_k0.nc"), "--layers", "5e3,20e3", "-o", fig])
+
+
+def _lonlat_fields(nlat=60, nlon=90, lat0=60.0, dlat=0.05, dlon=0.1, nz=9, seed=3):
+    """Smooth fields on a bounded lon-lat grid (degrees), not periodic in either direction."""
+    rng = np.random.default_rng(seed)
+    lat = lat0 + np.arange(nlat) * dlat
+    lon = 10.0 + np.arange(nlon) * dlon
+    z = np.linspace(30e3, 32e3, nz)
+    Z, LA, LO = np.meshgrid(z, lat, lon, indexing="ij")
+
+    def field():
+        f = np.zeros_like(LA)
+        for _ in range(8):
+            f += rng.normal() * np.cos(
+                rng.uniform(0.5, 4) * 2 * np.pi * (LO - 10.0) / (nlon * dlon)
+                + rng.uniform(0.5, 4) * 2 * np.pi * (LA - lat0) / (nlat * dlat)
+                + rng.uniform(1, 3) * Z / 1e3 + rng.uniform(0, 6))
+        return f
+
+    def da(a):
+        out = xr.DataArray(a, dims=("z", "lat", "lon"), coords={"z": z, "lat": lat, "lon": lon})
+        out.lat.attrs.update(units="degrees_north")
+        out.lon.attrs.update(units="degrees_east")
+        return out
+    return da(10 * field() + 15.0), da(10 * field()), da(field())
+
+
+def test_parseval_on_lonlat_grids():
+    """On lon-lat grids the spectra are those of the fields times sqrt(cos(lat)) (area weighting),
+    and the mean removed before the FFT and restored at k = 0 must be the mean with the same
+    weights: then a co-spectrum summed over every mode is the area-weighted domain mean of the
+    product (the plain mean without area weighting), and the interior HKE transfer sums to
+    round-off on a bounded lon-lat grid. Removing a cos^2-weighted mean and restoring the
+    cos-weighted one left 4e-7 of each co-spectrum and 2e-5 of max|Pi| in the interior sum
+    (4e-3 without area weighting)."""
+    from budget.budget import lateral_hke_flux
+    from budget.cf_coords import infer_grid_resolution
+    u, v, w = _lonlat_fields()
+    dx, dy = infer_grid_resolution(xr.Dataset({"u": u}))
+    a, b = u.isel(z=4), v.isel(z=4) + 3.0
+    cos = np.cos(np.deg2rad(a.lat))
+    saved = (sp.SPECTRAL_CFG["area_weighting"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"])
+    try:
+        for weighting in (True, False):
+            sp.SPECTRAL_CFG["area_weighting"]["enabled"] = weighting
+            mean = float((a * b * cos).sum() / (cos.sum() * a.sizes["lon"])) if weighting \
+                else float((a * b).mean())
+            for detrend in ("constant", None):
+                sp.SPECTRAL_CFG["detrend"]["type"] = detrend
+                total = float(isotropize(sp.scalar_cross_spectrum(a, b), dx, dy, nyquist=False,
+                                         include_dc=True).sum())
+                err = abs(total / mean - 1)
+                print(f"  area weighting {weighting!s:5}, detrend {detrend!s:8}: "
+                      f"|sum_k (a, b)_k / <ab> - 1| = {err:.1e}")
+                assert err < 1e-12, (weighting, detrend, err)
+            sp.SPECTRAL_CFG["detrend"]["type"] = "constant"
+            t2d = (nonlinear_hke_transfer_flux(u, v, w, conservative=True)
+                   - lateral_hke_flux(u, v)).isel(z=4)
+            total = float(isotropize(t2d, dx, dy, nyquist=False, include_dc=True).sum())
+            scale = float(np.abs(isotropize(t2d, dx, dy, cumulative=True)).max())
+            print(f"  area weighting {weighting!s:5}: interior HKE transfer, |sum_k| / max|Pi| = "
+                  f"{abs(total) / scale:.1e}")
+            assert abs(total) < 1e-12 * scale, (weighting, total / scale)
+    finally:
+        sp.SPECTRAL_CFG["area_weighting"]["enabled"], sp.SPECTRAL_CFG["detrend"]["type"] = saved
+
+
+def test_compute_budget_binning_options():
+    """nyquist_cutoff = False extends the isotropic bins to the corner of the grid; on an
+    anisotropic, bounded grid (energy beyond the Nyquist circle) the interior transfer then
+    closes with mf_*, pi_*(k_min) + mf_* = 0, which the default binning leaves open.
+    include_k0 = True adds a bin at wavenumber 0 whose cumulative value is the domain total:
+    pi_* there equals pi_*(k_min) + mf_*, lf_* equals lf_*(k_min) + lf0_*. The output records
+    the settings as global attributes."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    dy = 2.5 * dx
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = (1.0 + 1e-3 * v) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u + 20.0, "v": 10 * v, "w": w, "theta": theta, "pressure": pres,
+                     "density": pres / (287.0 * 240.0)})
+    # short waves along x (12 cycles over the domain; the Nyquist circle of dy is at 8)
+    short = np.cos(2 * np.pi * (12 * ds.x / (40 * dx) + 2 * ds.y / (40 * dx)) + 0.3 * ds.z / 1e3)
+    ds["u"] = ds.u + 4.0 * short
+    ds["v"] = ds.v + 3.0 * short.shift(x=3, fill_value=0.0)
+    ds = ds.assign_coords(y=ds.y * 2.5)
+    out = {}
+    for nyq, k0 in ((True, False), (False, False), (False, True)):
+        cfg = SimpleNamespace(compute=SimpleNamespace(
+            dx=dx, dy=dy, cumulative=True, transfer_form="conservative", periodic_axes=[],
+            rechunk_spatial=False, nyquist_cutoff=nyq, include_k0=k0))
+        out[nyq, k0] = compute_budget(ds, cfg).compute()
+    for (nyq, k0), b in out.items():
+        assert b.attrs["nyquist_cutoff"] == int(nyq) and b.attrs["include_k0"] == int(k0)
+        assert b.attrs["cumulative"] == 1 and b.attrs["periodic_axes"] == "none"
+        assert b.attrs["spectral_detrend"] == "constant" and b.attrs["spectral_taper"] == 0
+    closure = {}
+    for key in ((True, False), (False, False)):
+        b = out[key]
+        closure[key] = max(float(np.abs(b[pi].isel(wavenumber=0) + b[mf]).max()
+                                 / np.abs(b[pi]).max())
+                           for pi, mf in (("pi_nke", "mf_hke"), ("pi_ape", "mf_ape")))
+        print(f"  nyquist_cutoff {key[0]!s:5}: max |pi(k_min) + mf| / max |pi| = "
+              f"{closure[key]:.1e}, {b.sizes['wavenumber']} bins")
+    assert closure[True, False] > 1e-4 and closure[False, False] < 1e-12, closure
+    assert out[False, False].sizes["wavenumber"] > out[True, False].sizes["wavenumber"]
+    b0, b = out[False, True], out[False, False]
+    assert float(b0.wavenumber[0]) == 0.0
+    assert np.allclose(b0.wavenumber[1:], b.wavenumber)
+    err = 0.0
+    for name, at0 in (("pi_nke", "mf_hke"), ("lf_hke", "lf0_hke"), ("lf_pres", "lf0_pres")):
+        ref = b[name].isel(wavenumber=0) + b[at0]
+        err = max(err, float(np.abs(b0[name].isel(wavenumber=0) - ref).max()
+                             / np.abs(b[name]).max()))
+        assert np.allclose(b0[name].isel(wavenumber=slice(1, None)).values, b[name].values,
+                           rtol=1e-12, atol=1e-14 * float(np.abs(b[name]).max()))
+    print(f"  include_k0: k = 0 bin equals the k_min value plus mf_*/lf0_* to {err:.1e}")
+    assert err < 1e-12
+
+
+def test_k0_pressure_budget_reference():
+    """With the k = 0 values of every pressure term (include_k0), the horizontal pressure work at
+    k = 0 does not depend on the reference of pi': adding C(z) to pi' changes the k = 0 values of
+    the lateral pressure flux, the vertical pressure flux terms, the conversion and the
+    divergence work, but not their sum (grad_h C(z) = 0), while at k > 0 nothing changes."""
+    from budget.budget import (pressure_flux, conversion_ape_to_dke, pressure_divergence_work,
+                               nonconservative_adiabatic_pressure, nonlinear_pressure_work_hke,
+                               lateral_pressure_flux)
+    u, v, w, th, th_mean, _, rho, exner, dx = _stratified_case(seed=17)
+    ramp = xr.DataArray(np.linspace(0.0, 1.0, u.sizes["x"]), dims="x", coords={"x": u.x})
+    u, exner = u + 3.0 * ramp, exner + 2e-3 * ramp                    # not periodic in x
+    shift = 1e-3 * (1.0 + u.z / 4e4)                                  # C(z)
+
+    def terms(ex):
+        div = horizontal_divergence(u, v)
+        f_p = pressure_flux(th_mean, w, ex)
+        return {"vertical flux": vertical_gradient_flux(f_p),
+                "J_p": nonconservative_adiabatic_pressure(f_p, rho, th_mean),
+                "C_A->h": conversion_ape_to_dke(th_mean, w, ex),
+                "Div_p": pressure_divergence_work(u, v, w, div, rho, th_mean, ex),
+                "N_h": nonlinear_pressure_work_hke(u, v, th, ex),
+                "lateral": lateral_pressure_flux(u, v, th_mean, ex)}
+    with _NoTaper():
+        a, b = terms(exner), terms(exner + shift)
+        k0 = lambda d: _interior(sum(dc_component(t) for t in d.values()))
+        iso = lambda t: _interior(isotropize(t, dx, dx, cumulative=False))
+        scale = float(np.abs(sum(iso(t) for t in a.values())).max())
+        change_sum = float(np.abs(k0(b) - k0(a)).max()) / scale
+        change_lf = float(np.abs(_interior(dc_component(b["lateral"]) - dc_component(a["lateral"])))
+                          .max()) / scale
+        change_k = max(float(np.abs(iso(b[n]) - iso(a[n])).max()) for n in a) / scale
+    print(f"  pi' + C(z), relative to max |pressure work|: k = 0 lateral term changes by "
+          f"{change_lf:.1e}, the k = 0 sum by {change_sum:.1e}; k > 0 terms by {change_k:.1e}")
+    assert change_lf > 1e-3 and change_sum < 1e-10 and change_k < 1e-10, \
+        (change_lf, change_sum, change_k)
 
 
 def _nonperiodic_2d(n, L=500e3):
@@ -2356,6 +2544,10 @@ if __name__ == "__main__":
              test_compute_budget_lateral_flux_at_k0,
              test_lateral_pressure_flux_reference,
              test_example_plot_budget,
+             test_parseval_on_lonlat_grids,
+             test_compute_budget_binning_options,
+             test_k0_pressure_budget_reference,
+             test_example_configs_load,
              test_isotropize_conserves_variance_on_any_grid,
              test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,

@@ -421,6 +421,18 @@ def main(argv: list[str] | None = None) -> None:
     _add_bool_pair(p_compute, "cumulative", "cumulative",
                    "Enable cumulative spectral sums.", "Disable cumulative spectral sums.")
 
+    _add_bool_pair(p_compute, "nyquist-cutoff", "nyquist_cutoff",
+                   "spectral_budget: isotropic bins stop at the Nyquist wavenumber of the "
+                   "coarser axis (default).",
+                   "spectral_budget: extend the bins to the corner of the grid, so that sums "
+                   "over the output include every Fourier mode.")
+
+    _add_bool_pair(p_compute, "include-k0", "include_k0",
+                   "spectral_budget: add a first bin at wavenumber 0 (domain-mean mode); the "
+                   "cumulative value there is the domain total of each term.",
+                   "spectral_budget: no k = 0 bin (default; mf_* and lf0_* give the k = 0 "
+                   "values of the interior and lateral terms).")
+
     _add_bool_pair(p_compute, "rechunk-spatial", "rechunk_spatial",
                    "Force single spatial chunks for FFTs (recommended).",
                    "Skip spatial rechunking (faster, less stable for FFT).")

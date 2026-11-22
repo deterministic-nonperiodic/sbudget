@@ -233,6 +233,11 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
     # Get data spatial dimensions
     dims = get_spatial_dims(da)
 
+    # The mean removed: weighted with ``weights`` alone (the squared spectral window, so that the
+    # mean restored at k = 0 matches it and Parseval's theorem holds), or, without weights, the
+    # domain mean (cos(lat)-weighted on lon-lat grids).
+    mean = (lambda f: weighted_mean(f, weights)) if weights is not None else domain_mean
+
     if weights is None:
         # Create a DataArray of ones with the same dimensions and coordinates as the spatial slice
         da_shape = tuple(da.sizes[dim] for dim in dims)
@@ -241,15 +246,13 @@ def detrend(da: xr.DataArray, weights: Union[xr.DataArray, None] = None,
 
     if detrend_type == "errico":
         trendless = _errico_detrend(da, dims)
-        return trendless - domain_mean(trendless * weights) / domain_mean(weights)
+        return trendless - mean(trendless)
 
     # Calculate the fit (constant or plane)
     fit_to_remove = 0
 
     if detrend_type == "constant":
-        # Constant fit is the domain mean of the RAW field (weights are used in domain_mean)
-        # Weighted mean (using domain_mean assumes correct normalization)
-        fit_to_remove = domain_mean(data * weights) / domain_mean(weights)
+        fit_to_remove = mean(data)
 
     elif detrend_type == "linear":
         # Pass both the data and the (real or one-filled) weights to the WLS ufunc
@@ -284,6 +287,13 @@ def _errico_detrend(da: xr.DataArray, dims) -> xr.DataArray:
     return out
 
 
+def weighted_mean(field: xr.DataArray, weights: xr.DataArray) -> xr.DataArray:
+    """Mean of ``field`` over its horizontal dimensions with ``weights`` (broadcast to them)."""
+    dims = get_spatial_dims(field)
+    w = weights.broadcast_like(field.isel({d: slice(None) for d in dims}))
+    return (field * w).sum(dims) / w.sum(dims)
+
+
 def _apply_weighting(field: xr.DataArray) -> tuple[xr.DataArray, float, xr.DataArray]:
     """Apply taper and sqrt(area) weighting, detrend, and return weighted field, taper ms, and (mean)^2."""
 
@@ -303,8 +313,12 @@ def _apply_weighting(field: xr.DataArray) -> tuple[xr.DataArray, float, xr.DataA
     )
 
     # -- Mean to restore at DC: only what the detrending removed (without detrending the mean is
-    # still in the field, and restoring it would count the k = 0 product twice) --
-    mu_restore = domain_mean(field)
+    # still in the field, and restoring it would count the k = 0 product twice). It is the mean
+    # weighted with the squared window, the weights of the spectra themselves: the cos(lat)-
+    # weighted mean with area weighting, the plain mean without. Any other mean (as before:
+    # cos(lat) twice, or cos(lat) on unweighted fields) breaks Parseval's theorem on lon-lat
+    # grids. --
+    mu_restore = weighted_mean(field, window_total ** 2)
     if detrend_type is None:                                 # mean left in place
         mu_restore = xr.zeros_like(mu_restore)
 

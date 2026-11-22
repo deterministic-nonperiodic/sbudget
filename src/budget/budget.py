@@ -13,6 +13,7 @@ from .grid_utils import resolve_periodic_axes
 from .numeric_tools import horizontal_divergence, relative_vorticity
 from .spectral_primitives import horizontal_wavenumber_magnitude, isotropize, dc_component
 from .spectral_primitives import scalar_spectrum, scalar_cross_spectrum, vector_cross_spectrum
+from .spectral_primitives import SPECTRAL_CFG
 from .thermodynamics import hydrostatic_exner_function
 from .thermodynamics import potential_temperature, exner_function, density, lorenz_parameter
 from .vertical import (is_lorenz_staggered, interp_full_to_half, diff_full_to_half,
@@ -905,25 +906,36 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # --- accumulation (optional; defaults True) ---
     cumulative = getattr(cfg.compute, "cumulative", True)
 
+    # --- isotropic binning: nyquist_cutoff = False extends the bins to the corner of the grid
+    # (the modes beyond the Nyquist circle, otherwise left out of every isotropic spectrum);
+    # include_k0 = True adds a first bin at wavenumber 0 (the domain-mean mode), so that the
+    # cumulative value there is the domain total of every term ---
+    nyquist_cutoff = bool(getattr(cfg.compute, "nyquist_cutoff", True))
+    include_k0 = bool(getattr(cfg.compute, "include_k0", False))
+
+    def _iso(spectrum, dx, dy, cumulative=False):
+        return isotropize(spectrum, dx, dy, nyquist=nyquist_cutoff, cumulative=cumulative,
+                          include_dc=include_k0)
+
     # --- spectra: 2D HKE, RKE, and DKE and isotropic 1D ---
     hke_2d = kinetic_energy_spectra(u, v, name="hke")
-    hke_1d = isotropize(hke_2d, dx, dy, cumulative=False)  # non-cumulative HKE spectra
+    hke_1d = _iso(hke_2d, dx, dy, cumulative=False)  # non-cumulative HKE spectra
 
     # wavenumber kappa² = k² + l² [m**-2]
     # RKE and DKE spectra
     rke_2d = rotational_kinetic_energy_spectra(vorticity, dx, dy)
-    rke_1d = isotropize(rke_2d, dx, dy, cumulative=False)
+    rke_1d = _iso(rke_2d, dx, dy, cumulative=False)
 
     dke_2d = divergent_kinetic_energy_spectra(divergence, dx, dy)
-    dke_1d = isotropize(dke_2d, dx, dy, cumulative=False)
+    dke_1d = _iso(dke_2d, dx, dy, cumulative=False)
 
     # --- spectra: 2D VKE and isotropic 1D ---
     vke_2d = vertical_kinetic_energy_spectra(w, name="vke")
-    vke_1d = isotropize(vke_2d, dx, dy, cumulative=False)  # non-cumulative VKE spectra
+    vke_1d = _iso(vke_2d, dx, dy, cumulative=False)  # non-cumulative VKE spectra
 
     # --- spectra: 2D APE and isotropic 1D ---
     ape_2d = available_potential_energy_spectra(theta_prime, gamma, name="ape")
-    ape_1d = isotropize(ape_2d, dx, dy, cumulative=False)  # non-cumulative APE spectra
+    ape_1d = _iso(ape_2d, dx, dy, cumulative=False)  # non-cumulative APE spectra
 
     # ----- Calculate nonlinear spectral transfer → π(HKE) -----
     # "conservative" (default; skew-symmetric, sums to zero on periodic axes) | "flux" | "invariant"
@@ -944,8 +956,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # lf_* the lateral flux divergence (zero on periodic axes); pi_* + lf_* is the full transfer.
     lf_hke_2d = lateral_hke_flux(u, v, name="lf_hke")
     pi_nke_2d = (pi_nke_2d - lf_hke_2d).rename("pi_nke")
-    pi_nke = isotropize(pi_nke_2d, dx, dy, cumulative=cumulative)
-    lf_hke = isotropize(lf_hke_2d, dx, dy, cumulative=cumulative)
+    pi_nke = _iso(pi_nke_2d, dx, dy, cumulative=cumulative)
+    lf_hke = _iso(lf_hke_2d, dx, dy, cumulative=cumulative)
     # k = 0: the isotropic spectra exclude the domain-mean mode, so the interior transfer summed
     # over the output wavenumbers is minus its value there (exchange with the domain-mean flow)
     mf_hke = dc_component(pi_nke_2d).rename("mf_hke")
@@ -953,14 +965,14 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     lf0_hke = dc_component(lf_hke_2d).rename("lf0_hke")
 
     pi_lke_2d = coriolis_linear_transfer(u, v, name="pi_lke")
-    pi_lke = isotropize(pi_lke_2d, dx, dy, cumulative=cumulative)
+    pi_lke = _iso(pi_lke_2d, dx, dy, cumulative=cumulative)
 
     pi_vke_2d = nonlinear_vke_transfer(u, v, w, divergence, conservative=conservative,
                                        name="pi_vke")
     lf_vke_2d = lateral_vke_flux(u, v, w, name="lf_vke")
     pi_vke_2d = (pi_vke_2d - lf_vke_2d).rename("pi_vke")
-    pi_vke = isotropize(pi_vke_2d, dx, dy, cumulative=cumulative)
-    lf_vke = isotropize(lf_vke_2d, dx, dy, cumulative=cumulative)
+    pi_vke = _iso(pi_vke_2d, dx, dy, cumulative=cumulative)
+    lf_vke = _iso(lf_vke_2d, dx, dy, cumulative=cumulative)
     mf_vke = dc_component(pi_vke_2d).rename("mf_vke")
     lf0_vke = dc_component(lf_vke_2d).rename("lf0_vke")
 
@@ -968,8 +980,8 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
                                        conservative=conservative, name="pi_ape")
     lf_ape_2d = lateral_ape_flux(u, v, theta_prime, gamma, name="lf_ape")
     pi_ape_2d = (pi_ape_2d - lf_ape_2d).rename("pi_ape")
-    pi_ape = isotropize(pi_ape_2d, dx, dy, cumulative=cumulative)
-    lf_ape = isotropize(lf_ape_2d, dx, dy, cumulative=cumulative)
+    pi_ape = _iso(pi_ape_2d, dx, dy, cumulative=cumulative)
+    lf_ape = _iso(lf_ape_2d, dx, dy, cumulative=cumulative)
     mf_ape = dc_component(pi_ape_2d).rename("mf_ape")
     lf0_ape = dc_component(lf_ape_2d).rename("lf0_ape")
 
@@ -991,26 +1003,26 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
         vf_ape_2d = turbulent_ape_flux(w, theta_prime, gamma, name="vf_ape")
         vfd_ape_2d = vertical_gradient_flux(vf_ape_2d, name="vfd_ape")
 
-    vf_hke = isotropize(vf_hke_2d.rename("vf_hke"), dx, dy, cumulative=cumulative)
-    vfd_dke = isotropize(vfd_dke_2d.rename("vfd_dke"), dx, dy, cumulative=cumulative)
-    vf_vke = isotropize(vf_vke_2d.rename("vf_vke"), dx, dy, cumulative=cumulative)
-    vfd_vke = isotropize(vfd_vke_2d.rename("vfd_vke"), dx, dy, cumulative=cumulative)
-    vf_ape = isotropize(vf_ape_2d.rename("vf_ape"), dx, dy, cumulative=cumulative)
-    vfd_ape = isotropize(vfd_ape_2d.rename("vfd_ape"), dx, dy, cumulative=cumulative)
+    vf_hke = _iso(vf_hke_2d.rename("vf_hke"), dx, dy, cumulative=cumulative)
+    vfd_dke = _iso(vfd_dke_2d.rename("vfd_dke"), dx, dy, cumulative=cumulative)
+    vf_vke = _iso(vf_vke_2d.rename("vf_vke"), dx, dy, cumulative=cumulative)
+    vfd_vke = _iso(vfd_vke_2d.rename("vfd_vke"), dx, dy, cumulative=cumulative)
+    vf_ape = _iso(vf_ape_2d.rename("vf_ape"), dx, dy, cumulative=cumulative)
+    vfd_ape = _iso(vfd_ape_2d.rename("vfd_ape"), dx, dy, cumulative=cumulative)
 
     # --- ADIABATIC NON-CONSERVATIVE (j_hke, j_vke, j_ape) ---
     # Note: nonconservative_adiabatic uses vf_hke_2d (or calculates it if not passed)
     j_hke_2d = nonconservative_adiabatic_hke(u, v, w, rho, vf_hke=vf_hke_2d, name="j_hke")
-    j_hke = isotropize(j_hke_2d, dx, dy, cumulative=cumulative)
+    j_hke = _iso(j_hke_2d, dx, dy, cumulative=cumulative)
 
     # Note: nonconservative_adiabatic uses vf_vke_2d (or calculates it if not passed)
     j_vke_2d = nonconservative_adiabatic_vke(w, rho, vf_vke=vf_vke_2d, name="j_vke")
-    j_vke = isotropize(j_vke_2d, dx, dy, cumulative=cumulative)
+    j_vke = _iso(j_vke_2d, dx, dy, cumulative=cumulative)
 
     # Note: nonconservative_adiabatic uses vf_ape_2d (or calculates it if not passed)
     j_ape_2d = nonconservative_adiabatic_ape(theta_prime, gamma, rho, vf_ape=vf_ape_2d,
                                              name="j_ape")
-    j_ape = isotropize(j_ape_2d, dx, dy, cumulative=cumulative)
+    j_ape = _iso(j_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- PRESSURE WORK & CONVERSION (vf_pres, vfd_pres, cad) ---
     if staggered:
@@ -1018,12 +1030,12 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     else:
         vf_pres_2d = pressure_flux(theta_mean, w, exner_prime, name="vf_pres")
         vfd_pres_2d = vertical_gradient_flux(vf_pres_2d, name="vfd_pres")
-    vf_pres = isotropize(vf_pres_2d.rename("vf_pres"), dx, dy, cumulative=cumulative)
-    vfd_pres = isotropize(vfd_pres_2d.rename("vfd_pres"), dx, dy, cumulative=cumulative)
+    vf_pres = _iso(vf_pres_2d.rename("vf_pres"), dx, dy, cumulative=cumulative)
+    vfd_pres = _iso(vfd_pres_2d.rename("vfd_pres"), dx, dy, cumulative=cumulative)
 
     # Reference-profile term of the pressure flux (j_pres): ∂z F_p + J_p = θ̄ ρ̄⁻¹ ∂z(ρ̄ F_p / θ̄)
     j_pres_2d = nonconservative_adiabatic_pressure(vf_pres_2d, rho, theta_mean, name="j_pres")
-    j_pres = isotropize(j_pres_2d, dx, dy, cumulative=cumulative)
+    j_pres = _iso(j_pres_2d, dx, dy, cumulative=cumulative)
 
     # Conversion (cad, caz)
     if staggered:
@@ -1031,40 +1043,40 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     else:
         cad_2d = conversion_ape_to_dke(theta_mean, w, exner_prime, name="cad")
         caz_2d = conversion_ape_to_vke(theta_mean, theta_prime, w, exner_prime, name="caz")
-    cad = isotropize(cad_2d.rename("cad"), dx, dy, cumulative=cumulative)
-    caz = isotropize(caz_2d.rename("caz"), dx, dy, cumulative=cumulative)
+    cad = _iso(cad_2d.rename("cad"), dx, dy, cumulative=cumulative)
+    caz = _iso(caz_2d.rename("caz"), dx, dy, cumulative=cumulative)
 
     # Pressure work by the anelastic-departure divergence (div_pres) and by θ' (np_hke, np_vke):
     # with these, ∂z F_p + J_p + C_{A→h} + Div_p + N_h + L_p is the exact horizontal pressure work
     # (L_p = lf_pres, zero on periodic axes).
     div_pres_2d = pressure_divergence_work(u, v, w, divergence, rho, theta_mean, exner_prime,
                                            dzw=dzw, name="div_pres")
-    div_pres = isotropize(div_pres_2d, dx, dy, cumulative=cumulative)
+    div_pres = _iso(div_pres_2d, dx, dy, cumulative=cumulative)
 
     # Lateral pressure flux: with it, the horizontal pressure work closes on bounded axes too
     lf_pres_2d = lateral_pressure_flux(u, v, theta_mean, exner_prime, name="lf_pres")
-    lf_pres = isotropize(lf_pres_2d, dx, dy, cumulative=cumulative)
+    lf_pres = _iso(lf_pres_2d, dx, dy, cumulative=cumulative)
     lf0_pres = dc_component(lf_pres_2d).rename("lf0_pres")
 
     np_hke_2d = nonlinear_pressure_work_hke(u, v, theta_prime, exner_prime, name="np_hke")
-    np_hke = isotropize(np_hke_2d, dx, dy, cumulative=cumulative)
+    np_hke = _iso(np_hke_2d, dx, dy, cumulative=cumulative)
 
     if staggered:
         np_vke_2d = stag["np_vke"].rename("np_vke")
     else:
         np_vke_2d = nonlinear_pressure_work_vke(w, theta_prime, exner_prime, name="np_vke")
-    np_vke = isotropize(np_vke_2d, dx, dy, cumulative=cumulative)
+    np_vke = _iso(np_vke_2d, dx, dy, cumulative=cumulative)
 
     # --- COMPRESSIBILITY TERMS: D = ρ̄⁻¹∇·(ρ̄v), consistent with the J terms above ---
     div_hke_2d = divergence_hke(u, v, w, divergence, rho=rho, dzw=dzw, name="div_hke")
-    div_hke = isotropize(div_hke_2d, dx, dy, cumulative=cumulative)
+    div_hke = _iso(div_hke_2d, dx, dy, cumulative=cumulative)
 
     div_vke_2d = divergence_vke(u, v, w, divergence, rho=rho, dzw=dzw, name="div_vke")
-    div_vke = isotropize(div_vke_2d, dx, dy, cumulative=cumulative)
+    div_vke = _iso(div_vke_2d, dx, dy, cumulative=cumulative)
 
     div_ape_2d = divergence_ape(u, v, w, theta_prime, gamma, divergence, rho=rho, dzw=dzw,
                                 name="div_ape")
-    div_ape = isotropize(div_ape_2d, dx, dy, cumulative=cumulative)
+    div_ape = _iso(div_ape_2d, dx, dy, cumulative=cumulative)
 
     # --- ASSEMBLE ---
     fluxes = [hke_1d, rke_1d, dke_1d, vke_1d, ape_1d,
@@ -1079,6 +1091,17 @@ def compute_budget(ds: xr.Dataset, cfg) -> xr.Dataset:
     # attributes of their inputs.
     fluxes = xr.Dataset({da.name: _set_budget_metadata(da, da.name)
                          for da in fluxes if da is not None})
+
+    # settings that determine how the output is read (netCDF attributes cannot be boolean)
+    fluxes.attrs.update({
+        "cumulative": int(bool(cumulative)),
+        "nyquist_cutoff": int(nyquist_cutoff),
+        "include_k0": int(include_k0),
+        "transfer_form": str(transfer_mode),
+        "periodic_axes": ",".join(sorted(periodic)) or "none",
+        "spectral_detrend": str(SPECTRAL_CFG["detrend"]["type"]),
+        "spectral_taper": int(bool(SPECTRAL_CFG["taper"]["enabled"])),
+    })
 
     # wavenumber coord attrs (unchanged, but placed after assembly)
     fluxes.wavenumber.attrs.update({'standard_name': 'wavenumber',
