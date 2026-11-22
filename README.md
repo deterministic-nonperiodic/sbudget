@@ -183,6 +183,87 @@ $\pi'$ changes it by $-c_p\bar\theta\, C\,\langle\nabla\cdot\mathbf{u}\rangle$, 
 $k = 0$ parts of the other pressure terms (not written) compensate. `lf_pres` at $k > 0$ does not
 depend on it.
 
+#### Reading the output
+
+Every term is written per unit mass (W kg⁻¹), with dimensions (`time`, `z`, `wavenumber`);
+`wavenumber` is in rad m⁻¹ and the wavelength is $2\pi/k$. With `cumulative: true` (the default)
+each transfer, flux and conversion term $X$ is accumulated from the smallest resolved scale,
+$X(k) = \sum_{k' \ge k} X(k')$: the net effect of all scales smaller than $2\pi/k$. The energy
+spectra (`hke`, `rke`, `dke`, `vke`, `ape`) are not accumulated, and the $k = 0$ terms (`mf_*`,
+`lf0_*`) have no `wavenumber` dimension.
+
+How to read a cumulative curve:
+
+* **Value at $k$**: the net gain, by this term, of all scales smaller than $2\pi/k$. For a
+  transfer, $\Pi(k) > 0$ means a net transfer from scales larger than $2\pi/k$ to smaller ones
+  (downscale) and $\Pi(k) < 0$ upscale.
+* **Slope**: where $X(k)$ decreases as $k$ increases, the term is a source at those scales (the
+  difference between two neighbouring values is the term in that shell); where it increases, a
+  sink.
+* **Value at the lowest wavenumber**: the total over all resolved scales except $k = 0$. For
+  `pi_*` and `lf_*`, add the $k = 0$ term (`mf_*`, `lf0_*`) to get the total over the domain;
+  the other terms have no $k = 0$ output.
+
+What to plot: average over `time` first (the terms are linear in the co-spectra, so this is
+exact), then integrate over a layer with the reference density, $\int\bar\rho X dz$ from $z_b$
+to $z_t$ (W m⁻²). Values per unit mass at different heights are not comparable, and the
+density weight turns the vertical flux terms into fluxes through the layer's top and bottom. For HKE and VKE,
+
+$$\int_{z_b}^{z_t}\bar\rho\,(\partial_z F + J)\,dz = \bar\rho F\big|_{z_t} - \bar\rho F\big|_{z_b},$$
+
+the net flux into the layer. For the pressure flux and APE,
+$\partial_z F + J = (\bar\theta/\bar\rho)\partial_z(\bar\rho F/\bar\theta)$ and
+$(\gamma/\bar\rho)\partial_z(\bar\rho F/\gamma)$, so the same holds up to the variation of
+$\bar\theta$ or $\gamma$ across the layer. Plot `vfd_* + j_*` together for that reason.
+
+What the terms do:
+
+| Budget | Between scales | Conversion | Vertical transport | Lateral transport | Small terms |
+|---|---|---|---|---|---|
+| HKE | `pi_nke`, `pi_lke` (Coriolis) | `cad` ($C_{A\to h}$, positive: HKE gains) | `vfd_dke + j_hke`, `vfd_pres + j_pres` | `lf_hke`, `lf_pres` | `div_hke`, `div_pres`, `np_hke` |
+| VKE | `pi_vke` | `caz` ($C_{A\to z}$) | `vfd_vke + j_vke` | `lf_vke` | `div_vke`, `np_vke` |
+| APE | `pi_ape` | `-(cad + caz)` ($-C_A$) | `vfd_ape + j_ape` | `lf_ape` | `div_ape` |
+
+* **Transfers** (`pi_*`) only redistribute energy among scales: including $k = 0$ they sum to
+  zero. A transfer that is positive and flat over a range of $k$ is a constant downscale flux
+  (an inertial range).
+* **Conversions** exchange energy between budgets at the same scale. The APE budget loses what
+  the kinetic energy budgets gain: $C_A = C_{A\to h} + C_{A\to z}$.
+* **Vertical transport** moves energy between layers at the same scale. For gravity waves the
+  vertical pressure flux $c_p\bar\theta(w, \pi')_k$ is the wave energy flux, and its convergence
+  in a layer marks where waves deposit energy.
+* **Lateral transport** is the import through the side boundaries (zero on periodic axes).
+* **Small terms**: compressibility ($D = \bar\rho^{-1}\nabla\cdot(\bar\rho\mathbf{v})$, zero for
+  anelastic flow) and pressure work by $\theta'$. They are needed for exact closure and are
+  usually small where the flow is nearly anelastic.
+* The diabatic and dissipative terms are not computed. With the tendency $\partial_t E(k)$ from
+  consecutive outputs, they are the residual.
+
+Checks to run on your own output:
+
+1. `pi_*` at the lowest wavenumber plus `mf_*` is close to zero. The remainder is the modes
+   beyond the Nyquist circle, a few percent at most on strongly anisotropic grids. A larger
+   remainder means the spectra do not satisfy Parseval's theorem (end-point detrending or a
+   taper).
+2. On periodic axes, `lf_*` and `lf0_*` are zero.
+3. `pi_* + lf_*` is the transfer before the split, as in a code without lateral fluxes.
+4. `lf_*` at the lowest wavenumber plus `lf0_*` is the flux through the side boundaries, except
+   for the pressure flux, whose $k = 0$ value depends on the reference of $\pi'$ (see above).
+
+`examples/plot_budget.py` does all of this for a set of layers (it needs matplotlib, which is
+not a dependency of sbudget). It plots one row per budget (HKE, APE) and one column per layer,
+adds the $k = 0$ points, leaves out the lateral terms on doubly periodic domains, and prints the
+layer totals and checks 1 and 4:
+
+```bash
+python examples/plot_budget.py budget.nc --layers 20e3,50e3 50e3,80e3 -o budget.png
+# density-weighted layers (W m-2): any file with the density; averaged over all dims except z
+python examples/plot_budget.py budget.nc --layers 20e3,50e3 \
+    --density model_output.nc --density-var rho --density-zdim height
+# output written with cumulative: false
+python examples/plot_budget.py budget.nc --not-cumulative --layers 20e3,50e3
+```
+
 #### Features
 
 - FFT backed chunk-friendly xarray/dask implementation (out-of-core). Fully parallel along
@@ -356,6 +437,12 @@ of the filter) for comparison with spectral fluxes.
   sbudget compute examples/config.yaml \
   --mode scale_transfer \
   --scales 1000,5000,10000
+```
+
+Plot a spectral budget (see *Reading the output* above)
+
+```bash
+  python examples/plot_budget.py ./out/budget.nc --layers 20e3,50e3 50e3,80e3 -o budget.png
 ```
 
 Perform analysis on selected levels and scales. Note, level selection is ignored in

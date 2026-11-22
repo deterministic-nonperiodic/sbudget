@@ -645,6 +645,56 @@ def test_compute_budget_lateral_flux_at_k0():
     assert err0 < 1e-12 and err_sum < 1e-12, (err0, err_sum)
 
 
+def test_example_plot_budget():
+    """examples/plot_budget.py runs on compute_budget outputs (periodic and bounded, with and
+    without a density profile), and its accumulation of an output written with cumulative: false
+    reproduces the cumulative output."""
+    import importlib.util
+    import tempfile
+    from types import SimpleNamespace
+    from budget.budget import compute_budget
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except ImportError:
+        print("  matplotlib not installed: skipped")
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "plot_budget", os.path.join(here, "..", "examples", "plot_budget.py"))
+    pb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pb)
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = (1.0 + 1e-3 * v) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u + 20.0, "v": 10 * v, "w": w, "theta": theta, "pressure": pres,
+                     "density": pres / (287.0 * 240.0)}).expand_dims(time=2)
+    with tempfile.TemporaryDirectory() as tmp:
+        rho_path = os.path.join(tmp, "rho.nc")
+        ds.density.rename(z="height").to_dataset(name="rho").to_netcdf(rho_path)
+        for axes in (["x", "y"], []):
+            out = {}
+            for cumulative in (True, False):
+                cfg = SimpleNamespace(compute=SimpleNamespace(
+                    dx=dx, dy=dx, cumulative=cumulative, transfer_form="conservative",
+                    periodic_axes=axes, rechunk_spatial=False))
+                out[cumulative] = compute_budget(ds, cfg).compute()
+                out[cumulative].to_netcdf(os.path.join(tmp, f"budget_{cumulative}.nc"))
+            acc = pb.accumulate(out[False])
+            err = max(float(np.abs(acc[n] - out[True][n]).max() / np.abs(out[True][n]).max())
+                      for n in ("pi_nke", "lf_hke", "cad", "vfd_dke"))
+            print(f"  axes {str(axes):10s}: accumulated / cumulative output, max rel. diff "
+                  f"{err:.1e}")
+            assert err < 1e-12, (axes, err)
+            fig = os.path.join(tmp, "budget.png")
+            pb.main([os.path.join(tmp, "budget_True.nc"), "--layers", "5e3,20e3", "20e3,35e3",
+                     "-o", fig])
+            pb.main([os.path.join(tmp, "budget_False.nc"), "--not-cumulative", "--layers",
+                     "5e3,20e3", "--density", rho_path, "--density-zdim", "height", "-o", fig])
+            assert os.path.getsize(fig) > 0
+
+
 def _nonperiodic_2d(n, L=500e3):
     """Analytic, non-periodic fields on [0, L]^2 (both end points on the grid), one level."""
     x = np.linspace(0.0, L, n)
@@ -2305,6 +2355,7 @@ if __name__ == "__main__":
              test_compute_budget_mean_flow_exchange,
              test_compute_budget_lateral_flux_at_k0,
              test_lateral_pressure_flux_reference,
+             test_example_plot_budget,
              test_isotropize_conserves_variance_on_any_grid,
              test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,
