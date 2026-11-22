@@ -13,20 +13,28 @@ suitable for studying spectral energy transfers across scales. The budget is for
 [Peng et al. (2015)](https://doi.org/10.1175/JAS-D-14-0306.1),
 and [Wang et al.(2018)](https://doi.org/10.1175/JAS-D-17-0391.1) as:
 
-$$\partial_t E_h(k)=T_h(k)+L_h(k)+\partial_z F_{h\uparrow}(k)+J_h(k)+\mathrm{Div}_h(k)
-+\partial_z F_{p\uparrow}(k)+J_p(k)+C_{A\to h}(k)+\mathrm{Div}_p(k)+N_h(k)+H_h(k)+D_h(k),$$
+$$\partial_t E_h(k)=T_h(k)+L_h(k)+\nabla_h\cdot F_h(k)+\partial_z F_{h\uparrow}(k)+J_h(k)
++\mathrm{Div}_h(k)+\nabla_h\cdot F_p(k)+\partial_z F_{p\uparrow}(k)+J_p(k)+C_{A\to h}(k)
++\mathrm{Div}_p(k)+N_h(k)+H_h(k)+D_h(k),$$
+the budget of vertical kinetic energy (VKE) as:
+$$\partial_t E_z(k)=T_z(k)+\nabla_h\cdot F_z(k)+\partial_z F_{z\uparrow}(k)+J_z(k)
++\mathrm{Div}_z(k)+C_{A\to z}(k)+N_z(k)+D_z(k),$$
 and the budget of available potential energy (APE) as:
-$$\partial_t E_A(k)=-C_A(k)+T_A(k)+\partial_z F_{A\uparrow}(k)+J_A(k)+\mathrm{Div}_A(k)+H_A
-(k)+D_A(k).$$
+$$\partial_t E_A(k)=-C_A(k)+T_A(k)+\nabla_h\cdot F_A(k)+\partial_z F_{A\uparrow}(k)+J_A(k)
++\mathrm{Div}_A(k)+H_A(k)+D_A(k).$$
 
-Where subscripts $h$ and $A$ denote terms for HKE and APE, respectively, and $(a,b)_k$ is the
-co-spectrum summed over the wavenumber shell $k$:
-* $E_h(k), E_A(k)$ — isotropic spectrum of energy at wavenumber $k$.
-* $T_h(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales); sums to zero over
-  $k$ on a periodic domain.
+Where subscripts $h$, $z$ and $A$ denote terms for HKE, VKE and APE, respectively, and
+$(a,b)_k$ is the co-spectrum summed over the wavenumber shell $k$:
+* $E_h(k), E_z(k), E_A(k)$ — isotropic spectrum of energy at wavenumber $k$.
+* $T_h(k), T_z(k), T_A(k)$ — nonlinear **spectral transfer** of energy (across scales), interior
+  part: sums to zero over $k$ on any domain (see *Lateral fluxes* below).
 * $L_h(k)$ — linear **spectral transfer** of HKE due to Coriolis.
-* $F_{h\uparrow} = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, $F _{A\uparrow}$ — **vertical flux** of energy
-  (positive downward, so $\partial_z F > 0$ is a gain).
+* $\nabla_h\cdot F _h(k)$, $\nabla_h\cdot F _z(k)$, $\nabla_h\cdot F _A(k)$, $\nabla_h\cdot F _p(k)$ —
+  **lateral flux** divergence of energy and of pressure work: transport through the side
+  boundaries, zero on periodic axes (see *Lateral fluxes* below).
+* $F_{h\uparrow} = -\tfrac12(\mathbf{u}, w\mathbf{u})_k$, $F _{z\uparrow} = -\tfrac12(w, ww)_k$,
+  $F _{A\uparrow}$ — **vertical flux** of energy (positive downward, so $\partial_z F > 0$ is a
+  gain).
 * $F_{p\uparrow} = -c_p\bar\theta(w,\pi')_k$ — vertical **pressure** flux.
 * $J_h = F_{h\uparrow}\partial_z\ln\bar\rho$, $J_A = F_{A\uparrow}\partial_z\ln(\bar\rho/\gamma)$,
   $J_p = F_{p\uparrow}\partial_z\ln(\bar\rho/\bar\theta)$ — **reference-profile** terms; with them,
@@ -34,8 +42,10 @@ co-spectrum summed over the wavenumber shell $k$:
   integrals reduce to boundary fluxes.
 * $\mathrm{Div}_X = \tfrac12(X, X D)_k$, $\mathrm{Div}_p = c_p\bar\theta(\pi', D)_k$ — **compressibility**
   terms, with $D = \bar\rho^{-1}\nabla\cdot(\bar\rho\mathbf{v})$ (zero for anelastic flow).
-* $C_{A\to h} = c_p\bar\theta(w,\partial_z\pi')_k$ — **conversion** from APE to HKE (pressure work);
-  $C_A = (g/\bar\theta)(w,\theta')_k$ is the total APE→KE conversion.
+* $C_{A\to h} = c_p\bar\theta(w,\partial_z\pi') _k$ — **conversion** from APE to HKE (pressure work);
+  $C _{A\to z} = (g/\bar\theta)(w,\theta') _k - c_p\bar\theta(w,\partial_z\pi') _k$ — conversion to
+  VKE (buoyancy minus vertical pressure work); $C _A = (g/\bar\theta)(w,\theta') _k$ is the total
+  APE→KE conversion, $C _A = C _{A\to h} + C _{A\to z}$.
 * $N_h = -c_p(\mathbf{u}, \theta'\nabla_h\pi')_k$ — pressure work by $\theta'$ (and
   $N_z = -c_p(w, \theta'\partial_z\pi')_k$ for VKE).
 * $H_h(k), H_A(k)$ — **diabatic** tendency (heating/cooling).
@@ -92,11 +102,16 @@ and well above 2 on a bounded axis. `periodic_axes: [x]`, `[x, y]` or `none` ove
 a global longitude is always periodic. Along periodic axes derivatives wrap around, and spectra
 are neither tapered nor detrended. The scale-transfer mode uses the same test: periodic axes are
 padded by wrapping and other axes by reflection (explicit `x_coord_boundary`/`y_coord_boundary`
-keywords take precedence). Along bounded axes the default is Errico (1985) end-point
-detrending (the mean and the linear trend joining the two edges are removed, the mean restored
-at $k = 0$), which removes the edge jump of the periodic extension and its leakage tail, and no
-taper. A taper (`SPECTRAL_CFG["taper"]`) weights the domain: its transfers include the energy
-flux into the window,
+keywords take precedence). Spectra remove the domain mean and restore it at $k = 0$
+(`SPECTRAL_CFG["detrend"]["type"] = "constant"`), with no trend and no taper, so that every
+co-spectrum sums to the domain mean of the product (Parseval), on which the conservation of the
+transfers and the closure of the budget rest. Errico (1985) end-point detrending (`"errico"`:
+along bounded axes, the linear trend joining the two edges is also removed) suppresses the edge
+jump of the periodic extension and its leakage tail in the energy spectra, but removes a
+different ramp from each field of a co-spectrum: the transfers then no longer sum to zero (by up
+to ~40% of $\max|\Pi|$ on bounded model domains, while the shape of $\Pi(k)$ changes by about
+5%). Use it for energy spectra, not for budgets. A taper (`SPECTRAL_CFG["taper"]`) weights the
+domain: its transfers include the energy flux into the window,
 
 $$\frac{\langle \mathbf{F}\cdot\nabla W^2\rangle}{\langle W^2\rangle},
 \qquad \mathbf{F} = \tfrac12\,\mathbf{u}\,|\mathbf{u}|^2,$$
@@ -104,22 +119,150 @@ $$\frac{\langle \mathbf{F}\cdot\nabla W^2\rangle}{\langle W^2\rangle},
 which projects onto the largest scales, grows with the mean wind along the tapered axis and can
 exceed the inter-scale transfer itself.
 
-Defaults: `transfer_form: conservative`, `periodic_axes: auto`, Errico detrending along bounded
-axes, no taper. They give exact conservation on periodic axes and leakage-free spectra on
-bounded ones without any setting; on undeclared periodic data the transfers equal those with the
-axes declared (`tests/test_synthetic_budget.py`).
+Defaults: `transfer_form: conservative`, `periodic_axes: auto`, mean removal only, no taper.
+The interior transfers then sum to zero to round-off on any domain and the lateral fluxes to the
+flux through the side boundaries (see below); on undeclared periodic data the transfers equal
+those with the axes declared (`tests/test_synthetic_budget.py`).
 
 ```bash
 sbudget compute config.yaml --mode spectral_budget                       # defaults
 sbudget compute config.yaml --mode spectral_budget --periodic-axes x     # declare x periodic
 ```
 
-On a domain bounded in $y$, the sum over all wavenumbers ($k = 0$ included) is the energy flux
-through the walls,
+#### Lateral fluxes on bounded domains
 
-$$\sum_k T(k) = -\frac{1}{L_y}\Big[\big\langle \tfrac12\, v\,|\mathbf{u}|^2 \big\rangle_x\Big]_{y_S}^{y_N},$$
+On a bounded domain the horizontal advection also carries energy through the side boundaries,
+and a transfer computed from it no longer sums to zero over wavenumbers. sbudget splits it the
+way the vertical advection is split. For a quantity $X$ advected by $\mathbf{u} = (u, v)$, at
+every $k$,
 
-and $\Pi(k_{min})$ is the part of it that reaches $k > 0$.
+$$-\big(X, \tfrac12[(\mathbf{u}\cdot\nabla)X + \nabla\cdot(\mathbf{u}X)]\big)_k
+= \underbrace{\tfrac12\big[(\nabla X, \mathbf{u}X)_k - (X, (\mathbf{u}\cdot\nabla)X)_k\big]}_{\text{interior transfer}}
+\underbrace{-\tfrac12\big[(X, \nabla\cdot(\mathbf{u}X))_k + (\nabla X, \mathbf{u}X)_k\big]}_{\nabla_h\cdot F _X(k)}.$$
+
+* The interior transfer sums to zero over wavenumbers on **any** domain: its two terms are equal
+  point by point ($\nabla X\cdot\mathbf{u}X = X\,\mathbf{u}\cdot\nabla X$), as are those of the
+  vertical part $\tfrac12[(\partial_z X, wX)_k - (X, w\,\partial_z X)_k]$.
+* The lateral term sums to $-\langle\nabla\cdot(\tfrac12\mathbf{u}X^2)\rangle$, the flux of
+  $\tfrac12 X^2$ through the side boundaries divided by the area. It vanishes at every $k$ along
+  periodic axes, where the wrap-around centred difference is skew-adjoint wavenumber by
+  wavenumber.
+
+For the pressure work,
+
+$$-c_p\bar\theta(\mathbf{u}, \nabla\pi') _k = c_p\bar\theta(\nabla\cdot\mathbf{u}, \pi') _k
+-c_p\bar\theta\big[(\mathbf{u}, \nabla\pi') _k + (\nabla\cdot\mathbf{u}, \pi') _k\big]:$$
+
+the first term is what $\partial_z F _{p\uparrow} + J _p + C _{A\to h} + \mathrm{Div} _p$
+decompose, and the second, $\nabla_h\cdot F _p(k)$, closes the pressure work at every $k$ on
+bounded axes.
+
+Outputs: `pi_nke`, `pi_vke`, `pi_ape` are the interior transfers; `lf_hke`, `lf_vke`, `lf_ape`,
+`lf_pres` the lateral flux divergences (cumulative, like the other terms). The full transfer of
+the chosen form is their sum, e.g. `pi_nke + lf_hke`; on periodic axes `lf_*` is zero and
+`pi_*` is the full transfer. How the boundary flux spreads over $k$ depends on the Fourier basis
+of the bounded domain, as does every spectrum there; their sum over $k$ is the boundary flux.
+
+The isotropic spectra exclude the domain-mean mode $k = 0$, and the interior transfer at $k = 0$
+is the exchange between the fluctuations and the domain-mean flow, which is not zero even on a
+periodic domain (e.g. wave drag on a mean wind). It is written as `mf_hke`, `mf_vke`, `mf_ape`
+(per time and level, no wavenumber dimension; positive when the mean flow gains energy), so
+that `pi_*` at the lowest wavenumber plus `mf_*` is zero, up to the transfer in the modes beyond
+the Nyquist circle, which the isotropic spectra also leave out (small unless the grid is very
+anisotropic). On lon–lat grids the spectra are those of the area-weighted fields, and $k = 0$ is
+the mean of the weighted field.
+
+The lateral terms are written at $k = 0$ in the same way, as `lf0_hke`, `lf0_vke`, `lf0_ape`,
+`lf0_pres`: `lf_*` at the lowest wavenumber plus `lf0_*` is the flux through the side boundaries
+divided by the area (again up to the modes beyond the Nyquist circle), and `lf0_*` is zero on
+periodic axes. At $k = 0$ a co-spectrum is the product of the domain means, so for a field
+with a large-scale gradient across the domain and a mean wind most of the boundary flux sits in
+this one mode: without it, the lateral spectra alone can miss most of the boundary flux.
+`lf0_pres` depends on the reference of the Exner perturbation $\pi'$: a constant $C$ added to
+$\pi'$ changes it by $-c_p\bar\theta\, C\,\langle\nabla\cdot\mathbf{u}\rangle$, which the
+$k = 0$ parts of the other pressure terms (not written) compensate. `lf_pres` at $k > 0$ does not
+depend on it.
+
+#### Reading the output
+
+Every term is written per unit mass (W kg⁻¹), with dimensions (`time`, `z`, `wavenumber`);
+`wavenumber` is in rad m⁻¹ and the wavelength is $2\pi/k$. With `cumulative: true` (the default)
+each transfer, flux and conversion term $X$ is accumulated from the smallest resolved scale,
+$X(k) = \sum_{k' \ge k} X(k')$: the net effect of all scales smaller than $2\pi/k$. The energy
+spectra (`hke`, `rke`, `dke`, `vke`, `ape`) are not accumulated, and the $k = 0$ terms (`mf_*`,
+`lf0_*`) have no `wavenumber` dimension.
+
+How to read a cumulative curve:
+
+* **Value at $k$**: the net gain, by this term, of all scales smaller than $2\pi/k$. For a
+  transfer, $\Pi(k) > 0$ means a net transfer from scales larger than $2\pi/k$ to smaller ones
+  (downscale) and $\Pi(k) < 0$ upscale.
+* **Slope**: where $X(k)$ decreases as $k$ increases, the term is a source at those scales (the
+  difference between two neighbouring values is the term in that shell); where it increases, a
+  sink.
+* **Value at the lowest wavenumber**: the total over all resolved scales except $k = 0$. For
+  `pi_*` and `lf_*`, add the $k = 0$ term (`mf_*`, `lf0_*`) to get the total over the domain;
+  the other terms have no $k = 0$ output.
+
+What to plot: average over `time` first (the terms are linear in the co-spectra, so this is
+exact), then integrate over a layer with the reference density, $\int\bar\rho X dz$ from $z_b$
+to $z_t$ (W m⁻²). Values per unit mass at different heights are not comparable, and the
+density weight turns the vertical flux terms into fluxes through the layer's top and bottom. For HKE and VKE,
+
+$$\int_{z_b}^{z_t}\bar\rho\,(\partial_z F + J)\,dz = \bar\rho F\big|_{z_t} - \bar\rho F\big|_{z_b},$$
+
+the net flux into the layer. For the pressure flux and APE,
+$\partial_z F + J = (\bar\theta/\bar\rho)\partial_z(\bar\rho F/\bar\theta)$ and
+$(\gamma/\bar\rho)\partial_z(\bar\rho F/\gamma)$, so the same holds up to the variation of
+$\bar\theta$ or $\gamma$ across the layer. Plot `vfd_* + j_*` together for that reason.
+
+What the terms do:
+
+| Budget | Between scales | Conversion | Vertical transport | Lateral transport | Small terms |
+|---|---|---|---|---|---|
+| HKE | `pi_nke`, `pi_lke` (Coriolis) | `cad` ($C_{A\to h}$, positive: HKE gains) | `vfd_dke + j_hke`, `vfd_pres + j_pres` | `lf_hke`, `lf_pres` | `div_hke`, `div_pres`, `np_hke` |
+| VKE | `pi_vke` | `caz` ($C_{A\to z}$) | `vfd_vke + j_vke` | `lf_vke` | `div_vke`, `np_vke` |
+| APE | `pi_ape` | `-(cad + caz)` ($-C_A$) | `vfd_ape + j_ape` | `lf_ape` | `div_ape` |
+
+* **Transfers** (`pi_*`) only redistribute energy among scales: including $k = 0$ they sum to
+  zero. A transfer that is positive and flat over a range of $k$ is a constant downscale flux
+  (an inertial range).
+* **Conversions** exchange energy between budgets at the same scale. The APE budget loses what
+  the kinetic energy budgets gain: $C_A = C_{A\to h} + C_{A\to z}$.
+* **Vertical transport** moves energy between layers at the same scale. For gravity waves the
+  vertical pressure flux $c_p\bar\theta(w, \pi')_k$ is the wave energy flux, and its convergence
+  in a layer marks where waves deposit energy.
+* **Lateral transport** is the import through the side boundaries (zero on periodic axes).
+* **Small terms**: compressibility ($D = \bar\rho^{-1}\nabla\cdot(\bar\rho\mathbf{v})$, zero for
+  anelastic flow) and pressure work by $\theta'$. They are needed for exact closure and are
+  usually small where the flow is nearly anelastic.
+* The diabatic and dissipative terms are not computed. With the tendency $\partial_t E(k)$ from
+  consecutive outputs, they are the residual.
+
+Checks to run on your own output:
+
+1. `pi_*` at the lowest wavenumber plus `mf_*` is close to zero. The remainder is the modes
+   beyond the Nyquist circle, a few percent at most on strongly anisotropic grids. A larger
+   remainder means the spectra do not satisfy Parseval's theorem (end-point detrending or a
+   taper).
+2. On periodic axes, `lf_*` and `lf0_*` are zero.
+3. `pi_* + lf_*` is the transfer before the split, as in a code without lateral fluxes.
+4. `lf_*` at the lowest wavenumber plus `lf0_*` is the flux through the side boundaries, except
+   for the pressure flux, whose $k = 0$ value depends on the reference of $\pi'$ (see above).
+
+`examples/plot_budget.py` does all of this for a set of layers (it needs matplotlib, which is
+not a dependency of sbudget). It plots one row per budget (HKE, APE) and one column per layer,
+adds the $k = 0$ points, leaves out the lateral terms on doubly periodic domains, and prints the
+layer totals and checks 1 and 4:
+
+```bash
+python examples/plot_budget.py budget.nc --layers 20e3,50e3 50e3,80e3 -o budget.png
+# density-weighted layers (W m-2): any file with the density; averaged over all dims except z
+python examples/plot_budget.py budget.nc --layers 20e3,50e3 \
+    --density model_output.nc --density-var rho --density-zdim height
+# output written with cumulative: false
+python examples/plot_budget.py budget.nc --not-cumulative --layers 20e3,50e3
+```
 
 #### Features
 
@@ -294,6 +437,12 @@ of the filter) for comparison with spectral fluxes.
   sbudget compute examples/config.yaml \
   --mode scale_transfer \
   --scales 1000,5000,10000
+```
+
+Plot a spectral budget (see *Reading the output* above)
+
+```bash
+  python examples/plot_budget.py ./out/budget.nc --layers 20e3,50e3 50e3,80e3 -o budget.png
 ```
 
 Perform analysis on selected levels and scales. Note, level selection is ignored in

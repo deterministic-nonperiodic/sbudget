@@ -28,7 +28,7 @@ from budget.budget import (nonlinear_hke_transfer_flux, nonlinear_hke_transfer_i
 from budget.inter_scale_transfers import inter_scale_kinetic_energy_transfer  # noqa: E402
 from budget.numeric_tools import (horizontal_divergence, relative_vorticity,  # noqa: E402
                                   horizontal_advection, stack_vector)
-from budget.spectral_primitives import isotropize, vector_cross_spectrum  # noqa: E402
+from budget.spectral_primitives import isotropize, vector_cross_spectrum, dc_component  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------------
@@ -476,6 +476,375 @@ def test_compute_budget_conservative_periodic_axes():
 
 
 # ------------------------------------------------------------------------------------------------
+# Lateral fluxes: interior transfer + lateral flux divergence
+# ------------------------------------------------------------------------------------------------
+def _lateral_case(periodic, seed=7):
+    """Random fields with a 30 m/s mean wind (large lateral fluxes), optionally marked periodic."""
+    from budget.numeric_tools import mark_periodic
+    u, v, w, th, dx = _random_3d_fields(seed=seed, n=40, w_amp=1.0)
+    u = u + 30.0
+    exner = 1e-3 * _random_3d_fields(seed=seed + 1, n=40)[0]
+    fields = [u, v, w, th, exner]
+    if periodic:
+        fields = [mark_periodic(a.copy(), ("y", "x")) for a in fields]
+    return (*fields, dx)
+
+
+def _lateral_terms(u, v, w, th, exner, conservative=True):
+    """Full transfers and lateral fluxes (2-D spectra) for HKE, VKE, APE and the pressure work."""
+    from budget.budget import (lateral_hke_flux, lateral_vke_flux, lateral_ape_flux,
+                               lateral_pressure_flux)
+    gamma = xr.ones_like(th.z, dtype=float)
+    theta_mean = xr.ones_like(th.z, dtype=float) * 250.0
+    total = {"HKE": nonlinear_hke_transfer_flux(u, v, w, conservative=conservative),
+             "VKE": nonlinear_vke_transfer(u, v, w, conservative=conservative),
+             "APE": nonlinear_ape_transfer(u, v, w, th, gamma, conservative=conservative)}
+    lateral = {"HKE": lateral_hke_flux(u, v), "VKE": lateral_vke_flux(u, v, w),
+               "APE": lateral_ape_flux(u, v, th, gamma),
+               "pres": lateral_pressure_flux(u, v, theta_mean, exner)}
+    return total, lateral
+
+
+def test_lateral_fluxes_vanish_on_periodic_axes():
+    """Along periodic axes the lateral flux spectra are zero at every wavenumber (the wrap-around
+    centred difference is skew-adjoint at each k), with or without the Errico detrend, so the
+    interior transfer equals the full transfer."""
+    u, v, w, th, exner, dx = _lateral_case(periodic=True)
+    for detrend in (None, "errico"):
+        with _Spectral(False, detrend):
+            total, lateral = _lateral_terms(u, v, w, th, exner)
+            for name, lf in lateral.items():
+                ref = total.get(name, lateral["pres"] * 0 + total["HKE"])
+                scale = float(np.abs(isotropize(ref, dx, dx, cumulative=True)).max())
+                err = float(np.abs(isotropize(lf, dx, dx, cumulative=False,
+                                              include_dc=True)).max()) / scale
+                print(f"  detrend {str(detrend):6s} {name:4s}: max_k |L(k)| / max |Pi| = {err:.1e}")
+                assert err < 1e-12, (detrend, name, err)
+
+
+def test_interior_transfer_sums_to_zero_on_bounded_axes():
+    """On axes treated as bounded (one-sided differences at the edges), the interior transfer
+    pi - L sums to zero over all wavenumbers (k = 0 included) to round-off, for the conservative
+    and the flux form, while the full transfer keeps the lateral import; pi = (pi - L) + L at
+    every k. Without detrending: Parseval's sum_k (a, b)_k = <a b> carries the pointwise
+    cancellation grad X . U X = X U . grad X over to the spectra. The flux form keeps its
+    product-rule residual, (X/2)[div(U X) - U.grad X - X div U], here < 5%."""
+    u, v, w, th, exner, dx = _lateral_case(periodic=False)
+    for conservative in (True, False):
+        with _Spectral(False, None):
+            total, lateral = _lateral_terms(u, v, w, th, exner, conservative)
+        for name in ("HKE", "VKE", "APE"):
+            scale = float(np.abs(isotropize(total[name], dx, dx, cumulative=True)).max())
+            interior = total[name] - lateral[name]
+            s_int = float(np.abs(_shell_sum(interior, dx)).max()) / scale
+            s_tot = float(np.abs(_shell_sum(total[name], dx)).max()) / scale
+            print(f"  {'conservative' if conservative else 'flux':12s} {name}: "
+                  f"max_z |sum_k (pi - L)| = {s_int:.1e}, |sum_k pi| = {s_tot:.1e} (of max|Pi|)")
+            assert s_int < (1e-12 if conservative else 5e-2), (conservative, name, s_int)
+            assert s_tot > 1e-3, (conservative, name, s_tot)
+
+
+def test_default_detrend_keeps_the_split_exact():
+    """With the default spectral settings (mean removed and restored, no trend, no taper) the
+    interior HKE transfer sums to zero and the lateral flux to its physical-space domain mean on
+    a non-periodic domain. Errico detrending removes a different ramp from each field of a
+    co-spectrum, so Parseval, and with it the conservation of the interior transfer, fails."""
+    from budget.budget import lateral_hke_flux
+    u, v, w, th, exner, dx = _lateral_case(periodic=False)
+    ramp = xr.DataArray(np.linspace(0.0, 1.0, u.sizes["x"]), dims="x", coords={"x": u.x})
+    u = u + 8.0 * ramp                                                  # not periodic in x
+    assert sp.SPECTRAL_CFG["detrend"]["type"] == "constant"
+    assert not sp.SPECTRAL_CFG["taper"]["enabled"]
+    res = {}
+    for detrend in ("constant", "errico"):
+        with _Spectral(False, detrend):
+            total = nonlinear_hke_transfer_flux(u, v, w, conservative=True)
+            lf = lateral_hke_flux(u, v)
+            scale = float(np.abs(isotropize(total - lf, dx, dx, cumulative=True)).max())
+            res[detrend] = float(np.abs(_shell_sum(total - lf, dx)).max()) / scale
+        print(f"  detrend {detrend:8s}: max_z |sum_k interior| / max|Pi_int| = {res[detrend]:.1e}")
+    assert res["constant"] < 1e-12 and res["errico"] > 1e-3, res
+
+
+def test_compute_budget_mean_flow_exchange():
+    """mf_hke, mf_vke, mf_ape are the interior transfers at k = 0, which the isotropic spectra
+    leave out: with them the interior transfers close, pi_*(k_min) + mf_* = 0 to round-off, on
+    periodic and on bounded axes, with the default spectral settings (the fields have no energy
+    beyond the Nyquist circle). A mean wind makes the HKE exchange with the mean flow non-zero;
+    the VKE and APE terms vanish here because w and theta' have zero domain mean (on a lon-lat
+    grid the k = 0 mode of the area-weighted fields need not)."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget, _BUDGET_META
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = xr.ones_like(u) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u + 20.0 + 0.1 * u.z / 1e3, "v": 10 * v, "w": w, "theta": theta,
+                     "pressure": pres, "density": pres / (287.0 * 240.0)})
+    for axes in (["x", "y"], []):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      transfer_form="conservative",
+                                                      periodic_axes=axes, rechunk_spatial=False))
+        out = compute_budget(ds, cfg).compute()
+        for pi, mf in (("pi_nke", "mf_hke"), ("pi_vke", "mf_vke"), ("pi_ape", "mf_ape")):
+            assert "wavenumber" not in out[mf].dims and out[mf].attrs["standard_name"] == \
+                _BUDGET_META[mf][0]
+            scale = float(np.abs(out[pi]).max())
+            closure = float(np.abs(out[pi].isel(wavenumber=0) + out[mf]).max()) / scale
+            size = float(np.abs(out[mf]).max()) / scale
+            print(f"  axes {str(axes):10s} {pi}: max_z |Pi(k_min) + {mf}| = {closure:.1e}, "
+                  f"max |{mf}| = {size:.2f} (of max|Pi|)")
+            assert closure < 1e-12, (axes, pi, closure)
+            if mf == "mf_hke":
+                assert size > 1e-2, (axes, mf, size)
+
+
+def test_compute_budget_lateral_flux_at_k0():
+    """lf0_hke, lf0_vke, lf0_ape, lf0_pres are the lateral flux divergences at k = 0, which the
+    isotropic spectra leave out. They vanish on periodic axes (skew-adjointness holds at k = 0 as
+    at every k); on bounded axes lf0_hke is the k = 0 value of L_h computed directly, and
+    lf_hke(k_min) + lf0_hke is the sum of L_h over all wavenumbers inside the Nyquist circle. At
+    k = 0 a co-spectrum is the product of the domain means: lf0_hke is non-zero here (mean wind),
+    lf0_vke and lf0_ape vanish because w and theta' have zero mean, and lf0_pres is small because
+    these fields are periodic in the data, so the domain-mean pressure gradient nearly vanishes
+    (test_lateral_fluxes_converge_to_boundary_fluxes covers a field that is not)."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget, _BUDGET_META, lateral_hke_flux
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = (1.0 + 1e-3 * v) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]   # horizontal pi'
+    ds = xr.Dataset({"u": 10 * u + 20.0 + 0.1 * u.z / 1e3, "v": 10 * v, "w": w, "theta": theta,
+                     "pressure": pres, "density": pres / (287.0 * 240.0)})
+    names = (("lf_hke", "lf0_hke"), ("lf_vke", "lf0_vke"), ("lf_ape", "lf0_ape"),
+             ("lf_pres", "lf0_pres"))
+    out = {}
+    for axes in (["x", "y"], []):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      transfer_form="conservative",
+                                                      periodic_axes=axes, rechunk_spatial=False))
+        out[str(axes)] = compute_budget(ds, cfg).compute()
+    per, bnd = out["['x', 'y']"], out["[]"]
+    for lf, lf0 in names:
+        assert "wavenumber" not in bnd[lf0].dims
+        assert bnd[lf0].attrs["standard_name"] == _BUDGET_META[lf0][0]
+        scale = max(float(np.abs(bnd[lf]).max()), float(np.abs(bnd[lf0]).max()))
+        r_per = float(np.abs(per[lf0]).max()) / scale
+        size = float(np.abs(bnd[lf0]).max()) / scale
+        print(f"  {lf0}: max |periodic| = {r_per:.1e}, max |bounded| = {size:.2f} (of max|{lf}|, |{lf0}|)")
+        assert r_per < 1e-10, (lf0, r_per)
+        if lf0 == "lf0_hke":
+            assert size > 1e-2, (lf0, size)
+    direct = lateral_hke_flux(ds.u, ds.v)                   # bounded: coordinates not marked
+    scale = float(np.abs(bnd.lf_hke).max())
+    err0 = float(np.abs(bnd.lf0_hke - dc_component(direct)).max()) / scale
+    err_sum = float(np.abs(bnd.lf_hke.isel(wavenumber=0) + bnd.lf0_hke
+                           - _shell_sum(direct, dx)).max()) / scale
+    print(f"  bounded: |lf0_hke - L_h(0)| = {err0:.1e}, "
+          f"|lf_hke(k_min) + lf0_hke - sum_k L_h| = {err_sum:.1e} (of max|lf_hke|)")
+    assert err0 < 1e-12 and err_sum < 1e-12, (err0, err_sum)
+
+
+def test_example_plot_budget():
+    """examples/plot_budget.py runs on compute_budget outputs (periodic and bounded, with and
+    without a density profile), and its accumulation of an output written with cumulative: false
+    reproduces the cumulative output."""
+    import importlib.util
+    import tempfile
+    from types import SimpleNamespace
+    from budget.budget import compute_budget
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except ImportError:
+        print("  matplotlib not installed: skipped")
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "plot_budget", os.path.join(here, "..", "examples", "plot_budget.py"))
+    pb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pb)
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = (1.0 + 1e-3 * v) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u + 20.0, "v": 10 * v, "w": w, "theta": theta, "pressure": pres,
+                     "density": pres / (287.0 * 240.0)}).expand_dims(time=2)
+    with tempfile.TemporaryDirectory() as tmp:
+        rho_path = os.path.join(tmp, "rho.nc")
+        ds.density.rename(z="height").to_dataset(name="rho").to_netcdf(rho_path)
+        for axes in (["x", "y"], []):
+            out = {}
+            for cumulative in (True, False):
+                cfg = SimpleNamespace(compute=SimpleNamespace(
+                    dx=dx, dy=dx, cumulative=cumulative, transfer_form="conservative",
+                    periodic_axes=axes, rechunk_spatial=False))
+                out[cumulative] = compute_budget(ds, cfg).compute()
+                out[cumulative].to_netcdf(os.path.join(tmp, f"budget_{cumulative}.nc"))
+            acc = pb.accumulate(out[False])
+            err = max(float(np.abs(acc[n] - out[True][n]).max() / np.abs(out[True][n]).max())
+                      for n in ("pi_nke", "lf_hke", "cad", "vfd_dke"))
+            print(f"  axes {str(axes):10s}: accumulated / cumulative output, max rel. diff "
+                  f"{err:.1e}")
+            assert err < 1e-12, (axes, err)
+            fig = os.path.join(tmp, "budget.png")
+            pb.main([os.path.join(tmp, "budget_True.nc"), "--layers", "5e3,20e3", "20e3,35e3",
+                     "-o", fig])
+            pb.main([os.path.join(tmp, "budget_False.nc"), "--not-cumulative", "--layers",
+                     "5e3,20e3", "--density", rho_path, "--density-zdim", "height", "-o", fig])
+            assert os.path.getsize(fig) > 0
+
+
+def _nonperiodic_2d(n, L=500e3):
+    """Analytic, non-periodic fields on [0, L]^2 (both end points on the grid), one level."""
+    x = np.linspace(0.0, L, n)
+    X, Y = np.meshgrid(x, x)
+    a, b = 2 * np.pi / (1.3 * L), 2 * np.pi / (1.7 * L)
+    f = {"u": lambda X, Y: 20.0 + 5.0 * np.sin(a * X + 0.4) * np.cos(b * Y + 0.2),
+         "v": lambda X, Y: 3.0 * np.cos(a * X - 0.3) * np.sin(b * Y + 0.5) + 1e-5 * X,
+         "p": lambda X, Y: 1e-3 * np.cos(a * X + b * Y + 0.1)}
+    da = lambda q: xr.DataArray(q[None], dims=("z", "y", "x"),
+                                coords={"z": [0.0], "y": x, "x": x})
+    return {k: da(g(X, Y)) for k, g in f.items()}, f, x[1] - x[0]
+
+
+def _boundary_flux(flux_x, flux_y, L=500e3, m=4001):
+    """(1/A) of the outward flux of (flux_x, flux_y) through the edges of [0, L]^2 (trapezoid)."""
+    s = np.linspace(0.0, L, m)
+    trap = lambda q: float(np.trapz(q, s))
+    out = (trap(flux_x(L, s)) - trap(flux_x(0.0, s)) + trap(flux_y(s, L)) - trap(flux_y(s, 0.0)))
+    return out / L ** 2
+
+
+def test_lateral_fluxes_converge_to_boundary_fluxes():
+    """Summed over wavenumbers, L_h and L_p equal minus the advective HKE flux U |U|^2/2 and the
+    pressure flux pi' U through the edges of a non-periodic domain, divided by the area: the
+    grid sum is a domain mean of a discrete divergence, so it converges at first order (end-point
+    weights) to the boundary integral. The sum is taken as compute_budget writes it, the
+    cumulative lf_* at the lowest wavenumber plus lf0_* (k = 0); it equals the shell sum
+    including k = 0 to round-off."""
+    from budget.budget import lateral_hke_flux, lateral_pressure_flux
+    from budget.constants import cp
+    _, f, _ = _nonperiodic_2d(3)
+    ke = lambda X, Y: 0.5 * (f["u"](X, Y) ** 2 + f["v"](X, Y) ** 2)
+    exact_h = -_boundary_flux(lambda X, Y: f["u"](X, Y) * ke(X, Y),
+                              lambda X, Y: f["v"](X, Y) * ke(X, Y))
+    exact_p = -_boundary_flux(lambda X, Y: f["p"](X, Y) * f["u"](X, Y),
+                              lambda X, Y: f["p"](X, Y) * f["v"](X, Y))
+    errors = []
+    for n in (41, 81, 161):
+        q, _, dx = _nonperiodic_2d(n)
+        with _Spectral(False, None):
+            sums, without_k0 = [], []
+            for spec in (lateral_hke_flux(q["u"], q["v"]),
+                         lateral_pressure_flux(q["u"], q["v"], 1.0 / cp, q["p"])):
+                # as compute_budget writes them: lf_* (cumulative) at k_min and lf0_* (k = 0)
+                k_min = float(isotropize(spec, dx, dx, cumulative=True).isel(wavenumber=0)
+                              .squeeze())
+                sums.append(k_min + float(dc_component(spec).squeeze()))
+                without_k0.append(k_min)
+                assert abs(sums[-1] - float(_shell_sum(spec, dx).squeeze())) < \
+                    1e-12 * abs(sums[-1])
+        lh, lp = sums
+        errors.append((abs(lh / exact_h - 1), abs(lp / exact_p - 1)))
+        print(f"  n = {n:3d}: (L_h(k_min) + L_h(0)) / boundary flux - 1 = {lh / exact_h - 1:+.4f}"
+              f" (without k = 0: {without_k0[0] / exact_h - 1:+.4f}), L_p: {lp / exact_p - 1:+.4f}"
+              f" ({without_k0[1] / exact_p - 1:+.4f})")
+    for i in range(2):
+        e = [err[i] for err in errors]
+        assert e[0] / e[1] > 1.7 and e[1] / e[2] > 1.7, e         # first-order convergence
+        assert e[2] < 0.05, e
+
+
+def test_lateral_pressure_flux_reference():
+    """A constant C added to pi' leaves L_p unchanged at every k > 0 and changes its k = 0 value
+    (lf0_pres) by -c_p theta C <div U>, where <div U> is the domain mean of the
+    finite-difference divergence (non-zero on a bounded domain)."""
+    from budget.budget import lateral_pressure_flux
+    from budget.constants import cp
+    q, _, dx = _nonperiodic_2d(81)
+    C = 0.01
+    with _Spectral(False, None):
+        a = lateral_pressure_flux(q["u"], q["v"], 1.0 / cp, q["p"])
+        b = lateral_pressure_flux(q["u"], q["v"], 1.0 / cp, q["p"] + C)
+        mean_div = float(horizontal_divergence(q["u"], q["v"]).mean())
+    ia, ib = isotropize(a, dx, dx), isotropize(b, dx, dx)
+    change = float(np.abs(ia - ib).max()) / float(np.abs(ia).max())
+    d0 = float((dc_component(b) - dc_component(a)).squeeze())
+    print(f"  k > 0: max |change| / max |L_p| = {change:.1e}; k = 0 change {d0:.4e}, "
+          f"-C <div U> = {-C * mean_div:.4e}")
+    assert change < 1e-12, change
+    assert abs(d0 + C * mean_div) < 1e-10 * abs(C * mean_div) and abs(mean_div) > 0
+
+
+def test_pressure_work_closes_on_bounded_axes():
+    """On a non-periodic domain the vertical-flux decomposition of the horizontal pressure work
+    misses the lateral pressure flux; with L_p (lf_pres) it closes at every wavenumber."""
+    from budget.budget import (pressure_flux, conversion_ape_to_dke, pressure_divergence_work,
+                               nonconservative_adiabatic_pressure, nonlinear_pressure_work_hke,
+                               lateral_pressure_flux)
+    from budget.constants import cp
+    from budget.numeric_tools import horizontal_gradient
+    u, v, w, th, th_mean, _, rho, exner, dx = _stratified_case(seed=17)
+    ramp = xr.DataArray(np.linspace(0.0, 1.0, u.sizes["x"]), dims="x", coords={"x": u.x})
+    u, exner = u + 3.0 * ramp, exner + 2e-3 * ramp                    # not periodic in x
+    with _NoTaper():
+        div = horizontal_divergence(u, v)
+        f_p = pressure_flux(th_mean, w, exner)
+        gx, gy = horizontal_gradient(exner)
+        exact = -cp * vector_cross_spectrum(stack_vector(u, v),
+                                            stack_vector((th_mean + th) * gx, (th_mean + th) * gy))
+        terms = [vertical_gradient_flux(f_p), nonconservative_adiabatic_pressure(f_p, rho, th_mean),
+                 conversion_ape_to_dke(th_mean, w, exner),
+                 pressure_divergence_work(u, v, w, div, rho, th_mean, exner),
+                 nonlinear_pressure_work_hke(u, v, th, exner)]
+        lateral = lateral_pressure_flux(u, v, th_mean, exner)
+        iso = lambda a: _interior(isotropize(a, dx, dx, cumulative=False, include_dc=True))
+        ex = iso(exact)
+        scale = float(np.abs(ex).max())
+        without = float(np.abs(sum(iso(t) for t in terms) - ex).max()) / scale
+        with_lf = float(np.abs(sum(iso(t) for t in terms) + iso(lateral) - ex).max()) / scale
+    print(f"  per-k closure error of the pressure work: without L_p {without:.3f}, "
+          f"with L_p {with_lf:.4f}")
+    assert without > 0.05 and with_lf < 0.01, (without, with_lf)
+
+
+def test_compute_budget_lateral_split():
+    """compute_budget writes lf_hke, lf_vke, lf_ape, lf_pres with metadata. Periodic axes: all
+    vanish and the transfers are unchanged. Bounded axes without detrending: pi_* + lf_* is the
+    full transfer at every k."""
+    from types import SimpleNamespace
+    from budget.budget import compute_budget, _BUDGET_META
+    from budget.spectral_primitives import isotropize as iso
+    u, v, w, th, dx = _random_3d_fields(seed=11, n=40, w_amp=1.0)
+    zf = u.z.values
+    theta = 250.0 * np.exp(0.02 ** 2 * zf / 9.81)[:, None, None] + th
+    pres = xr.ones_like(u) * (1e5 * np.exp(-zf / 7000.0))[:, None, None]
+    ds = xr.Dataset({"u": 10 * u + 20.0, "v": 10 * v, "w": w, "theta": theta, "pressure": pres,
+                     "density": pres / (287.0 * 240.0)})
+    lf_names = ("lf_hke", "lf_vke", "lf_ape", "lf_pres")
+    out = {}
+    for axes in (["x", "y"], []):
+        cfg = SimpleNamespace(compute=SimpleNamespace(dx=dx, dy=dx, cumulative=True,
+                                                      transfer_form="conservative",
+                                                      periodic_axes=axes, rechunk_spatial=False))
+        with _Spectral(False, None):
+            out[str(axes)] = compute_budget(ds, cfg).compute()
+    per, bnd = out["['x', 'y']"], out["[]"]
+    for k in lf_names:
+        assert per[k].attrs["standard_name"] == _BUDGET_META[k][0]
+        r = float(np.abs(per[k]).max() / np.abs(bnd[k]).max())
+        print(f"  {k}: max |periodic| / max |bounded| = {r:.1e}")
+        assert r < 1e-10, (k, r)
+    with _Spectral(False, None):
+        full = iso(nonlinear_hke_transfer_flux(ds.u, ds.v, ds.w, conservative=True), dx, dx,
+                   cumulative=True)
+    err = float(np.abs(bnd.pi_nke + bnd.lf_hke - full).max() / np.abs(full).max())
+    print(f"  bounded: max |pi_nke + lf_hke - full transfer| / max |full| = {err:.1e}")
+    assert err < 1e-12
+
+
+# ------------------------------------------------------------------------------------------------
 # Duchon-Robert inter-scale transfer
 # ------------------------------------------------------------------------------------------------
 def _mollifier(r, ell):
@@ -733,6 +1102,45 @@ def test_spectrum_parseval_and_cumulative_convention():
             .isel(wavenumber=slice(None, None, -1))
         assert np.allclose(cum, manual)
         assert np.allclose(cum.isel(wavenumber=0), e1d.sum("wavenumber"))
+
+
+def test_isotropize_conserves_variance_on_any_grid():
+    """Summed over all bins (DC and the corners beyond the Nyquist circle included), the
+    isotropic spectrum equals the 2-D sum, i.e. the domain mean: on even and odd grids, square
+    and not. The last bin edge used to sit below the resolution of the largest |k|, which dropped
+    the corner mode (and, with the Nyquist cut-off, the Nyquist column): 1e-6 of white noise, but
+    several % of a transfer on interpolated model output, whose 2-dx checkerboard sits there."""
+    rng = np.random.default_rng(0)
+    dx = 600.0
+    with _NoTaper():
+        for ny, nx in ((40, 40), (41, 40), (40, 41), (41, 41), (301, 751), (300, 751), (301, 750)):
+            co = {"y": np.arange(ny) * dx, "x": np.arange(nx) * dx}
+            a = xr.DataArray(rng.normal(size=(ny, nx)) + 3.0, dims=("y", "x"), coords=co)
+            checker = xr.DataArray(np.outer((-1.0) ** np.arange(ny), (-1.0) ** np.arange(nx)),
+                                   dims=("y", "x"), coords=co)
+            for f in (a, a + 5.0 * checker):
+                s2d = sp.scalar_spectrum(f)
+                total = float(isotropize(s2d, dx, dx, nyquist=False, include_dc=True).sum())
+                expect = float((f ** 2).mean())
+                assert abs(total / expect - 1) < 1e-12, (ny, nx, total / expect - 1)
+        print("  variance conserved to 1e-12 on 40/41 x 40/41 and 300/301 x 750/751 grids")
+
+
+def test_isotropize_odd_grid_wavenumbers():
+    """On an odd grid the rFFT length nx // 2 + 1 equals that of nx - 1; the spectra carry the
+    physical nx, so a pure mode lands in its own bin: on a 7 x 7 grid, cos(2 pi 2 x / L) has
+    |k| = 2 * 2 pi / L (reading nx as 6 put it at 2.33 x 2 pi / L)."""
+    n, dx = 7, 1000.0
+    x = np.arange(n) * dx
+    L = n * dx
+    f = xr.DataArray(np.cos(2 * np.pi * 2 * x / L)[None, :].repeat(n, 0), dims=("y", "x"),
+                     coords={"y": x, "x": x})
+    with _NoTaper():
+        e = isotropize(sp.scalar_spectrum(f), dx, dx, nyquist=False, include_dc=True)
+    peak = float(e.wavenumber[int(e.argmax())])
+    print(f"  pure mode at 2 x 2 pi / L: peak bin at {peak * L / (2 * np.pi):.3f} x 2 pi / L")
+    assert abs(peak * L / (2 * np.pi) - 2.0) < 1e-9
+    assert "nx_grid" not in e.coords
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1938,6 +2346,18 @@ if __name__ == "__main__":
              test_reader_keeps_native_half_level_w, test_geometry_recipe_matches_direct_geometry,
              test_cartesian_grid_is_not_global,
              test_periodic_derivative_float32_coordinates,
+             test_lateral_fluxes_vanish_on_periodic_axes,
+             test_interior_transfer_sums_to_zero_on_bounded_axes,
+             test_lateral_fluxes_converge_to_boundary_fluxes,
+             test_pressure_work_closes_on_bounded_axes,
+             test_compute_budget_lateral_split,
+             test_default_detrend_keeps_the_split_exact,
+             test_compute_budget_mean_flow_exchange,
+             test_compute_budget_lateral_flux_at_k0,
+             test_lateral_pressure_flux_reference,
+             test_example_plot_budget,
+             test_isotropize_conserves_variance_on_any_grid,
+             test_isotropize_odd_grid_wavenumbers,
              test_conservative_transfers_sum_to_zero_on_periodic_axes,
              test_conservative_and_flux_forms_converge,
              test_periodic_axes_skip_taper_and_linear_detrend,
