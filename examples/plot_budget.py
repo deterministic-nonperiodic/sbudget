@@ -26,7 +26,9 @@ usage:
   python plot_budget.py budget.nc --layers 20e3,50e3 50e3,80e3 -o budget.png
   python plot_budget.py budget.nc --layers 20e3,50e3 --density input.nc --density-var rho \\
       --density-zdim height
-  python plot_budget.py budget.nc --not-cumulative ...      # output written with cumulative: false
+  python plot_budget.py budget.nc --not-cumulative ...      # older output, cumulative: false
+Outputs record cumulative, nyquist_cutoff and include_k0 as global attributes; with include_k0
+the k = 0 points come from the k = 0 bin, otherwise from mf_* and lf0_*.
 """
 import argparse
 
@@ -109,8 +111,14 @@ def main(argv=None):
     b = xr.open_dataset(args.budget)
     b = b.mean("time") if "time" in b.dims else b
     b = b.sortby("z")
-    if args.not_cumulative:
+    # outputs record whether they are cumulative (sbudget writes the attribute); --not-cumulative
+    # is for older files
+    if args.not_cumulative or b.attrs.get("cumulative", 1) == 0:
         b = accumulate(b)
+    # with include_k0 the first bin is k = 0: its cumulative value is the domain total
+    b0 = None
+    if float(b.wavenumber[0]) == 0.0:
+        b0, b = b.isel(wavenumber=0), b.isel(wavenumber=slice(1, None))
     rho = density_profile(args.density, args.density_var, args.density_zdim, b.z) \
         if args.density else None
     units, units_tex = ("W m-2", r"W m$^{-2}$") if rho is not None else \
@@ -145,8 +153,13 @@ def main(argv=None):
                 expr = " ".join(n if i == 0 else (f"- {n[1:]}" if n[0] == "-" else f"+ {n}")
                                 for i, n in enumerate(names))
                 msg = f"  {expr:22s} {total:+.3e}"
-                if at0 is not None and combine(b, at0) is not None:
-                    with_k0 = total + float(layer(combine(b, at0), zb, zt, rho))
+                k0_value = None
+                if at0 is not None and b0 is not None:
+                    k0_value = float(layer(combine(b0, names), zb, zt, rho))
+                elif at0 is not None and combine(b, at0) is not None:
+                    k0_value = total + float(layer(combine(b, at0), zb, zt, rho))
+                if k0_value is not None:
+                    with_k0 = k0_value
                     ax.plot([k0, float(k[0])], [with_k0, total], color=color, lw=2)
                     ax.plot(k0, with_k0, marker="x", color=color, ms=9, mew=2.5, zorder=5)
                     msg += f"   with k = 0: {with_k0:+.3e}"

@@ -39,6 +39,10 @@ class ComputeConfig:
     perturbation: bool = False  # remove the level-mean horizontal wind first
     increment_components: list[str] | None = None  # None = ["u", "v"] (HKE); w adds VKE
     cumulative: bool = True  # Aggregate scale transfers cumulatively up to each scale
+    # spectral_budget isotropic binning: stop at the Nyquist wavenumber of the coarser axis
+    # (False: bins extend to the grid corner, so sums include every mode), and add a k = 0 bin
+    nyquist_cutoff: bool = True
+    include_k0: bool = False
     rechunk_spatial: bool = False  # ensure (y,x) are single chunks before FFTs
     # Dask scheduler: "threads", "distributed", or None = automatic ("distributed" under SLURM,
     # "threads" otherwise). See README "Choosing a scheduler" for the measurements behind this.
@@ -173,6 +177,11 @@ def apply_overrides(cfg, args):
     ic = _get(args, "increment_components")
     if ic:
         _set_nested(cfg, ["compute", "increment_components"], [str(c) for c in ic])
+
+    for key in ("nyquist_cutoff", "include_k0"):
+        val = _get(args, key)
+        if val is not None:
+            _set_nested(cfg, ["compute", key], bool(val))
 
     rs = _get(args, "rechunk_spatial")
     if rs is not None:
